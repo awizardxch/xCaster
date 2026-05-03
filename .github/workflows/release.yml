@@ -1,0 +1,64 @@
+name: Build & Release
+
+# Trigger: push a version tag like v0.4.2
+# Steps: install → build → zip → create GitHub Release → upload zip
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run package
+        env:
+          # electron-packager downloads the Electron binary from GitHub during
+          # the build. No cache needed on CI — it's a fresh runner each time.
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '0'
+
+      - name: Zip distribution
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path dist\XCaster-win32-x64 `
+            -DestinationPath XCaster-win32-x64.zip `
+            -CompressionLevel Optimal
+          $mb = [math]::Round((Get-Item XCaster-win32-x64.zip).Length / 1MB, 1)
+          Write-Host "Zip size: $mb MB"
+
+      - name: Extract release notes from tag annotation
+        id: notes
+        shell: pwsh
+        run: |
+          # Use the tag message as release notes, fall back to the tag name
+          $msg = git tag -l --format='%(contents)' $env:GITHUB_REF_NAME 2>$null
+          if (!$msg) { $msg = "Release $env:GITHUB_REF_NAME" }
+          # GitHub Actions multiline output
+          $delimiter = "EOF_$(New-Guid)"
+          echo "notes<<$delimiter" >> $env:GITHUB_OUTPUT
+          echo $msg >> $env:GITHUB_OUTPUT
+          echo $delimiter >> $env:GITHUB_OUTPUT
+
+      - name: Create GitHub Release and upload asset
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "XCaster ${{ github.ref_name }}"
+          body: ${{ steps.notes.outputs.notes }}
+          files: XCaster-win32-x64.zip
+          draft: false
+          prerelease: false
