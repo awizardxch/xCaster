@@ -6,6 +6,14 @@ It ships its own Chromium (via Electron), disables WebRTC's automatic gain contr
 
 ---
 
+## Download
+
+**[XCaster v0.4.0 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v0.4.0/XCaster-win32-x64.zip)**
+
+Extract the zip and run `XCaster.exe` — no installer required.
+
+---
+
 ## Features
 
 - **WebRTC AGC disabled** — X Spaces cannot auto-level, duck, or re-process your microphone

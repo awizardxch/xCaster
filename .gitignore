@@ -2,3 +2,5 @@ node_modules/
 dist/
 .cache/
 *.log
+XCaster-win32-x64.zip
+
