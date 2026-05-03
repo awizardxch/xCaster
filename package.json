@@ -1,0 +1,49 @@
+{
+  "name": "xcaster",
+  "version": "0.4.0",
+  "description": "XCaster - standalone Windows shell for x.com with full DSP mixer and WebRTC AGC disabled. Stream X Spaces with clean, professional audio.",
+  "main": "src/main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "package": "electron-packager . XCaster --platform=win32 --arch=x64 --out=dist --overwrite --asar --prune=true --ignore=^/dist$"
+  },
+  "build": {
+    "appId": "com.ricardo.xcaster",
+    "productName": "XCaster",
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false
+    }
+  },
+  "devDependencies": {
+    "@electron/packager": "^20.0.0",
+    "electron": "^32.2.0",
+    "electron-builder": "^25.1.8"
+  }
+}
