@@ -143,9 +143,29 @@
     function ensureAudioContext() {
         if (!audioCtx) {
             audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+            // Auto-resume whenever Chromium suspends the context (focus loss,
+            // device switch, OS audio session change, etc.)
+            audioCtx.addEventListener('statechange', () => {
+                if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+            });
+            // Silent keepalive: a zero-gain ConstantSourceNode keeps the Chromium
+            // audio rendering thread scheduled even when the window is minimized.
+            // Without it, background CPU throttling starves the DSP callbacks.
+            installAudioKeepalive(audioCtx);
         }
         if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
         return audioCtx;
+    }
+
+    function installAudioKeepalive(ctx) {
+        try {
+            const src = ctx.createConstantSource();
+            const silence = ctx.createGain();
+            silence.gain.value = 0;
+            src.connect(silence);
+            silence.connect(ctx.destination);
+            src.start();
+        } catch { /* not critical */ }
     }
 
     async function acquireDevice(deviceId) {
@@ -293,6 +313,45 @@
 
     function dbToLin(db) { return Math.pow(10, db / 20); }
 
+    // How long (ms) to wait after a track goes muted before triggering a
+    // rebuild. A short silence is normal during device handoff; only rebuild
+    // if it persists, which means the OS revoked access or the device vanished.
+    const MUTE_GRACE_MS = 2000;
+
+    // Attach mute/ended listeners to every audio track in a stream so that
+    // when Windows grabs the device exclusively (another app, audio session
+    // change, etc.) and the track goes muted, we auto-recover without the
+    // user needing to toggle the device selector.
+    function watchStream(stream, rebuildFn) {
+        if (!stream) return;
+        let pending = false;
+        for (const track of stream.getAudioTracks()) {
+            let muteTimer = null;
+            track.addEventListener('mute', () => {
+                if (pending) return;
+                muteTimer = setTimeout(() => {
+                    muteTimer = null;
+                    if (!pending && (track.muted || track.readyState === 'ended')) {
+                        pending = true;
+                        Promise.resolve(rebuildFn()).finally(() => { pending = false; });
+                    }
+                }, MUTE_GRACE_MS);
+            });
+            track.addEventListener('unmute', () => {
+                clearTimeout(muteTimer);
+                muteTimer = null;
+            });
+            track.addEventListener('ended', () => {
+                clearTimeout(muteTimer);
+                muteTimer = null;
+                if (!pending) {
+                    pending = true;
+                    Promise.resolve(rebuildFn()).finally(() => { pending = false; });
+                }
+            });
+        }
+    }
+
     async function ensureProcessedStream() {
         ensureAudioContext();
         if (!micRawStream) {
@@ -301,6 +360,7 @@
         }
         if (micRawStream && !micSrcNode) {
             micSrcNode = audioCtx.createMediaStreamSource(micRawStream);
+            watchStream(micRawStream, () => rebuildMic());
         }
         if (settings.auxDeviceId && settings.auxDeviceId !== 'none' && !auxRawStream) {
             try { auxRawStream = await acquireDevice(settings.auxDeviceId); }
@@ -308,6 +368,7 @@
         }
         if (auxRawStream && !auxSrcNode) {
             auxSrcNode = audioCtx.createMediaStreamSource(auxRawStream);
+            watchStream(auxRawStream, () => rebuildAux());
         }
         buildGraph();
         return processedStream;
@@ -1190,6 +1251,36 @@
         window.addEventListener('resize', () => opts.apply && opts.apply());
     }
 
+    // ---------- resilience: focus/visibility/periodic watchdog ---------------
+    // Resume AudioContext whenever the page regains visibility or focus.
+    // Chromium can suspend it on hide even with disable-background-media-suspend
+    // applied at the process level, because the policy can be re-applied by the
+    // page visibility API inside the renderer.
+    document.addEventListener('visibilitychange', () => {
+        if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+    });
+    window.addEventListener('focus', () => {
+        if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+    });
+
+    // Periodic health check catches state drift that event listeners miss
+    // (some virtual cable drivers on Windows don't fire 'ended' reliably).
+    function startHealthWatchdog() {
+        setInterval(() => {
+            if (audioCtx && audioCtx.state === 'suspended') {
+                audioCtx.resume().catch(() => {});
+            }
+            if (micRawStream) {
+                const t = micRawStream.getAudioTracks()[0];
+                if (t && t.readyState === 'ended') rebuildMic();
+            }
+            if (auxRawStream && settings.auxDeviceId && settings.auxDeviceId !== 'none') {
+                const t = auxRawStream.getAudioTracks()[0];
+                if (t && t.readyState === 'ended') rebuildAux();
+            }
+        }, 4000);
+    }
+
     function install() {
         if (!document.body) { requestAnimationFrame(install); return; }
         installBackground();
@@ -1198,6 +1289,7 @@
         applyFabPos();
         applyPanelPos();
         wire();
+        startHealthWatchdog();
     }
     install();
 })();

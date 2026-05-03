@@ -46,6 +46,17 @@ app.commandLine.appendSwitch(
 app.commandLine.appendSwitch('try-supported-channel-layouts');
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 
+// Keep the renderer process at full priority when the window is minimized,
+// occluded, or the user switches to another app. Without these, Chromium
+// throttles the renderer CPU allocation, which causes the Web Audio processing
+// thread to miss its callback deadlines and produce choppy audio.
+app.commandLine.appendSwitch('disable-renderer-backgrounding');
+app.commandLine.appendSwitch('disable-background-timer-throttling');
+app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
+// Prevent media (AudioContext, MediaStream capture) from being suspended when
+// the page is hidden. This is the main cause of audio cuts when alt-tabbing.
+app.commandLine.appendSwitch('disable-background-media-suspend');
+
 // Single-instance lock so a second launch focuses the existing window.
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
