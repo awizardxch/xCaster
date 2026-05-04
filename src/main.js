@@ -3,9 +3,10 @@
 // Gives streamers full control over launch flags and getUserMedia constraints,
 // plus a full DSP/mixer overlay for professional X Spaces audio.
 
-const { app, BrowserWindow, session, Menu, shell, ipcMain, dialog, protocol, net } = require('electron');
+const { app, BrowserWindow, session, Menu, shell, ipcMain, dialog, protocol, net, powerSaveBlocker } = require('electron');
 const path = require('path');
 const { pathToFileURL } = require('url');
+const { execFile } = require('child_process');
 
 // Register custom protocol so the in-page overlay can load packaged assets
 // (e.g. background.mp4) from an https origin without tripping CSP/CORS.
@@ -36,11 +37,17 @@ protocol.registerSchemesAsPrivileged([
 app.commandLine.appendSwitch(
     'disable-features',
     [
+        // WebRTC input-side audio processing (we do our own).
         'WebRtcAllowInputVolumeAdjustment',
         'WebRtcAnalogAgcClippingControl',
         'WebRtcHybridAgc',
         'ChromeWideEchoCancellation',
         'WebRtcApmInAudioService',
+        // Background throttling / freezing that causes choppy audio.
+        'IntensiveWakeUpThrottling',
+        'CalculateNativeWinOcclusion',
+        'TabFreezing',
+        'FreezingOnEnergySaverDesktop',
     ].join(',')
 );
 app.commandLine.appendSwitch('try-supported-channel-layouts');
@@ -56,6 +63,8 @@ app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
 // Prevent media (AudioContext, MediaStream capture) from being suspended when
 // the page is hidden. This is the main cause of audio cuts when alt-tabbing.
 app.commandLine.appendSwitch('disable-background-media-suspend');
+// Disable the priority manager which lowers process priority on idle/hidden.
+app.commandLine.appendSwitch('disable-renderer-priority-management');
 
 // Single-instance lock so a second launch focuses the existing window.
 const gotLock = app.requestSingleInstanceLock();
@@ -117,6 +126,44 @@ function createWindow() {
     mainWindow.webContents.setUserAgent(
         mainWindow.webContents.getUserAgent().replace(/Electron\/[^\s]+\s?/, '')
     );
+
+    // Keep system + display awake while XCaster runs so Windows doesn't
+    // throttle the audio capture pipeline when minimized.
+    try { powerSaveBlocker.start('prevent-app-suspension'); } catch {}
+    // 'prevent-display-sleep' also keeps the renderer at full priority on
+    // Windows when the window is occluded (covered by other apps).
+    try { powerSaveBlocker.start('prevent-display-sleep'); } catch {}
+
+    // Re-assert no-throttling whenever the window is minimized, hidden, or
+    // restored — Chromium can re-enable throttling on these transitions.
+    const reassertNoThrottle = () => {
+        try { mainWindow.webContents.setBackgroundThrottling(false); } catch {}
+        try { mainWindow.webContents.setFrameRate(60); } catch {}
+    };
+    mainWindow.on('minimize', reassertNoThrottle);
+    mainWindow.on('restore', reassertNoThrottle);
+    mainWindow.on('hide', reassertNoThrottle);
+    mainWindow.on('show', reassertNoThrottle);
+    mainWindow.on('blur', reassertNoThrottle);
+    mainWindow.on('focus', reassertNoThrottle);
+    // Periodic re-assertion catches occlusion-driven throttling that no
+    // event fires for (when other apps cover the window without minimizing).
+    setInterval(reassertNoThrottle, 2000);
+
+    // Pin all XCaster processes (main + renderers + GPU + audio service) to
+    // HIGH priority on Windows. Chromium silently demotes renderer priority
+    // when occluded, which is the root cause of background audio choppiness.
+    // Re-pinning every 3s catches any renderer that gets demoted.
+    function pinProcessPriorityWindows() {
+        if (process.platform !== 'win32') return;
+        try { process.priority = 'high'; } catch {}
+        // Use PowerShell to set every XCaster process to High priority.
+        // This includes the renderer that hosts the audio graph.
+        const cmd = `Get-Process -Name XCaster -ErrorAction SilentlyContinue | ForEach-Object { try { $_.PriorityClass = 'High' } catch {} }`;
+        execFile('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', cmd], () => {});
+    }
+    pinProcessPriorityWindows();
+    setInterval(pinProcessPriorityWindows, 3000);
 
     // Open external links (non-x.com) in the user's default browser.
     mainWindow.webContents.setWindowOpenHandler(({ url }) => {

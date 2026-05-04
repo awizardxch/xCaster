@@ -25,20 +25,39 @@
     // ---------- defaults & persistence -------------------------------------
     const STORAGE_KEY = 'xfw.settings';
     const DEFAULTS = {
-        // I/O — two independent input channels (mic + aux) summed pre-DSP.
-        inputDeviceId: 'default',           // mic
-        auxDeviceId: 'none',                // aux source ('none' = disabled)
+        // I/O — three independent input channels (mic + aux1 + aux2) summed pre-DSP.
+        inputDeviceId: 'default',           // mic (headset)
+        auxDeviceId: 'none',                // aux 1 — desktop audio
+        aux2DeviceId: 'none',               // aux 2 — external receiver/mixer
         outputDeviceId: 'default',          // playback for X
         // Per-channel mixer
         micGainDb: 0,
         micMuted: false,
         auxGainDb: 0,
         auxMuted: false,
-        // Browser-side capture toggles. Keep all OFF for a flat signal we
-        // process ourselves; flipping them on lets the browser re-process.
-        autoGainControl: false,
-        noiseSuppression: false,
-        echoCancellation: false,
+        aux2GainDb: 0,
+        aux2Muted: false,
+        // Browser-side capture toggles — independent per input channel.
+        // Keep all OFF for a flat signal we process ourselves.
+        micAutoGainControl: false,
+        micNoiseSuppression: false,
+        micEchoCancellation: false,
+        auxAutoGainControl: false,
+        auxNoiseSuppression: false,
+        auxEchoCancellation: false,
+        aux2AutoGainControl: false,
+        aux2NoiseSuppression: false,
+        aux2EchoCancellation: false,
+        // Per-channel headset monitor (route channel to your headphones).
+        // Mic monitor defaults OFF to avoid latency/feedback in your ear.
+        micMonitor: false,
+        auxMonitor: true,
+        aux2Monitor: true,
+        // Cue (PFL) — routes channel ONLY to monitor, not to broadcast mix.
+        // Used to preload/audition audio without sending it to the Space.
+        micCue: false,
+        auxCue: false,
+        aux2Cue: false,
         // Processing chain
         bypass: false,
         hpfHz: 90,
@@ -73,12 +92,16 @@
     let settings = loadSettings();
 
     // ---------- audio graph ------------------------------------------------
-    // Two input channels (mic, aux) -> per-channel Gain (with mute) -> summing
+    // Three input channels (mic, aux1, aux2) -> per-channel Gain -> summing
     // bus -> DSP chain -> MediaStreamDestination handed to X.
     let audioCtx = null;
-    let micRawStream = null, auxRawStream = null;
-    let micSrcNode = null, auxSrcNode = null;
-    let micGainNode = null, auxGainNode = null;
+    let micRawStream = null, auxRawStream = null, aux2RawStream = null;
+    let micSrcNode = null, auxSrcNode = null, aux2SrcNode = null;
+    let micGainNode = null, auxGainNode = null, aux2GainNode = null;
+    let micMixSend = null, auxMixSend = null, aux2MixSend = null;
+    let micMonitorGain = null, auxMonitorGain = null, aux2MonitorGain = null;
+    let monitorDest = null;
+    let monitorAudioEl = null;
     let mixBus = null;
     let hpf = null, eqLow = null, eqMid = null, eqHigh = null;
     let comp = null, limiter = null, makeup = null;
@@ -86,7 +109,7 @@
     let processedStream = null;
     let inputAnalyser = null;
     let outputAnalyser = null;
-    let micAnalyser = null, auxAnalyser = null;
+    let micAnalyser = null, auxAnalyser = null, aux2Analyser = null;
 
     // Track every AudioContext the page creates so we can rebind their sink
     // when the user changes the speaker selection.
@@ -111,6 +134,10 @@
     function applySinkToAllContexts() {
         for (const ctx of __xfwContexts) applySinkToAudioContext(ctx);
     }
+
+    // Save the native constructor BEFORE our patch wraps it.
+    // xOutputCtx must be created with this so we fully control setSinkId timing.
+    const _NativeAudioContext = window.AudioContext || window.webkitAudioContext;
 
     // Patch AudioContext so any context the page or our overlay creates is
     // routed to the selected output device. Without this, WebRTC remote
@@ -142,7 +169,10 @@
 
     function ensureAudioContext() {
         if (!audioCtx) {
-            audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+            // 'playback' uses a larger buffer than 'interactive', which keeps
+            // audio glitch-free when the renderer is briefly throttled (window
+            // minimized/occluded). The added ~20ms latency is invisible for X.
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'playback' });
             // Auto-resume whenever Chromium suspends the context (focus loss,
             // device switch, OS audio session change, etc.)
             audioCtx.addEventListener('statechange', () => {
@@ -168,12 +198,12 @@
         } catch { /* not critical */ }
     }
 
-    async function acquireDevice(deviceId) {
-        // Raw capture for any input. Browser-side AGC/NS/EC reflect toggles.
+    async function acquireDevice(deviceId, captureOpts) {
+        // Raw capture for any input. captureOpts overrides per-channel toggles.
         const audioConstraints = {
-            autoGainControl: !!settings.autoGainControl,
-            noiseSuppression: !!settings.noiseSuppression,
-            echoCancellation: !!settings.echoCancellation,
+            autoGainControl: !!(captureOpts && captureOpts.autoGainControl),
+            noiseSuppression: !!(captureOpts && captureOpts.noiseSuppression),
+            echoCancellation: !!(captureOpts && captureOpts.echoCancellation),
         };
         if (deviceId && deviceId !== 'default') {
             audioConstraints.deviceId = { exact: deviceId };
@@ -183,13 +213,21 @@
 
     function buildGraph() {
         const ctx = ensureAudioContext();
-        if (!micSrcNode && !auxSrcNode) return;
+        if (!micSrcNode && !auxSrcNode && !aux2SrcNode) return;
 
         // Tear down existing wiring on every node we touch.
         try { micSrcNode && micSrcNode.disconnect(); } catch {}
         try { auxSrcNode && auxSrcNode.disconnect(); } catch {}
+        try { aux2SrcNode && aux2SrcNode.disconnect(); } catch {}
         try { micGainNode && micGainNode.disconnect(); } catch {}
         try { auxGainNode && auxGainNode.disconnect(); } catch {}
+        try { aux2GainNode && aux2GainNode.disconnect(); } catch {}
+        try { micMixSend && micMixSend.disconnect(); } catch {}
+        try { auxMixSend && auxMixSend.disconnect(); } catch {}
+        try { aux2MixSend && aux2MixSend.disconnect(); } catch {}
+        try { micMonitorGain && micMonitorGain.disconnect(); } catch {}
+        try { auxMonitorGain && auxMonitorGain.disconnect(); } catch {}
+        try { aux2MonitorGain && aux2MonitorGain.disconnect(); } catch {}
         try { mixBus && mixBus.disconnect(); } catch {}
 
         // Per-channel input gains (with mute) and meters.
@@ -197,22 +235,57 @@
         micGainNode.gain.value = settings.micMuted ? 0 : dbToLin(settings.micGainDb);
         auxGainNode = ctx.createGain();
         auxGainNode.gain.value = settings.auxMuted ? 0 : dbToLin(settings.auxGainDb);
+        aux2GainNode = ctx.createGain();
+        aux2GainNode.gain.value = settings.aux2Muted ? 0 : dbToLin(settings.aux2GainDb);
         micAnalyser = ctx.createAnalyser(); micAnalyser.fftSize = 1024;
         auxAnalyser = ctx.createAnalyser(); auxAnalyser.fftSize = 1024;
+        aux2Analyser = ctx.createAnalyser(); aux2Analyser.fftSize = 1024;
 
-        // Summing bus where mic + aux meet before the DSP chain.
+        // Summing bus where all channels meet before the DSP chain.
         mixBus = ctx.createGain();
         mixBus.gain.value = 1;
+
+        // Headset monitor bus — separate destination so we can hear channels
+        // in our headphones without sending the monitor mix back to X.
+        monitorDest = ctx.createMediaStreamDestination();
+        // Mix-send gains: when cue is ON, this gain is 0 — channel is heard in
+        // monitor only and never reaches the broadcast mix.
+        micMixSend = ctx.createGain();
+        micMixSend.gain.value = settings.micCue ? 0 : 1;
+        auxMixSend = ctx.createGain();
+        auxMixSend.gain.value = settings.auxCue ? 0 : 1;
+        aux2MixSend = ctx.createGain();
+        aux2MixSend.gain.value = settings.aux2Cue ? 0 : 1;
+        micMonitorGain = ctx.createGain();
+        micMonitorGain.gain.value = (settings.micMonitor || settings.micCue) ? 1 : 0;
+        auxMonitorGain = ctx.createGain();
+        auxMonitorGain.gain.value = (settings.auxMonitor || settings.auxCue) ? 1 : 0;
+        aux2MonitorGain = ctx.createGain();
+        aux2MonitorGain.gain.value = (settings.aux2Monitor || settings.aux2Cue) ? 1 : 0;
+        micMixSend.connect(mixBus);
+        auxMixSend.connect(mixBus);
+        aux2MixSend.connect(mixBus);
+        micMonitorGain.connect(monitorDest);
+        auxMonitorGain.connect(monitorDest);
+        aux2MonitorGain.connect(monitorDest);
 
         if (micSrcNode) {
             micSrcNode.connect(micGainNode);
             micSrcNode.connect(micAnalyser);
-            micGainNode.connect(mixBus);
+            micGainNode.connect(micMixSend);
+            micGainNode.connect(micMonitorGain);
         }
         if (auxSrcNode) {
             auxSrcNode.connect(auxGainNode);
             auxSrcNode.connect(auxAnalyser);
-            auxGainNode.connect(mixBus);
+            auxGainNode.connect(auxMixSend);
+            auxGainNode.connect(auxMonitorGain);
+        }
+        if (aux2SrcNode) {
+            aux2SrcNode.connect(aux2GainNode);
+            aux2SrcNode.connect(aux2Analyser);
+            aux2GainNode.connect(aux2MixSend);
+            aux2GainNode.connect(aux2MonitorGain);
         }
 
         // High-pass filter — kills rumble, AC hum harmonics, breath thumps.
@@ -284,11 +357,37 @@
         }
 
         processedStream = processedDest.stream;
+
+        // Pipe the monitor MediaStream directly into xOutputCtx so it plays out
+        // the user's selected output device. Done async after ensureXOutputCtx
+        // has set the sink, so first sample lands on the right device.
+        attachMonitorToOutput(monitorDest.stream);
+    }
+
+    let monitorSrcNode = null; // node inside xOutputCtx
+    async function attachMonitorToOutput(stream) {
+        try {
+            const ctx = await ensureXOutputCtx();
+            if (monitorSrcNode) { try { monitorSrcNode.disconnect(); } catch {} }
+            monitorSrcNode = ctx.createMediaStreamSource(stream);
+            monitorSrcNode.connect(ctx.destination);
+            console.info('[XCaster] monitor bus attached to output device');
+        } catch (err) {
+            console.warn('[XCaster] attachMonitorToOutput failed', err);
+        }
     }
 
     function applyMixerLive() {
         if (micGainNode) micGainNode.gain.value = settings.micMuted ? 0 : dbToLin(settings.micGainDb);
         if (auxGainNode) auxGainNode.gain.value = settings.auxMuted ? 0 : dbToLin(settings.auxGainDb);
+        if (aux2GainNode) aux2GainNode.gain.value = settings.aux2Muted ? 0 : dbToLin(settings.aux2GainDb);
+        if (micMixSend) micMixSend.gain.value = settings.micCue ? 0 : 1;
+        if (auxMixSend) auxMixSend.gain.value = settings.auxCue ? 0 : 1;
+        if (aux2MixSend) aux2MixSend.gain.value = settings.aux2Cue ? 0 : 1;
+        // Cue forces monitor on so you can hear the cued channel.
+        if (micMonitorGain) micMonitorGain.gain.value = (settings.micMonitor || settings.micCue) ? 1 : 0;
+        if (auxMonitorGain) auxMonitorGain.gain.value = (settings.auxMonitor || settings.auxCue) ? 1 : 0;
+        if (aux2MonitorGain) aux2MonitorGain.gain.value = (settings.aux2Monitor || settings.aux2Cue) ? 1 : 0;
     }
 
     function applySettingsLive() {
@@ -355,7 +454,11 @@
     async function ensureProcessedStream() {
         ensureAudioContext();
         if (!micRawStream) {
-            try { micRawStream = await acquireDevice(settings.inputDeviceId); }
+            try { micRawStream = await acquireDevice(settings.inputDeviceId, {
+                autoGainControl: settings.micAutoGainControl,
+                noiseSuppression: settings.micNoiseSuppression,
+                echoCancellation: settings.micEchoCancellation,
+            }); }
             catch (err) { console.warn('[XCaster] mic acquire failed', err); }
         }
         if (micRawStream && !micSrcNode) {
@@ -363,12 +466,28 @@
             watchStream(micRawStream, () => rebuildMic());
         }
         if (settings.auxDeviceId && settings.auxDeviceId !== 'none' && !auxRawStream) {
-            try { auxRawStream = await acquireDevice(settings.auxDeviceId); }
+            try { auxRawStream = await acquireDevice(settings.auxDeviceId, {
+                autoGainControl: settings.auxAutoGainControl,
+                noiseSuppression: settings.auxNoiseSuppression,
+                echoCancellation: settings.auxEchoCancellation,
+            }); }
             catch (err) { console.warn('[XCaster] aux acquire failed', err); }
         }
         if (auxRawStream && !auxSrcNode) {
             auxSrcNode = audioCtx.createMediaStreamSource(auxRawStream);
             watchStream(auxRawStream, () => rebuildAux());
+        }
+        if (settings.aux2DeviceId && settings.aux2DeviceId !== 'none' && !aux2RawStream) {
+            try { aux2RawStream = await acquireDevice(settings.aux2DeviceId, {
+                autoGainControl: settings.aux2AutoGainControl,
+                noiseSuppression: settings.aux2NoiseSuppression,
+                echoCancellation: settings.aux2EchoCancellation,
+            }); }
+            catch (err) { console.warn('[XCaster] aux2 acquire failed', err); }
+        }
+        if (aux2RawStream && !aux2SrcNode) {
+            aux2SrcNode = audioCtx.createMediaStreamSource(aux2RawStream);
+            watchStream(aux2RawStream, () => rebuildAux2());
         }
         buildGraph();
         return processedStream;
@@ -384,10 +503,16 @@
         try { if (auxRawStream) auxRawStream.getTracks().forEach(t => t.stop()); } catch {}
         auxRawStream = null; auxSrcNode = null;
         if (!settings.auxDeviceId || settings.auxDeviceId === 'none') {
-            // disabled: just rewire graph without aux.
-            buildGraph();
-            replaceTracksOnActivePCs();
-            return;
+            buildGraph(); replaceTracksOnActivePCs(); return;
+        }
+        await ensureProcessedStream();
+        replaceTracksOnActivePCs();
+    }
+    async function rebuildAux2() {
+        try { if (aux2RawStream) aux2RawStream.getTracks().forEach(t => t.stop()); } catch {}
+        aux2RawStream = null; aux2SrcNode = null;
+        if (!settings.aux2DeviceId || settings.aux2DeviceId === 'none') {
+            buildGraph(); replaceTracksOnActivePCs(); return;
         }
         await ensureProcessedStream();
         replaceTracksOnActivePCs();
@@ -395,8 +520,10 @@
     async function rebuildAfterDeviceChange() {
         try { if (micRawStream) micRawStream.getTracks().forEach(t => t.stop()); } catch {}
         try { if (auxRawStream) auxRawStream.getTracks().forEach(t => t.stop()); } catch {}
+        try { if (aux2RawStream) aux2RawStream.getTracks().forEach(t => t.stop()); } catch {}
         micRawStream = null; micSrcNode = null;
         auxRawStream = null; auxSrcNode = null;
+        aux2RawStream = null; aux2SrcNode = null;
         processedStream = null;
         await ensureProcessedStream();
         replaceTracksOnActivePCs();
@@ -471,83 +598,181 @@
     }
 
     // ---------- output (speaker) routing -----------------------------------
-    // Apply settings.outputDeviceId to every <audio>/<video> on the page so
-    // X's incoming Spaces audio plays out the device the user picks.
-    //
-    // setSinkId is async, so a naive "watch DOM for new <audio> and call
-    // setSinkId" loses the race against autoplay: the element begins playing
-    // on the system default for a few hundred ms before our redirect lands,
-    // which the user hears as feedback through their speakers.
-    //
-    // We close that race by:
-    //   1) Patching HTMLMediaElement.prototype.play to await setSinkId first.
-    //   2) Patching the srcObject setter so attaching a remote MediaStream
-    //      triggers setSinkId immediately, before the element transitions
-    //      to HAVE_ENOUGH_DATA and starts pushing audio.
-    //   3) Patching document.createElement('audio'/'video') and the global
-    //      Audio() constructor to register the element the instant it exists.
-    //   4) Pausing -> setSinkId -> resume on any element that's already
-    //      playing when output device changes.
+    // X Spaces renders remote audio via HTMLMediaElement with srcObject = MediaStream.
+    // HTMLMediaElement.setSinkId is unreliable here but AudioContext.setSinkId works
+    // (confirmed by test tone). So we tap each element's stream via
+    // createMediaStreamSource → route through xOutputCtx whose setSinkId is
+    // explicitly AWAITED before any audio flows through it.
 
     const knownMedia = new WeakSet();
+    const xRoutedElements = new WeakMap(); // element → { srcNode, gainNode, stream }
+
+    // Dedicated context for X playback routing. Uses _NativeAudioContext so
+    // our patchAudioContext doesn't fire a competing fire-and-forget setSinkId.
+    let xOutputCtx = null;
+    let xOutputCtxSink = null; // last successfully applied sinkId
+
+    async function ensureXOutputCtx() {
+        if (!xOutputCtx || xOutputCtx.state === 'closed') {
+            xOutputCtx = new _NativeAudioContext({ latencyHint: 'playback' });
+            xOutputCtxSink = null;
+        }
+        if (xOutputCtx.state === 'suspended') await xOutputCtx.resume().catch(() => {});
+        const id = currentSinkId();
+        if (id !== xOutputCtxSink && typeof xOutputCtx.setSinkId === 'function') {
+            try {
+                await xOutputCtx.setSinkId(id === 'default' ? '' : id);
+                xOutputCtxSink = id;
+                clearSinkError();
+            } catch (err) {
+                console.warn('[XCaster] xOutputCtx.setSinkId failed', err);
+                notifySinkError(err);
+            }
+        }
+        return xOutputCtx;
+    }
+
+    // Route an element's audio through xOutputCtx via createMediaElementSource.
+    // Works for BOTH src= (timeline videos, blob URLs) and srcObject= (Spaces WebRTC).
+    // createMediaElementSource detaches the element from the default output entirely,
+    // so audio only exits via xOutputCtx → selected device.
+    // NOTE: createMediaElementSource can only be called ONCE per element (browser
+    // restriction), so we cache the source node and never re-create it.
+    async function routeXElement(el) {
+        if (!el) return;
+        // Already routed? Just make sure the sink is current.
+        if (xRoutedElements.has(el)) {
+            await ensureXOutputCtx();
+            return;
+        }
+        try {
+            const ctx = await ensureXOutputCtx();
+            // Guard: createMediaElementSource throws if element was already attached
+            // to a different AudioContext. xOutputCtx is the only one we use for
+            // routing so this should never happen — but catch defensively.
+            const srcNode = ctx.createMediaElementSource(el);
+            const gainNode = ctx.createGain();
+            gainNode.gain.value = 1;
+            srcNode.connect(gainNode);
+            gainNode.connect(ctx.destination);
+            xRoutedElements.set(el, { srcNode, gainNode });
+            console.info('[XCaster] element routed to output device', el.tagName, el.src ? 'src=' : el.srcObject ? 'srcObject' : '(empty)');
+        } catch (err) {
+            console.warn('[XCaster] routeXElement failed', err, el);
+        }
+    }
+
+    // No-op kept for compatibility; once createMediaElementSource is called we
+    // can't undo it, and we don't need to — the element stays silent on default.
+    function unrouteXElement(_el) { /* intentionally empty */ }
+
+    function notifySinkError(err) {
+        const el = document.getElementById('xfw-spk-status');
+        if (el) {
+            el.textContent = `⚠ Routing failed: ${err.message || err}. Audio may be going to the wrong device.`;
+            el.className = 'xfw-spk-status xfw-spk-warn';
+        }
+        const tab = document.querySelector('.xfw-tab[data-pane="spk"]');
+        if (tab && !tab.querySelector('.xfw-tab-warn')) {
+            const badge = document.createElement('span');
+            badge.className = 'xfw-tab-warn';
+            badge.title = 'Output routing has errors';
+            tab.appendChild(badge);
+        }
+    }
+    function clearSinkError() {
+        const el = document.getElementById('xfw-spk-status');
+        if (el) { el.textContent = ''; el.className = 'xfw-spk-status'; }
+        document.querySelector('.xfw-tab-warn')?.remove();
+    }
 
     function currentSinkId() { return settings.outputDeviceId || 'default'; }
 
+    // Fallback setSinkId for elements with no srcObject (static src= audio).
     async function ensureSink(el) {
         if (!el || typeof el.setSinkId !== 'function') return;
         const id = currentSinkId();
         if (el.__xfwSink === id) return;
         try {
-            // Mute briefly during the swap so any pre-redirect samples never
-            // hit the system speakers. We restore on completion.
-            const wasMuted = el.muted;
-            el.muted = true;
-            await el.setSinkId(id);
+            await el.setSinkId(id === 'default' ? '' : id);
             el.__xfwSink = id;
-            el.muted = wasMuted;
         } catch (err) {
-            console.warn('[XCaster] setSinkId failed', err);
+            console.warn('[XCaster] setSinkId fallback failed', err);
+        }
+    }
+
+    async function testOutputDevice() {
+        const statusEl = document.getElementById('xfw-spk-status');
+        let ctx;
+        try {
+            // Use the native constructor (bypass patchAudioContext) so the
+            // explicit awaited setSinkId below is the only sink call \u2014 no
+            // race with the patch's fire-and-forget setSinkId.
+            ctx = new _NativeAudioContext({ latencyHint: 'interactive' });
+            if (typeof ctx.setSinkId === 'function') {
+                const id = currentSinkId();
+                await ctx.setSinkId(id === 'default' ? '' : id);
+            }
+            // Resume in case autoplay policy left it suspended.
+            if (ctx.state === 'suspended') await ctx.resume().catch(() => {});
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            gain.gain.value = 0.12;
+            osc.type = 'sine';
+            osc.frequency.value = 880;
+            osc.connect(gain);
+            gain.connect(ctx.destination);
+            osc.start();
+            osc.stop(ctx.currentTime + 0.5);
+            osc.addEventListener('ended', () => { setTimeout(() => { try { ctx.close(); } catch {} }, 200); });
+            if (statusEl) {
+                statusEl.textContent = 'Tone sent \u2014 did you hear it from the right device?';
+                statusEl.className = 'xfw-spk-status xfw-spk-ok';
+            }
+            document.querySelector('.xfw-tab-warn')?.remove();
+        } catch (err) {
+            try { ctx && ctx.close(); } catch {}
+            console.warn('[XCaster] test tone failed', err);
+            if (statusEl) {
+                statusEl.textContent = `⚠ Routing failed: ${err.message || err}`;
+                statusEl.className = 'xfw-spk-status xfw-spk-warn';
+            }
         }
     }
 
     function registerMedia(el) {
         if (!el || knownMedia.has(el)) return;
         knownMedia.add(el);
-        // Apply sink immediately. If element isn't yet allowed to call
-        // setSinkId (no source), this just no-ops; play() override handles it.
-        ensureSink(el);
+        routeXElement(el);
     }
 
-    function applySinkToAll() {
+    // Update output routing on all elements. Awaits sink before re-routing.
+    async function applySinkToAll() {
+        await ensureXOutputCtx();      // set xOutputCtx sink first, awaited
+        applySinkToAllContexts();       // update mic/aux AudioContexts
         document.querySelectorAll('audio, video').forEach(el => {
-            // Pause -> setSinkId -> resume so a running element doesn't keep
-            // bleeding to the previous (or default) device during the swap.
-            const wasPlaying = !el.paused && !el.ended;
-            const swap = async () => {
-                try { if (wasPlaying) el.pause(); } catch {}
-                await ensureSink(el);
-                try { if (wasPlaying) await el.play(); } catch {}
-            };
-            swap();
-            registerMedia(el);
+            registerMedia(el); // routes if not already; ensureXOutputCtx handles sink
         });
     }
 
-    // (1) Wrap play() so it awaits sink redirection before starting.
+    let sinkScanInterval = 0;
+    function startSinkScan() {
+        if (sinkScanInterval) return;
+        sinkScanInterval = setInterval(async () => {
+            // Re-sync xOutputCtx sink in case device changed externally
+            await ensureXOutputCtx();
+            applySinkToAllContexts();
+            document.querySelectorAll('audio, video').forEach(registerMedia);
+        }, 2000);
+    }
+    function stopSinkScan() { clearInterval(sinkScanInterval); sinkScanInterval = 0; }
+
     const origPlay = HTMLMediaElement.prototype.play;
     HTMLMediaElement.prototype.play = function () {
         registerMedia(this);
-        const id = currentSinkId();
-        if (typeof this.setSinkId === 'function' && this.__xfwSink !== id) {
-            return this.setSinkId(id)
-                .then(() => { this.__xfwSink = id; })
-                .catch(() => {})
-                .then(() => origPlay.call(this));
-        }
         return origPlay.call(this);
     };
 
-    // (2) Trigger sink application the moment a stream is attached.
     const srcObjectDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'srcObject');
     if (srcObjectDesc && srcObjectDesc.set) {
         Object.defineProperty(HTMLMediaElement.prototype, 'srcObject', {
@@ -557,7 +782,6 @@
             set: function (val) {
                 srcObjectDesc.set.call(this, val);
                 registerMedia(this);
-                ensureSink(this);
             },
         });
     }
@@ -613,12 +837,23 @@
         <div id="xfw-panel" role="dialog" aria-label="XCaster audio">
             <div class="xfw-header">
                 <div class="xfw-title">XCaster</div>
-                <div class="xfw-version">v0.4.1</div>
+                <div class="xfw-version">v0.5.0</div>
+            </div>
+
+            <!-- PERSISTENT METERS (always visible) -->
+            <div class="xfw-meters-bar">
+                <div class="xfw-meter-row"><div class="xfw-meter-label">Mic</div><div class="xfw-meter"><div id="xfw-meter-mic" class="xfw-meter-fill"></div></div></div>
+                <div class="xfw-meter-row"><div class="xfw-meter-label">Aux 1</div><div class="xfw-meter"><div id="xfw-meter-aux" class="xfw-meter-fill"></div></div></div>
+                <div class="xfw-meter-row"><div class="xfw-meter-label">Aux 2</div><div class="xfw-meter"><div id="xfw-meter-aux2" class="xfw-meter-fill"></div></div></div>
+                <div class="xfw-meter-row"><div class="xfw-meter-label">Mix</div><div class="xfw-meter"><div id="xfw-meter-in" class="xfw-meter-fill"></div></div></div>
+                <div class="xfw-meter-row"><div class="xfw-meter-label">Out</div><div class="xfw-meter"><div id="xfw-meter-out" class="xfw-meter-fill"></div></div></div>
+                <div class="xfw-meter-row"><div class="xfw-meter-label">GR</div><div class="xfw-meter"><div id="xfw-meter-gr" class="xfw-gr-meter-fill"></div></div></div>
             </div>
 
             <div class="xfw-tabs">
                 <button class="xfw-tab xfw-active" data-pane="mic">Mic</button>
-                <button class="xfw-tab" data-pane="aux">Aux</button>
+                <button class="xfw-tab" data-pane="aux">Aux 1</button>
+                <button class="xfw-tab" data-pane="aux2">Aux 2</button>
                 <button class="xfw-tab" data-pane="spk">Speakers</button>
                 <button class="xfw-tab" data-pane="dsp">Processing</button>
                 <button class="xfw-tab" data-pane="pre">Presets</button>
@@ -637,51 +872,114 @@
                         <div>Mute mic<span class="xfw-help">Silence the mic channel without disabling the device.</span></div>
                         <div class="xfw-toggle" data-key="micMuted"></div>
                     </div>
+                    <div class="xfw-row">
+                        <div>Monitor in headset<span class="xfw-help">Hear yourself. OFF avoids latency/feedback.</span></div>
+                        <div class="xfw-toggle" data-key="micMonitor"></div>
+                    </div>
+                    <div class="xfw-row">
+                        <div>Cue (monitor only)<span class="xfw-help">Hear it in your headset but DON'T send to X. Use to preload audio.</span></div>
+                        <div class="xfw-toggle" data-key="micCue"></div>
+                    </div>
                     <div class="xfw-slider-row" data-slider="micGainDb" data-min="-40" data-max="18" data-step="0.5" data-suffix=" dB" data-label="Mic level"></div>
                 </div>
                 <div class="xfw-section">
                     <label class="xfw-label">Browser capture (off = clean signal)</label>
                     <div class="xfw-row">
                         <div>Auto Gain Control<span class="xfw-help">Browser AGC. Keep OFF — we do compression instead.</span></div>
-                        <div class="xfw-toggle" data-key="autoGainControl"></div>
+                        <div class="xfw-toggle" data-key="micAutoGainControl"></div>
                     </div>
                     <div class="xfw-row">
                         <div>Noise Suppression<span class="xfw-help">Browser denoiser. OFF for music, ON if very noisy room.</span></div>
-                        <div class="xfw-toggle" data-key="noiseSuppression"></div>
+                        <div class="xfw-toggle" data-key="micNoiseSuppression"></div>
                     </div>
                     <div class="xfw-row">
                         <div>Echo Cancellation<span class="xfw-help">Only useful with speakers + open mic. Usually OFF.</span></div>
-                        <div class="xfw-toggle" data-key="echoCancellation"></div>
-                    </div>
-                </div>
-                <div class="xfw-section">
-                    <label class="xfw-label">Live levels</label>
-                    <div class="xfw-meters">
-                        <div class="xfw-meter-row"><div class="xfw-meter-label">Mic</div><div class="xfw-meter"><div id="xfw-meter-mic" class="xfw-meter-fill"></div></div></div>
-                        <div class="xfw-meter-row"><div class="xfw-meter-label">Aux</div><div class="xfw-meter"><div id="xfw-meter-aux" class="xfw-meter-fill"></div></div></div>
-                        <div class="xfw-meter-row"><div class="xfw-meter-label">Mix</div><div class="xfw-meter"><div id="xfw-meter-in" class="xfw-meter-fill"></div></div></div>
-                        <div class="xfw-meter-row"><div class="xfw-meter-label">Out</div><div class="xfw-meter"><div id="xfw-meter-out" class="xfw-meter-fill"></div></div></div>
-                        <div class="xfw-meter-row"><div class="xfw-meter-label">GR</div><div class="xfw-meter"><div id="xfw-meter-gr" class="xfw-gr-meter-fill"></div></div></div>
+                        <div class="xfw-toggle" data-key="micEchoCancellation"></div>
                     </div>
                 </div>
             </div>
 
-            <!-- AUX PANE -->
+            <!-- AUX 1 PANE -->
             <div class="xfw-pane" data-pane="aux">
                 <div class="xfw-section">
-                    <label class="xfw-label" for="xfw-aux">Aux device (mix into X alongside mic)</label>
+                    <label class="xfw-label" for="xfw-aux">Aux 1 device — desktop audio</label>
                     <select id="xfw-aux" class="xfw-select"></select>
                     <div class="xfw-help" style="margin-top:6px;color:var(--xfw-muted);font-size:11px;">
-                        Pick a virtual cable, line-in, or any second capture device to mix audio (music, soundboard, browser tab via VB-CABLE) into your X transmission. Set to <b>None</b> to disable.
+                        Desktop system audio (e.g. via VB-CABLE). Set to <b>None</b> to disable.
                     </div>
                 </div>
                 <div class="xfw-section">
-                    <label class="xfw-label">Aux channel</label>
+                    <label class="xfw-label">Aux 1 channel</label>
                     <div class="xfw-row">
-                        <div>Mute aux<span class="xfw-help">Silence the aux channel without disabling the device.</span></div>
+                        <div>Mute aux 1<span class="xfw-help">Silence without disabling the device.</span></div>
                         <div class="xfw-toggle" data-key="auxMuted"></div>
                     </div>
-                    <div class="xfw-slider-row" data-slider="auxGainDb" data-min="-40" data-max="18" data-step="0.5" data-suffix=" dB" data-label="Aux level"></div>
+                    <div class="xfw-row">
+                        <div>Monitor in headset<span class="xfw-help">Hear Aux 1 (desktop audio) in your headphones.</span></div>
+                        <div class="xfw-toggle" data-key="auxMonitor"></div>
+                    </div>
+                    <div class="xfw-row">
+                        <div>Cue (monitor only)<span class="xfw-help">Hear it in your headset but DON'T send to X. Use to preload audio.</span></div>
+                        <div class="xfw-toggle" data-key="auxCue"></div>
+                    </div>
+                    <div class="xfw-slider-row" data-slider="auxGainDb" data-min="-40" data-max="18" data-step="0.5" data-suffix=" dB" data-label="Aux 1 level"></div>
+                </div>
+                <div class="xfw-section">
+                    <label class="xfw-label">Browser capture (off = clean signal)</label>
+                    <div class="xfw-row">
+                        <div>Auto Gain Control<span class="xfw-help">Browser AGC. Keep OFF — we do compression instead.</span></div>
+                        <div class="xfw-toggle" data-key="auxAutoGainControl"></div>
+                    </div>
+                    <div class="xfw-row">
+                        <div>Noise Suppression<span class="xfw-help">Browser denoiser. OFF for music, ON if very noisy room.</span></div>
+                        <div class="xfw-toggle" data-key="auxNoiseSuppression"></div>
+                    </div>
+                    <div class="xfw-row">
+                        <div>Echo Cancellation<span class="xfw-help">Only useful with speakers + open mic. Usually OFF.</span></div>
+                        <div class="xfw-toggle" data-key="auxEchoCancellation"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- AUX 2 PANE -->
+            <div class="xfw-pane" data-pane="aux2">
+                <div class="xfw-section">
+                    <label class="xfw-label" for="xfw-aux2">Aux 2 device — external receiver / mixer</label>
+                    <select id="xfw-aux2" class="xfw-select"></select>
+                    <div class="xfw-help" style="margin-top:6px;color:var(--xfw-muted);font-size:11px;">
+                        External audio hardware (receiver, mixer, line-in). Set to <b>None</b> to disable.
+                    </div>
+                </div>
+                <div class="xfw-section">
+                    <label class="xfw-label">Aux 2 channel</label>
+                    <div class="xfw-row">
+                        <div>Mute aux 2<span class="xfw-help">Silence without disabling the device.</span></div>
+                        <div class="xfw-toggle" data-key="aux2Muted"></div>
+                    </div>
+                    <div class="xfw-row">
+                        <div>Monitor in headset<span class="xfw-help">Hear Aux 2 (external hardware) in your headphones.</span></div>
+                        <div class="xfw-toggle" data-key="aux2Monitor"></div>
+                    </div>
+                    <div class="xfw-row">
+                        <div>Cue (monitor only)<span class="xfw-help">Hear it in your headset but DON'T send to X. Use to preload audio.</span></div>
+                        <div class="xfw-toggle" data-key="aux2Cue"></div>
+                    </div>
+                    <div class="xfw-slider-row" data-slider="aux2GainDb" data-min="-40" data-max="18" data-step="0.5" data-suffix=" dB" data-label="Aux 2 level"></div>
+                </div>
+                <div class="xfw-section">
+                    <label class="xfw-label">Browser capture (off = clean signal)</label>
+                    <div class="xfw-row">
+                        <div>Auto Gain Control<span class="xfw-help">Browser AGC. Keep OFF — we do compression instead.</span></div>
+                        <div class="xfw-toggle" data-key="aux2AutoGainControl"></div>
+                    </div>
+                    <div class="xfw-row">
+                        <div>Noise Suppression<span class="xfw-help">Browser denoiser. OFF for music, ON if very noisy room.</span></div>
+                        <div class="xfw-toggle" data-key="aux2NoiseSuppression"></div>
+                    </div>
+                    <div class="xfw-row">
+                        <div>Echo Cancellation<span class="xfw-help">Only useful with speakers + open mic. Usually OFF.</span></div>
+                        <div class="xfw-toggle" data-key="aux2EchoCancellation"></div>
+                    </div>
                 </div>
             </div>
 
@@ -692,6 +990,15 @@
                     <select id="xfw-output" class="xfw-select"></select>
                     <div class="xfw-help" style="margin-top:6px;color:var(--xfw-muted);font-size:11px;">
                         X's incoming Spaces audio plays directly to this device. The mic graph never receives this audio, so there is no feedback loop into what you transmit.
+                    </div>
+                </div>
+                <div class="xfw-section">
+                    <div class="xfw-buttons">
+                        <button id="xfw-test-spk" class="xfw-btn">Test speaker</button>
+                    </div>
+                    <div id="xfw-spk-status" class="xfw-spk-status"></div>
+                    <div class="xfw-help" style="margin-top:6px;color:var(--xfw-muted);font-size:11px;">
+                        Plays a short tone to confirm audio is reaching the selected device. If you hear it from your desktop speakers instead of the selected device, output routing is failing.
                     </div>
                 </div>
             </div>
@@ -810,7 +1117,7 @@
                 settings[key] = +input.value;
                 valSpan.textContent = formatVal(settings[key], suffix);
                 saveSettings(settings);
-                if (key === 'micGainDb' || key === 'auxGainDb') applyMixerLive();
+                if (key === 'micGainDb' || key === 'auxGainDb' || key === 'aux2GainDb') applyMixerLive();
                 else applySettingsLive();
             });
         });
@@ -838,11 +1145,11 @@
         }
         sel.value = settings.inputDeviceId || 'default';
 
-        // Aux dropdown reuses the same input list, plus a 'None' entry.
+        // Aux 1 dropdown
         const auxSel = document.getElementById('xfw-aux');
         if (auxSel) {
             auxSel.innerHTML = '';
-            const auxOpts = [{ deviceId: 'none', label: 'None (mic only)' }, ...devs];
+            const auxOpts = [{ deviceId: 'none', label: 'None (disabled)' }, ...devs];
             for (const d of auxOpts) {
                 const o = document.createElement('option');
                 o.value = d.deviceId || 'none';
@@ -850,6 +1157,19 @@
                 auxSel.appendChild(o);
             }
             auxSel.value = settings.auxDeviceId || 'none';
+        }
+        // Aux 2 dropdown
+        const aux2Sel = document.getElementById('xfw-aux2');
+        if (aux2Sel) {
+            aux2Sel.innerHTML = '';
+            const aux2Opts = [{ deviceId: 'none', label: 'None (disabled)' }, ...devs];
+            for (const d of aux2Opts) {
+                const o = document.createElement('option');
+                o.value = d.deviceId || 'none';
+                o.textContent = d.label || `Device (${(d.deviceId || '').slice(0, 6)})`;
+                aux2Sel.appendChild(o);
+            }
+            aux2Sel.value = settings.aux2DeviceId || 'none';
         }
     }
     async function populateOutputs() {
@@ -922,10 +1242,12 @@
         const grFill = document.getElementById('xfw-meter-gr');
         const micFill = document.getElementById('xfw-meter-mic');
         const auxFill = document.getElementById('xfw-meter-aux');
+        const aux2Fill = document.getElementById('xfw-meter-aux2');
         const inBuf = inputAnalyser ? new Uint8Array(inputAnalyser.fftSize) : null;
         const outBuf = outputAnalyser ? new Uint8Array(outputAnalyser.fftSize) : null;
         const micBuf = micAnalyser ? new Uint8Array(micAnalyser.fftSize) : null;
         const auxBuf = auxAnalyser ? new Uint8Array(auxAnalyser.fftSize) : null;
+        const aux2Buf = aux2Analyser ? new Uint8Array(aux2Analyser.fftSize) : null;
         const tick = () => {
             if (micAnalyser && micFill && micBuf) {
                 micAnalyser.getByteTimeDomainData(micBuf);
@@ -935,6 +1257,10 @@
                 auxAnalyser.getByteTimeDomainData(auxBuf);
                 auxFill.style.width = peakPct(auxBuf);
             } else if (auxFill) { auxFill.style.width = '0%'; }
+            if (aux2Analyser && aux2Fill && aux2Buf) {
+                aux2Analyser.getByteTimeDomainData(aux2Buf);
+                aux2Fill.style.width = peakPct(aux2Buf);
+            } else if (aux2Fill) { aux2Fill.style.width = '0%'; }
             if (inputAnalyser && inFill && inBuf) {
                 inputAnalyser.getByteTimeDomainData(inBuf);
                 inFill.style.width = peakPct(inBuf);
@@ -976,8 +1302,10 @@
                 await populateOutputs();
                 await ensureProcessedStream();
                 startMeters();
+                startSinkScan();
             } else {
                 stopMeters();
+                stopSinkScan();
             }
         });
 
@@ -1006,10 +1334,18 @@
             // bypass changes graph wiring
             if (key === 'bypass') { buildGraph(); replaceTracksOnActivePCs(); }
             // mute toggles update the per-channel gain live
-            if (key === 'micMuted' || key === 'auxMuted') applyMixerLive();
-            // browser-side capture toggles need a fresh raw stream
-            if (['autoGainControl', 'noiseSuppression', 'echoCancellation'].includes(key)) {
-                rebuildAfterDeviceChange();
+            if (key === 'micMuted' || key === 'auxMuted' || key === 'aux2Muted') applyMixerLive();
+            if (key === 'micMonitor' || key === 'auxMonitor' || key === 'aux2Monitor') applyMixerLive();
+            if (key === 'micCue' || key === 'auxCue' || key === 'aux2Cue') applyMixerLive();
+            // browser-side capture toggles need a fresh raw stream — only rebuild the affected channel
+            if (['micAutoGainControl', 'micNoiseSuppression', 'micEchoCancellation'].includes(key)) {
+                rebuildMic();
+            }
+            if (['auxAutoGainControl', 'auxNoiseSuppression', 'auxEchoCancellation'].includes(key)) {
+                rebuildAux();
+            }
+            if (['aux2AutoGainControl', 'aux2NoiseSuppression', 'aux2EchoCancellation'].includes(key)) {
+                rebuildAux2();
             }
         });
 
@@ -1029,12 +1365,25 @@
                 startMeters();
             });
         }
+        const aux2SelEl = document.getElementById('xfw-aux2');
+        if (aux2SelEl) {
+            aux2SelEl.addEventListener('change', async e => {
+                settings.aux2DeviceId = e.target.value;
+                saveSettings(settings);
+                await rebuildAux2();
+                startMeters();
+            });
+        }
         document.getElementById('xfw-output').addEventListener('change', e => {
             settings.outputDeviceId = e.target.value;
             saveSettings(settings);
+            clearSinkError();
             applySinkToAll();
             applySinkToAllContexts();
         });
+
+        const testSpkBtn = document.getElementById('xfw-test-spk');
+        if (testSpkBtn) testSpkBtn.addEventListener('click', () => testOutputDevice());
 
         // presets
         panel.querySelectorAll('.xfw-preset').forEach(b => {
@@ -1270,6 +1619,9 @@
             if (audioCtx && audioCtx.state === 'suspended') {
                 audioCtx.resume().catch(() => {});
             }
+            if (xOutputCtx && xOutputCtx.state === 'suspended') {
+                xOutputCtx.resume().catch(() => {});
+            }
             if (micRawStream) {
                 const t = micRawStream.getAudioTracks()[0];
                 if (t && t.readyState === 'ended') rebuildMic();
@@ -1278,7 +1630,32 @@
                 const t = auxRawStream.getAudioTracks()[0];
                 if (t && t.readyState === 'ended') rebuildAux();
             }
+            if (aux2RawStream && settings.aux2DeviceId && settings.aux2DeviceId !== 'none') {
+                const t = aux2RawStream.getAudioTracks()[0];
+                if (t && t.readyState === 'ended') rebuildAux2();
+            }
         }, 4000);
+    }
+
+    // ---------- worker keepalive --------------------------------------------
+    // Chromium throttles main-thread timers when the window is occluded, but
+    // Web Worker timers are exempt from that throttling. We spawn a tiny
+    // worker that pings the main thread every 250ms; the message handler
+    // resumes any suspended AudioContexts and forces the main thread to
+    // remain scheduled regularly. This eliminates audio choppiness when
+    // other apps cover the XCaster window.
+    function startWorkerKeepalive() {
+        try {
+            const src = `let id = setInterval(() => postMessage(0), 250);`;
+            const blob = new Blob([src], { type: 'application/javascript' });
+            const w = new Worker(URL.createObjectURL(blob));
+            w.onmessage = () => {
+                if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+                if (xOutputCtx && xOutputCtx.state === 'suspended') xOutputCtx.resume().catch(() => {});
+            };
+        } catch (err) {
+            console.warn('[XCaster] worker keepalive failed', err);
+        }
     }
 
     function install() {
@@ -1290,6 +1667,7 @@
         applyPanelPos();
         wire();
         startHealthWatchdog();
+        startWorkerKeepalive();
     }
     install();
 })();

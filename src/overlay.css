@@ -70,7 +70,7 @@ html.xfw-skin-on #react-root {
     position: fixed;
     right: 16px;
     bottom: 76px;
-    width: 400px;
+    width: 460px;
     max-height: calc(100vh - 110px);
     overflow-y: auto;
     background: var(--xfw-bg);
@@ -108,6 +108,18 @@ html.xfw-skin-on #react-root {
     padding: 6px 10px; font-size: 12px; cursor: pointer;
 }
 .xfw-tab.xfw-active { color: var(--xfw-text); border-bottom-color: var(--xfw-accent); }
+/* Warning badge on a tab button (e.g. Speakers routing error) */
+.xfw-tab-warn {
+    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--xfw-warn); margin-left: 5px; vertical-align: middle;
+}
+
+/* Speaker routing status line */
+.xfw-spk-status {
+    font-size: 11px; margin-top: 8px; min-height: 14px; line-height: 1.5;
+}
+.xfw-spk-ok  { color: var(--xfw-good); }
+.xfw-spk-warn { color: var(--xfw-warn); }
 
 .xfw-pane { display: none; }
 .xfw-pane.xfw-active { display: block; }
@@ -191,6 +203,13 @@ html.xfw-skin-on #react-root {
 .xfw-dot.xfw-off { background: var(--xfw-danger); }
 .xfw-dot.xfw-warn { background: var(--xfw-warn); }
 
+/* Persistent meters bar — always visible above tabs */
+.xfw-meters-bar {
+    display: flex; flex-direction: column; gap: 5px;
+    padding: 8px 0 10px;
+    border-bottom: 1px solid var(--xfw-border);
+    margin-bottom: 2px;
+}
 .xfw-meters { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
 .xfw-meter-row { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--xfw-muted); }
 .xfw-meter-row .xfw-meter-label { width: 44px; }
