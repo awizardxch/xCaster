@@ -8,7 +8,7 @@ It ships its own Chromium (via Electron), disables WebRTC's automatic gain contr
 
 ## Download
 
-**[XCaster v0.4.1 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v0.4.1/XCaster-win32-x64.zip)**
+**[XCaster v0.5.0 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v0.5.0/XCaster-win32-x64.zip)**
 
 Extract the zip and run `XCaster.exe` — no installer required.
 
@@ -17,12 +17,15 @@ Extract the zip and run `XCaster.exe` — no installer required.
 ## Features
 
 - **WebRTC AGC disabled** — X Spaces cannot auto-level, duck, or re-process your microphone
-- **2-channel mixer** — Mic input + Aux input (music, soundboard, second device) summed pre-DSP
+- **3-channel mixer** — Mic + Aux 1 (desktop audio) + Aux 2 (external receiver/mixer) summed pre-DSP
+- **Per-channel controls** — Level, Mute, Monitor in headset, Cue (PFL), AGC/NS/EC toggles per channel
+- **Cue (PFL)** — Hear a channel in your headset without sending it to X. Preload audio before going live.
+- **Output routing** — All X Spaces + page audio routed through a dedicated AudioContext to your chosen headset device
 - **Full DSP chain** — High-pass filter → 3-band EQ → Compressor → Limiter → Makeup gain
-- **Speaker routing** — Choose which device X plays incoming Spaces audio to (no feedback loop)
-- **Live meters** — Mic / Aux / Mix / Out / Gain Reduction
+- **Live meters** — Mic / Aux 1 / Aux 2 / Mix / Out / Gain Reduction (persistent bar above tabs)
+- **Background priority** — Pinned to High process priority every 3 s via PowerShell; Web Worker keepalive prevents audio choppiness when minimized or covered by other apps
 - **Background skin** — Your `background.mp4` plays behind a semi-transparent X content window
-- **Draggable UI** — Drag the gear button (and the panel follows) anywhere on screen
+- **Draggable UI** — Drag the gear button anywhere on screen
 - **Presets** — Spaces loud+steady / Podcast / Music / Off (raw bypass)
 - **Persists settings** — All knobs saved in localStorage between sessions
 

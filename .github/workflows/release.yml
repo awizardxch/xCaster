@@ -7,6 +7,10 @@ on:
     tags:
       - 'v*'
 
+# softprops/action-gh-release needs write access to create the release.
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
