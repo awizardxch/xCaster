@@ -8,15 +8,18 @@
 // The WebRTC interception inside overlay.js only matters on x.com (it patches
 // getUserMedia so X Spaces receives the processed stream). On all other pages
 // the patch is present but harmlessly falls back to the real getUserMedia.
+//
+// NOTE: Patching navigator.mediaDevices in the preload's isolated world has
+// NO effect on x.com — page scripts live in the main world. The only way to
+// intercept getUserMedia is via webFrame.executeJavaScript (main world), which
+// is what overlay.js does when injected below. This matches exactly how v0.5.0
+// worked.
 
 'use strict';
 
-const { webFrame } = require('electron');
+const { webFrame, ipcRenderer } = require('electron');
 const fs   = require('fs');
 const path = require('path');
-
-// NOTE: Shell ↔ overlay IPC is handled entirely by wv.executeJavaScript in
-// shell.js. No bridge code is needed in the preload.
 
 const cssText = (() => {
     try { return fs.readFileSync(path.join(__dirname, 'overlay.css'), 'utf8'); } catch { return ''; }
@@ -39,11 +42,22 @@ function injectStyle() {
 async function injectScript() {
     if (!jsText) return;
     try {
-        // Mark this as a webview context so overlay.js knows not to auto-start
-        // xCaster capture (that only happens in the shell window).
-        await webFrame.executeJavaScript('window.__xfwIsWebview = true;', false);
+        // Inject the IPC bridge + flags into the main world first so overlay.js
+        // can use them immediately when it runs.
+        await webFrame.executeJavaScript(`
+            window.__xcBroadcastBridge = {
+                getOffer:      () => require('electron').ipcRenderer.invoke('xfw:broadcast-offer'),
+                applyAnswer:   (id, sdp) => require('electron').ipcRenderer.invoke('xfw:broadcast-answer', id, sdp),
+                getSettings:   () => require('electron').ipcRenderer.invoke('xfw:get-settings'),
+                getXcastOffer: () => require('electron').ipcRenderer.invoke('xfw:get-xcast-offer'),
+            };
+            window.__xfwIsWebview = true;
+        `, false);
+        // Inject overlay.js into x.com's main world — same as v0.5.0.
+        // overlay.js patches getUserMedia synchronously when this executes,
+        // before x.com scripts run.
         await webFrame.executeJavaScript(jsText, false);
-        console.info('[XCaster] overlay inject requested');
+        console.info('[XCaster] overlay injected');
     } catch (err) {
         console.warn('[XCaster] executeJavaScript failed, falling back to <script> tag', err);
         try {
@@ -64,4 +78,3 @@ function inject() {
 inject();
 document.addEventListener('DOMContentLoaded', inject, { once: true });
 window.addEventListener('load', inject, { once: true });
-

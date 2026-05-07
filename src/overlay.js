@@ -29,7 +29,8 @@
         inputDeviceId: 'default',           // mic (headset)
         auxDeviceId: 'none',                // aux 1 — desktop audio
         aux2DeviceId: 'none',               // aux 2 — external receiver/mixer
-        outputDeviceId: 'default',          // playback for X
+        outputDeviceId: 'default',          // playback / monitor (headset)
+        broadcastDeviceId: 'none',          // broadcast out — route full mix here (e.g. virtual cable input)
         // Per-channel mixer
         micGainDb: 0,
         micMuted: false,
@@ -127,6 +128,9 @@
     let comp = null, limiter = null, makeup = null;
     let processedDest = null;
     let processedStream = null;
+    let xBroadcastCtx = null;       // dedicated AudioContext for broadcast out device
+    let xBroadcastCtxSink = null;   // last sinkId applied to xBroadcastCtx
+    let broadcastSrcNode = null;    // source node inside xBroadcastCtx
     let inputAnalyser = null;
     let outputAnalyser = null;
     let micAnalyser = null, auxAnalyser = null, aux2Analyser = null, xcastAnalyser = null;
@@ -233,8 +237,9 @@
 
     function buildGraph() {
         const ctx = ensureAudioContext();
-        // Allow graph build when xcast has sources even if mic/aux aren't open.
-        if (!micSrcNode && !auxSrcNode && !aux2SrcNode && !xcastSrcNodes.length) return;
+        // Always build — even with zero sources we need processedDest.stream so
+        // the WebRTC relay has a live (possibly silent) track ready for X before
+        // the user opens the mixer or adds any sources.
 
         // Tear down existing wiring on every node we touch.
         try { micSrcNode && micSrcNode.disconnect(); } catch {}
@@ -406,6 +411,9 @@
         // the user's selected output device. Done async after ensureXOutputCtx
         // has set the sink, so first sample lands on the right device.
         attachMonitorToOutput(monitorDest.stream);
+        // Route the fully processed mix to the broadcast output device (virtual cable).
+        // Always on — independent of per-channel monitor toggles and cue state.
+        attachBroadcastToOutput(processedDest.stream);
     }
 
     let monitorSrcNode = null; // node inside xOutputCtx
@@ -418,6 +426,42 @@
             console.info('[XCaster] monitor bus attached to output device');
         } catch (err) {
             console.warn('[XCaster] attachMonitorToOutput failed', err);
+        }
+    }
+
+    // Broadcast out — routes the fully processed mix to a separate device
+    // (e.g. virtual cable input) at all times, independent of monitor toggles.
+    // X Spaces receives this via CABLE Output selected as the mic in X's UI.
+    async function ensureXBroadcastCtx() {
+        const id = settings.broadcastDeviceId;
+        if (!id || id === 'none') return null;
+        if (!xBroadcastCtx || xBroadcastCtx.state === 'closed') {
+            xBroadcastCtx = new _NativeAudioContext({ latencyHint: 'playback' });
+            xBroadcastCtxSink = null;
+        }
+        if (xBroadcastCtx.state === 'suspended') await xBroadcastCtx.resume().catch(() => {});
+        if (id !== xBroadcastCtxSink && typeof xBroadcastCtx.setSinkId === 'function') {
+            try {
+                await xBroadcastCtx.setSinkId(id === 'default' ? '' : id);
+                xBroadcastCtxSink = id;
+            } catch (err) {
+                console.warn('[XCaster] xBroadcastCtx.setSinkId failed', err);
+            }
+        }
+        return xBroadcastCtx;
+    }
+
+    async function attachBroadcastToOutput(stream) {
+        if (!stream) return;
+        try {
+            const ctx = await ensureXBroadcastCtx();
+            if (!ctx) return; // no broadcast device selected
+            if (broadcastSrcNode) { try { broadcastSrcNode.disconnect(); } catch {} }
+            broadcastSrcNode = ctx.createMediaStreamSource(stream);
+            broadcastSrcNode.connect(ctx.destination);
+            console.info('[XCaster] broadcast mix attached to broadcast device');
+        } catch (err) {
+            console.warn('[XCaster] attachBroadcastToOutput failed', err);
         }
     }
 
@@ -705,6 +749,115 @@
         replaceTracksOnActivePCs();
     }
 
+    // ---------- broadcast relay (shell side) --------------------------------
+    // Creates a local WebRTC peer connection that sends the fully processed mix
+    // to a webview tab. The webview intercepts getUserMedia and receives this
+    // track instead of using a physical virtual cable. No OS-level routing
+    // needed — the audio stays entirely inside the Electron process.
+    // Patch Opus SDP parameters for maximum audio quality.
+    // - maxaveragebitrate=510000 : 510 kbps — effectively transparent
+    // - stereo=1 / sprop-stereo=1 : stereo if source is stereo
+    // - usedtx=0 : disable Discontinuous Transmission (causes pumping/silence)
+    // - useinbandfec=0 : disable FEC (local relay, zero packet loss)
+    // - cbr=1 : constant bitrate — prevents bitrate dips during silence
+    function _patchOpusSdp(sdp) {
+        return sdp.replace(/(a=rtpmap:\d+ opus\/48000\/2\r?\n)/g, (m) => {
+            return m + 'a=fmtp:' + m.match(/(\d+)/)[1] +
+                ' minptime=10;useinbandfec=0;usedtx=0;stereo=1;sprop-stereo=1;maxaveragebitrate=510000;cbr=1\r\n';
+        // Replace any existing fmtp line for opus payload type too
+        });
+    }
+    // More robust version: find opus PT and set/replace its fmtp line entirely.
+    function patchOpusSdp(sdp) {
+        const ptMatch = sdp.match(/a=rtpmap:(\d+) opus\/48000/i);
+        if (!ptMatch) return sdp;
+        const pt = ptMatch[1];
+        const fmtp = `a=fmtp:${pt} minptime=10;useinbandfec=0;usedtx=0;stereo=1;sprop-stereo=1;maxaveragebitrate=510000;cbr=1`;
+        // Remove any existing fmtp for this PT, then insert after rtpmap line.
+        let out = sdp.replace(new RegExp(`a=fmtp:${pt} [^\r\n]+[\r\n]+`, 'g'), '');
+        out = out.replace(new RegExp(`(a=rtpmap:${pt} opus[^\r\n]+[\r\n])`), `$1${fmtp}\r\n`);
+        return out;
+    }
+
+    const _broadcastPCs = {};
+    window.__xcCreateBroadcastOffer = async () => {
+        try {
+            if (!processedStream) buildGraph();
+            if (!processedStream) await ensureProcessedStream();
+            // Last resort: wait up to 2 s for the graph to become ready.
+            if (!processedStream) {
+                await new Promise(r => setTimeout(r, 2000));
+                buildGraph();
+            }
+            if (!processedStream) return null;
+            const pc = new RTCPeerConnection({ iceServers: [] });
+            const id = 'bc_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+            _broadcastPCs[id] = pc;
+            for (const t of processedStream.getAudioTracks()) pc.addTrack(t.clone());
+            // Gather all ICE candidates before returning (trickle-off approach).
+            const offerSdp = await new Promise((resolve) => {
+                let settled = false;
+                const finish = () => { if (!settled) { settled = true; resolve(pc.localDescription?.sdp || null); } };
+                pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') finish(); };
+                pc.createOffer().then(o => {
+                    const patched = { type: o.type, sdp: patchOpusSdp(o.sdp) };
+                    return pc.setLocalDescription(patched);
+                });
+                setTimeout(finish, 3000); // hard timeout
+            });
+            if (!offerSdp) { delete _broadcastPCs[id]; return null; }
+            return { id, sdp: offerSdp };
+        } catch (err) {
+            console.warn('[XCaster] createBroadcastOffer failed', err);
+            return null;
+        }
+    };
+    window.__xcApplyBroadcastAnswer = async (id, answerSdp) => {
+        try {
+            const pc = _broadcastPCs[id];
+            if (!pc) return;
+            await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
+        } catch (err) {
+            console.warn('[XCaster] applyBroadcastAnswer failed', err);
+        }
+    };
+
+    // Expose current settings to webview so it can mirror our device selection.
+    window.__xcGetSettings = () => JSON.stringify(settings);
+
+    // Creates a relay carrying ONLY the xCaster tab-capture mix.
+    // Webview uses this as its xcast source node — mic/aux are captured directly
+    // in the webview context (one Opus encode, same as v0.5.0).
+    window.__xcCreateXcastOffer = async () => {
+        try {
+            if (!xcastSrcNodes.length) return { empty: true };
+            const ctx = ensureAudioContext();
+            const xcastOnlyDest = ctx.createMediaStreamDestination();
+            const premix = ctx.createGain();
+            premix.connect(xcastOnlyDest);
+            for (const node of xcastSrcNodes) { try { node.connect(premix); } catch {} }
+            const pc = new RTCPeerConnection({ iceServers: [] });
+            const id = 'xc_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+            _broadcastPCs[id] = pc;
+            for (const t of xcastOnlyDest.stream.getAudioTracks()) pc.addTrack(t);
+            const offerSdp = await new Promise((resolve) => {
+                let settled = false;
+                const finish = () => { if (!settled) { settled = true; resolve(pc.localDescription?.sdp || null); } };
+                pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') finish(); };
+                pc.createOffer().then(o => {
+                    const patched = { type: o.type, sdp: patchOpusSdp(o.sdp) };
+                    return pc.setLocalDescription(patched);
+                });
+                setTimeout(finish, 3000);
+            });
+            if (!offerSdp) { delete _broadcastPCs[id]; return null; }
+            return { id, sdp: offerSdp };
+        } catch (err) {
+            console.warn('[XCaster] createXcastOffer failed', err);
+            return null;
+        }
+    };
+
     // ---------- getUserMedia interception ----------------------------------
     // Save originals BEFORE anything else can capture references.
     const md = navigator.mediaDevices;
@@ -713,7 +866,55 @@
 
     md.getUserMedia = async function (constraints) {
         try {
-            // Only intercept when audio is requested.
+            if (window.__xfwIsWebview) {
+                // ── Webview context (x.com tab) ──────────────────────────────
+                // Same approach as v0.5.0: build the DSP graph directly here in
+                // x.com's renderer so there is exactly ONE Opus encode path
+                // (x.com's WebRTC sender). No relay, no cross-process audio.
+                //
+                // We sync device settings from the shell first so mic/aux device
+                // IDs, gains, and processing toggles match what the user set in
+                // the xCaster panel.
+                if (!constraints?.audio) return __xfwOriginalGUM(constraints);
+                try {
+                    const bridge = window.__xcBroadcastBridge;
+                    if (bridge) {
+                        const settingsJson = await bridge.getSettings();
+                        if (settingsJson) {
+                            const s = JSON.parse(settingsJson);
+                            Object.assign(settings, s);
+                            saveSettings(settings);
+                        }
+                    }
+                    await ensureProcessedStream();
+                    if (!processedStream) throw new Error('processedStream null');
+                    const audioTrack = processedStream.getAudioTracks()[0];
+                    if (!audioTrack) throw new Error('no audio track');
+                    // Disable Chrome's APM on our track so its AGC/NS/EC don't
+                    // re-process what xCaster's compressor/limiter already handled.
+                    try {
+                        await audioTrack.applyConstraints({
+                            autoGainControl: false,
+                            noiseSuppression: false,
+                            echoCancellation: false,
+                        });
+                    } catch {}
+                    const out = new MediaStream([audioTrack.clone()]);
+                    if (constraints.video) {
+                        try {
+                            const v = await __xfwOriginalGUM({ video: constraints.video });
+                            v.getVideoTracks().forEach(t => out.addTrack(t));
+                        } catch {}
+                    }
+                    console.info('[XCaster] getUserMedia → webview DSP graph (single encode, APM off)');
+                    return out;
+                } catch (err) {
+                    console.warn('[XCaster] webview DSP failed, falling back to raw mic', err);
+                    return __xfwOriginalGUM(constraints);
+                }
+            }
+
+            // Shell window: intercept and return processedStream.
             const wantsAudio = constraints && constraints.audio;
             const wantsVideo = constraints && constraints.video;
 
@@ -750,8 +951,26 @@
         window.RTCPeerConnection = function (...args) {
             const pc = new RealPC(...args);
             __xfwPCs.add(pc);
+            // Intercept createOffer/createAnswer so X's own outbound Opus encoder
+            // gets the same high-quality settings we use for the internal relay:
+            // no DTX (usedtx=0), constant bitrate (cbr=1), high bitrate, stereo.
+            // This is what fixes the "up and down" pumping remote listeners hear —
+            // it's caused by Opus DTX silencing low-energy frames during pauses.
+            const origCreateOffer = pc.createOffer.bind(pc);
+            pc.createOffer = async function (...a) {
+                const offer = await origCreateOffer(...a);
+                return { type: offer.type, sdp: patchOpusSdp(offer.sdp) };
+            };
+            const origCreateAnswer = pc.createAnswer.bind(pc);
+            pc.createAnswer = async function (...a) {
+                const answer = await origCreateAnswer(...a);
+                return { type: answer.type, sdp: patchOpusSdp(answer.sdp) };
+            };
             pc.addEventListener('connectionstatechange', () => {
                 if (['closed', 'failed'].includes(pc.connectionState)) __xfwPCs.delete(pc);
+                // When X's PC connects, push our relay/processed track into its senders
+                // so X's own AGC/NS/EC pipeline is bypassed at the WebRTC layer.
+                if (pc.connectionState === 'connected') replaceTracksOnActivePCs();
             });
             return pc;
         };
@@ -766,7 +985,10 @@
             try {
                 for (const sender of pc.getSenders()) {
                     if (sender.track && sender.track.kind === 'audio') {
-                        sender.replaceTrack(newTrack.clone());
+                        const t = newTrack.clone();
+                        // Disable APM so Chrome's AGC doesn't pump the level.
+                        t.applyConstraints({ autoGainControl: false, noiseSuppression: false, echoCancellation: false }).catch(() => {});
+                        sender.replaceTrack(t);
                     }
                 }
             } catch (e) { /* ignore */ }
@@ -1190,10 +1412,17 @@
             <!-- SPEAKERS PANE -->
             <div class="xfw-pane" data-pane="spk">
                 <div class="xfw-section">
-                    <label class="xfw-label" for="xfw-output">Output device (where X plays into your ears)</label>
+                    <label class="xfw-label" for="xfw-broadcast-out">Broadcast out (X injection)</label>
+                    <select id="xfw-broadcast-out" class="xfw-select"></select>
+                    <div class="xfw-help" style="margin-top:6px;color:var(--xfw-muted);font-size:11px;">
+                        The full mixed output is always routed here, regardless of monitor toggles. Point this at your virtual cable input, then select the cable output as the mic in X Spaces.
+                    </div>
+                </div>
+                <div class="xfw-section">
+                    <label class="xfw-label" for="xfw-output">Monitor device (your headset)</label>
                     <select id="xfw-output" class="xfw-select"></select>
                     <div class="xfw-help" style="margin-top:6px;color:var(--xfw-muted);font-size:11px;">
-                        X's incoming Spaces audio plays directly to this device. The mic graph never receives this audio, so there is no feedback loop into what you transmit.
+                        What you hear in your headphones. Controlled by per-channel Monitor toggles. Cued channels play here only and are excluded from the broadcast mix.
                     </div>
                 </div>
                 <div class="xfw-section">
@@ -1378,18 +1607,33 @@
         }
     }
     async function populateOutputs() {
-        const sel = document.getElementById('xfw-output');
-        if (!sel) return;
-        sel.innerHTML = '';
         const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audiooutput');
-        const opts = [{ deviceId: 'default', label: 'System default' }, ...devs];
-        for (const d of opts) {
-            const o = document.createElement('option');
-            o.value = d.deviceId || 'default';
-            o.textContent = d.label || `Output (${(d.deviceId || '').slice(0, 6)})`;
-            sel.appendChild(o);
+
+        const sel = document.getElementById('xfw-output');
+        if (sel) {
+            sel.innerHTML = '';
+            const opts = [{ deviceId: 'default', label: 'System default' }, ...devs];
+            for (const d of opts) {
+                const o = document.createElement('option');
+                o.value = d.deviceId || 'default';
+                o.textContent = d.label || `Output (${(d.deviceId || '').slice(0, 6)})`;
+                sel.appendChild(o);
+            }
+            sel.value = settings.outputDeviceId || 'default';
         }
-        sel.value = settings.outputDeviceId || 'default';
+
+        const bsel = document.getElementById('xfw-broadcast-out');
+        if (bsel) {
+            bsel.innerHTML = '';
+            const bopts = [{ deviceId: 'none', label: 'None (disabled)' }, ...devs];
+            for (const d of bopts) {
+                const o = document.createElement('option');
+                o.value = d.deviceId || 'none';
+                o.textContent = d.label || `Output (${(d.deviceId || '').slice(0, 6)})`;
+                bsel.appendChild(o);
+            }
+            bsel.value = settings.broadcastDeviceId || 'none';
+        }
     }
 
     // ---------- presets ----------------------------------------------------
@@ -1617,6 +1861,16 @@
             // Reattach the monitor bus so it plays through the newly selected device.
             if (monitorDest) attachMonitorToOutput(monitorDest.stream);
         });
+
+        const broadcastOutSel = document.getElementById('xfw-broadcast-out');
+        if (broadcastOutSel) {
+            broadcastOutSel.addEventListener('change', e => {
+                settings.broadcastDeviceId = e.target.value;
+                saveSettings(settings);
+                xBroadcastCtxSink = null; // force re-bind on next attach
+                if (processedDest) attachBroadcastToOutput(processedDest.stream);
+            });
+        }
 
         const testSpkBtn = document.getElementById('xfw-test-spk');
         if (testSpkBtn) testSpkBtn.addEventListener('click', () => testOutputDevice());
@@ -1890,6 +2144,7 @@
             w.onmessage = () => {
                 if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
                 if (xOutputCtx && xOutputCtx.state === 'suspended') xOutputCtx.resume().catch(() => {});
+                if (xBroadcastCtx && xBroadcastCtx.state === 'suspended') xBroadcastCtx.resume().catch(() => {});
             };
         } catch (err) {
             console.warn('[XCaster] worker keepalive failed', err);
@@ -1908,6 +2163,9 @@
         // Only starts if there is an active webview tab to capture (main.js
         // will deny the request otherwise and overlay shows 'Not capturing').
         if (!window.__xfwIsWebview) {
+            // Pre-build the audio graph immediately so processedStream is live
+            // before any webview calls getUserMedia and requests the relay offer.
+            buildGraph();
             setTimeout(() => startXcast(), 300);
         }
         startHealthWatchdog();

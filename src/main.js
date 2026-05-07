@@ -363,6 +363,45 @@ ipcMain.handle('xfw:open-external', (_e, url) => {
     } catch { /* ignore invalid URLs */ }
 });
 
+// IPC: broadcast relay — webview asks shell for a WebRTC offer carrying the
+// fully processed mix. Shell creates an RTCPeerConnection, adds the processed
+// stream track, and returns the SDP offer + session id. The webview then
+// completes the handshake so it receives the mix as a local MediaStreamTrack,
+// which it returns from getUserMedia — no physical virtual cable required.
+ipcMain.handle('xfw:broadcast-offer', async () => {
+    try {
+        return await mainWindow.webContents.executeJavaScript('window.__xcCreateBroadcastOffer()');
+    } catch (err) {
+        console.warn('[XCaster] broadcast-offer IPC failed', err);
+        return null;
+    }
+});
+ipcMain.handle('xfw:broadcast-answer', async (_e, id, answerSdp) => {
+    try {
+        const idJ = JSON.stringify(String(id));
+        const sdpJ = JSON.stringify(String(answerSdp));
+        await mainWindow.webContents.executeJavaScript(`window.__xcApplyBroadcastAnswer(${idJ}, ${sdpJ})`);
+    } catch (err) {
+        console.warn('[XCaster] broadcast-answer IPC failed', err);
+    }
+});
+ipcMain.handle('xfw:get-settings', async () => {
+    try {
+        return await mainWindow.webContents.executeJavaScript('window.__xcGetSettings()');
+    } catch (err) {
+        console.warn('[XCaster] get-settings IPC failed', err);
+        return null;
+    }
+});
+ipcMain.handle('xfw:get-xcast-offer', async () => {
+    try {
+        return await mainWindow.webContents.executeJavaScript('window.__xcCreateXcastOffer()');
+    } catch (err) {
+        console.warn('[XCaster] get-xcast-offer IPC failed', err);
+        return null;
+    }
+});
+
 // IPC: open a chrome-extension:// page in a real BrowserWindow so it has
 // the correct extension context (necessary for MetaMask popup / home page).
 ipcMain.handle('xfw:open-extension-page', (_e, extUrl) => {
