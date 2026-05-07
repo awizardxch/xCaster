@@ -314,7 +314,7 @@ function createWindow() {
                         dialog.showMessageBox(mainWindow, {
                             type: 'info',
                             title: 'About XCaster',
-                            message: 'XCaster v1.1.1',
+                            message: 'XCaster v1.1.2',
                             detail:
                                 'Standalone Windows shell for x.com with WebRTC AGC, noise suppression, and echo cancellation disabled.\n\n' +
                                 'v1.0.1 — Full multi-channel DSP mixer (Mic + Aux 1 + Aux 2 + xCaster), dual output routing (X Spaces injection + monitor/cue), reapply audio graph for clean channel selection, virtual cable auto-installer, compressor, limiter, EQ, background skin, and live meters.\n\n' +
@@ -345,10 +345,18 @@ app.whenReady().then(() => {
         }
     });
 
-    // Strip Content-Security-Policy and related headers from x.com responses so
-    // our injected overlay <script>/<style> is allowed to run. Without this, X's
-    // CSP blocks the gear button and DSP graph from ever appearing.
+    // Strip security headers from x.com/twitter.com responses only.
+    // - CSP / X-Frame-Options: would block our injected overlay script/style.
+    // - COOP / COEP / CORP: X Spaces loads cross-origin CDN audio/media. With
+    //   COEP: require-corp in place those resources are blocked by Chromium,
+    //   breaking the speaker list and Space connection. v0.5.0 stripped these
+    //   globally; we scope the strip to x.com so other sites keep their headers.
+    //   SharedArrayBuffer still works in Electron without cross-origin isolation.
     session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+        const url = details.url || '';
+        const isXDomain = /^https?:\/\/([a-z0-9-]+\.)?(x\.com|twitter\.com)(\/|$)/i.test(url);
+        if (!isXDomain) { callback({}); return; }
+
         const headers = details.responseHeaders || {};
         const stripped = {};
         for (const k of Object.keys(headers)) {

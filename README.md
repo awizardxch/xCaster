@@ -9,17 +9,32 @@ It ships its own Chromium (via Electron), disables WebRTC AGC at the engine leve
 ## Download
 
 **Windows (x64)**
-[XCaster v1.1.1 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.1.1/XCaster-win32-x64.zip)
+[XCaster v1.1.2 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.1.2/XCaster-win32-x64.zip)
 
 **macOS (Apple Silicon / arm64)**
-[XCaster v1.1.1 — XCaster-darwin-arm64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.1.1/XCaster-darwin-arm64.zip)
+[XCaster v1.1.2 — XCaster-darwin-arm64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.1.2/XCaster-darwin-arm64.zip)
 
 **macOS (Intel / x64)**
-[XCaster v1.1.1 — XCaster-darwin-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.1.1/XCaster-darwin-x64.zip)
+[XCaster v1.1.2 — XCaster-darwin-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.1.2/XCaster-darwin-x64.zip)
 
 Extract the zip and run `XCaster.exe` (Windows) or `XCaster.app` (macOS) — no installer required.
 
 > **macOS note:** First launch requires right-click → Open to bypass Gatekeeper (app is not notarized).
+
+---
+
+## What's new in v1.1.2
+
+### X Spaces speakers and connection fully restored
+- Restored stripping of `Cross-Origin-Embedder-Policy`, `Cross-Origin-Opener-Policy`, and `Cross-Origin-Resource-Policy` headers for x.com — scoped to x.com/twitter.com only (other sites keep their headers). `COEP: require-corp` was blocking X Spaces' cross-origin CDN audio/avatar resources, causing the speaker list to be empty and the Space connection to fail
+- Matches v0.5.0's proven header-stripping behaviour exactly
+
+---
+
+## What's new in v1.1.1
+
+### macOS builds added
+- GitHub Actions CI now produces three release artifacts on every tag: `XCaster-win32-x64.zip`, `XCaster-darwin-arm64.zip` (Apple Silicon), `XCaster-darwin-x64.zip` (Intel)
 
 ---
 
