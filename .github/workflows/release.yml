@@ -1,26 +1,24 @@
 name: Build & Release
 
-# Trigger: push a version tag like v0.4.2
-# Steps: install → build → zip → create GitHub Release → upload zip
+# Trigger: push a version tag like v1.1.0
+# Builds Windows (x64) and macOS (arm64 + x64 universal) in parallel,
+# then combines all artifacts into a single GitHub Release.
 on:
   push:
     tags:
       - 'v*'
 
-# softprops/action-gh-release needs write access to create the release.
 permissions:
   contents: write
 
 jobs:
-  build:
+  # ── Windows x64 ────────────────────────────────────────────────────────────
+  build-windows:
     runs-on: windows-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: 'npm'
@@ -30,39 +28,119 @@ jobs:
 
       - name: Build
         run: npm run package
-        env:
-          # electron-packager downloads the Electron binary from GitHub during
-          # the build. No cache needed on CI — it's a fresh runner each time.
-          ELECTRON_SKIP_BINARY_DOWNLOAD: '0'
 
-      - name: Zip distribution
+      - name: Zip
         shell: pwsh
         run: |
           Compress-Archive `
             -Path dist\XCaster-win32-x64 `
             -DestinationPath XCaster-win32-x64.zip `
             -CompressionLevel Optimal
-          $mb = [math]::Round((Get-Item XCaster-win32-x64.zip).Length / 1MB, 1)
-          Write-Host "Zip size: $mb MB"
+          Write-Host "Size: $([math]::Round((Get-Item XCaster-win32-x64.zip).Length/1MB,1)) MB"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-zip
+          path: XCaster-win32-x64.zip
+          retention-days: 1
+
+  # ── macOS arm64 (Apple Silicon) ────────────────────────────────────────────
+  build-mac-arm64:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npx electron-packager . XCaster --platform=darwin --arch=arm64 --out=dist --overwrite --asar --prune=true "--ignore=^/dist$" "--ignore=\\.zip$"
+
+      - name: Zip
+        run: |
+          cd dist
+          zip -r ../XCaster-darwin-arm64.zip XCaster-darwin-arm64
+          echo "Size: $(du -sh ../XCaster-darwin-arm64.zip | cut -f1)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-arm64-zip
+          path: XCaster-darwin-arm64.zip
+          retention-days: 1
+
+  # ── macOS x64 (Intel) ──────────────────────────────────────────────────────
+  build-mac-x64:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npx electron-packager . XCaster --platform=darwin --arch=x64 --out=dist --overwrite --asar --prune=true "--ignore=^/dist$" "--ignore=\\.zip$"
+
+      - name: Zip
+        run: |
+          cd dist
+          zip -r ../XCaster-darwin-x64.zip XCaster-darwin-x64
+          echo "Size: $(du -sh ../XCaster-darwin-x64.zip | cut -f1)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-x64-zip
+          path: XCaster-darwin-x64.zip
+          retention-days: 1
+
+  # ── Create GitHub Release with all three zips ──────────────────────────────
+  release:
+    needs: [build-windows, build-mac-arm64, build-mac-x64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-zip
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: mac-arm64-zip
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: mac-x64-zip
 
       - name: Extract release notes from tag annotation
         id: notes
-        shell: pwsh
         run: |
-          # Use the tag message as release notes, fall back to the tag name
-          $msg = git tag -l --format='%(contents)' $env:GITHUB_REF_NAME 2>$null
-          if (!$msg) { $msg = "Release $env:GITHUB_REF_NAME" }
-          # GitHub Actions multiline output
-          $delimiter = "EOF_$(New-Guid)"
-          echo "notes<<$delimiter" >> $env:GITHUB_OUTPUT
-          echo $msg >> $env:GITHUB_OUTPUT
-          echo $delimiter >> $env:GITHUB_OUTPUT
+          msg=$(git tag -l --format='%(contents)' "$GITHUB_REF_NAME" 2>/dev/null || true)
+          if [ -z "$msg" ]; then msg="Release $GITHUB_REF_NAME"; fi
+          delimiter="EOF_$(uuidgen)"
+          echo "notes<<$delimiter" >> "$GITHUB_OUTPUT"
+          echo "$msg" >> "$GITHUB_OUTPUT"
+          echo "$delimiter" >> "$GITHUB_OUTPUT"
 
-      - name: Create GitHub Release and upload asset
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           name: "XCaster ${{ github.ref_name }}"
           body: ${{ steps.notes.outputs.notes }}
-          files: XCaster-win32-x64.zip
           draft: false
           prerelease: false
+          files: |
+            XCaster-win32-x64.zip
+            XCaster-darwin-arm64.zip
+            XCaster-darwin-x64.zip

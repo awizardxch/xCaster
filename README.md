@@ -8,9 +8,18 @@ It ships its own Chromium (via Electron), disables WebRTC AGC at the engine leve
 
 ## Download
 
-**[XCaster v1.1.0 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.1.0/XCaster-win32-x64.zip)**
+**Windows (x64)**
+[XCaster v1.1.0 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.1.0/XCaster-win32-x64.zip)
 
-Extract the zip and run `XCaster.exe` — no installer required.
+**macOS (Apple Silicon / arm64)**
+[XCaster v1.1.0 — XCaster-darwin-arm64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.1.0/XCaster-darwin-arm64.zip)
+
+**macOS (Intel / x64)**
+[XCaster v1.1.0 — XCaster-darwin-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.1.0/XCaster-darwin-x64.zip)
+
+Extract the zip and run `XCaster.exe` (Windows) or `XCaster.app` (macOS) — no installer required.
+
+> **macOS note:** First launch requires right-click → Open to bypass Gatekeeper (app is not notarized).
 
 ---
 
