@@ -8,9 +8,19 @@ It ships its own Chromium (via Electron), disables WebRTC AGC at the engine leve
 
 ## Download
 
-**[XCaster v1.0.0 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.0.0/XCaster-win32-x64.zip)**
+**[XCaster v1.0.1 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.0.1/XCaster-win32-x64.zip)**
 
 Extract the zip and run `XCaster.exe` — no installer required.
+
+---
+
+## What's new in v1.0.1
+
+### Audio quality restored to v0.5.0 standard
+- DSP graph is now built directly inside X's webview context (same as v0.5.0) — single Opus encode, no relay
+- Chrome WebRTC AGC disabled at capture time via `applyConstraints` (autoGainControl / noiseSuppression / echoCancellation all off)
+- Opus DTX and CBR enforced on X's outbound WebRTC connection — eliminates audio pumping / level instability heard by remote listeners
+- Loopback bleed from Cable Output fixed — raw mic fallback no longer occurs
 
 ---
 
