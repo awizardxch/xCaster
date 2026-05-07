@@ -9,13 +9,13 @@ It ships its own Chromium (via Electron), disables WebRTC AGC at the engine leve
 ## Download
 
 **Windows (x64)**
-[XCaster v1.1.0 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.1.0/XCaster-win32-x64.zip)
+[XCaster v1.1.1 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.1.1/XCaster-win32-x64.zip)
 
 **macOS (Apple Silicon / arm64)**
-[XCaster v1.1.0 — XCaster-darwin-arm64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.1.0/XCaster-darwin-arm64.zip)
+[XCaster v1.1.1 — XCaster-darwin-arm64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.1.1/XCaster-darwin-arm64.zip)
 
 **macOS (Intel / x64)**
-[XCaster v1.1.0 — XCaster-darwin-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.1.0/XCaster-darwin-x64.zip)
+[XCaster v1.1.1 — XCaster-darwin-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.1.1/XCaster-darwin-x64.zip)
 
 Extract the zip and run `XCaster.exe` (Windows) or `XCaster.app` (macOS) — no installer required.
 

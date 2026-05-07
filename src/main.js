@@ -314,7 +314,7 @@ function createWindow() {
                         dialog.showMessageBox(mainWindow, {
                             type: 'info',
                             title: 'About XCaster',
-                            message: 'XCaster v1.1.0',
+                            message: 'XCaster v1.1.1',
                             detail:
                                 'Standalone Windows shell for x.com with WebRTC AGC, noise suppression, and echo cancellation disabled.\n\n' +
                                 'v1.0.1 — Full multi-channel DSP mixer (Mic + Aux 1 + Aux 2 + xCaster), dual output routing (X Spaces injection + monitor/cue), reapply audio graph for clean channel selection, virtual cable auto-installer, compressor, limiter, EQ, background skin, and live meters.\n\n' +
