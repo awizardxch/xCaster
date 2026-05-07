@@ -8,9 +8,20 @@ It ships its own Chromium (via Electron), disables WebRTC AGC at the engine leve
 
 ## Download
 
-**[XCaster v1.0.1 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.0.1/XCaster-win32-x64.zip)**
+**[XCaster v1.1.0 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.1.0/XCaster-win32-x64.zip)**
 
 Extract the zip and run `XCaster.exe` — no installer required.
+
+---
+
+## What's new in v1.1.0
+
+### Audio routing fixed — host audible to listeners in X Spaces
+- x.com now loads in a **BrowserView** with `preload.js` — identical to v0.5.0's architecture. `getUserMedia` is patched before any X scripts run, so the DSP graph and X's `RTCPeerConnection` share the same renderer context
+- Removed SDP patching (`patchOpusSdp`) from X's own `RTCPeerConnection` — forcing stereo/510kbps/CBR/no-DTX on X's outbound connection caused X's media servers to reject the SDP, showing the host as muted and disconnected to listeners
+- Fullscreen and maximise now resize the BrowserView correctly — listening to `maximize`, `unmaximize`, `enter-full-screen`, `leave-full-screen`, `enter-html-full-screen`, `leave-html-full-screen` in addition to `resize`
+- Removed `setAutoResize` which conflicted with manual `setBounds` calls and caused misalignment
+- Fixed `BrowserView is not defined` crash — `BrowserView` was missing from the Electron import destructure
 
 ---
 
@@ -19,7 +30,6 @@ Extract the zip and run `XCaster.exe` — no installer required.
 ### Audio quality restored to v0.5.0 standard
 - DSP graph is now built directly inside X's webview context (same as v0.5.0) — single Opus encode, no relay
 - Chrome WebRTC AGC disabled at capture time via `applyConstraints` (autoGainControl / noiseSuppression / echoCancellation all off)
-- Opus DTX and CBR enforced on X's outbound WebRTC connection — eliminates audio pumping / level instability heard by remote listeners
 - Loopback bleed from Cable Output fixed — raw mic fallback no longer occurs
 
 ---

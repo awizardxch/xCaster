@@ -106,6 +106,11 @@ function domainOf(url) {
 function getTab(id)    { return tabs.find(t => t.id === id) ?? null; }
 function activeTab()   { return getTab(activeTabId); }
 
+// URLs that must run in a BrowserView with v0.5.0's preload.js for correct audio.
+function isXViewURL(url) {
+    return /^https?:\/\/(www\.)?(x\.com|twitter\.com)/i.test(url || '');
+}
+
 function setHomeVisible(visible) {
     homeView.classList.toggle('visible', visible);
     homeView.hidden = !visible;
@@ -125,19 +130,31 @@ function showWebview(tab) {
 
 function createTab(url = null) {
     const id = nextTabId++;
+    const useXView = !!(url && isXViewURL(url));
     const tab = {
         id,
         title:       url ? 'Loading…' : 'New Tab',
         url:         url ?? '',
         favicon:     null,
-        loading:     false,
+        loading:     !!url,
         wv:          null,
         showingHome: !url,
+        xview:       useXView,
     };
     tabs.push(tab);
     renderTabBar();
     activateTab(id);
-    if (url) navigateTab(tab, url);
+    if (url) {
+        if (useXView) {
+            tab.showingHome = false;
+            setHomeVisible(false);
+            window.xcaster?.createXView(id, url)
+                .then(() => window.xcaster?.showXView(id))
+                .catch(() => {});
+        } else {
+            navigateTab(tab, url);
+        }
+    }
     return tab;
 }
 
@@ -147,7 +164,11 @@ function closeTab(id) {
     const idx = tabs.findIndex(t => t.id === id);
     if (idx === -1) return;
     const tab = tabs[idx];
-    if (tab.wv) { try { tab.wv.remove(); } catch { /* ignore */ } }
+    if (tab.xview) {
+        window.xcaster?.destroyXView(id).catch(() => {});
+    } else if (tab.wv) {
+        try { tab.wv.remove(); } catch { /* ignore */ }
+    }
     tabs.splice(idx, 1);
     if (tabs.length === 0) { createTab(); return; }
     if (activeTabId === id) {
@@ -172,6 +193,12 @@ function updateAllTabsForCapture() {
 // ── Tab: activate ─────────────────────────────────────────────────────────────
 
 function activateTab(id) {
+    // Hide the previously active xview.
+    const prevTab = getTab(activeTabId);
+    if (prevTab?.xview && prevTab.id !== id) {
+        window.xcaster?.hideXView(prevTab.id).catch(() => {});
+    }
+
     activeTabId = id;
     const tab = getTab(id);
 
@@ -184,7 +211,11 @@ function activateTab(id) {
 
     document.querySelectorAll('#webviews webview').forEach(wv => wv.classList.remove('active'));
 
-    if (!tab || tab.showingHome || !tab.wv) {
+    if (tab?.xview) {
+        // Hide all webviews; show the BrowserView for this tab.
+        setHomeVisible(false);
+        window.xcaster?.showXView(id).catch(() => {});
+    } else if (!tab || tab.showingHome || !tab.wv) {
         setHomeVisible(true);
     } else {
         showWebview(tab);
@@ -203,6 +234,13 @@ function navigateTab(tab, url) {
     tab.title       = 'Loading…';
     tab.loading     = true;
     tab.favicon     = null;
+
+    if (tab.xview) {
+        window.xcaster?.navigateXView(tab.id, url).catch(() => {});
+        if (activeTabId === tab.id) { syncAddressBar(tab); startProgress(); }
+        renderTabBar();
+        return;
+    }
 
     if (!tab.wv) {
         const wv = buildWebview(url);
@@ -230,13 +268,15 @@ function buildWebview(url) {
     // Inject DSP overlay into every webview.
     if (WEBVIEW_PRELOAD) wv.setAttribute('preload', WEBVIEW_PRELOAD);
     wv.setAttribute('src', url);
-    // Mute ALL webview audio from the system output immediately.
-    // Tab audio is routed exclusively through the xCaster mixer channel,
-    // so it never reaches PC default output, virtual cable, or Aux1.
-    try { wv.setAudioMuted(true); } catch {}
-    // Apply current opacity setting. DO NOT inject background:transparent CSS
-    // into pages — that destroys site styling. The webview opacity alone creates
-    // the see-through effect (page contents fade, video bg shows through).
+    // Only mute non-X tabs. X's audio (incoming Spaces) must play through
+    // unmuited so the output device routing in overlay.js can redirect it
+    // to the user's headset. Other tabs are muted so they don't leak into
+    // system output — their audio feeds xCaster's mixer channel instead.
+    const isXTab = /^https?:\/\/(www\.)?(x\.com|twitter\.com)/i.test(url || '');
+    if (!isXTab) {
+        try { wv.setAudioMuted(true); } catch {}
+    }
+    // Apply current opacity setting.
     try {
         const op = (shellSettings && (shellSettings.pageOpacity / 100)) || 1;
         wv.style.opacity = op.toFixed(2);
@@ -256,8 +296,10 @@ function attachWebviewListeners(tab, wv) {
     wv.addEventListener('dom-ready', () => {
         try {
             tab.webContentsId = wv.getWebContentsId();
-            // Re-assert mute in case it wasn't applied before first load.
-            try { wv.setAudioMuted(true); } catch {}
+            // Re-assert mute only for non-X tabs. X's audio must flow through
+            // so overlay.js can route it to the user's chosen output device.
+            const isXTab = /^https?:\/\/(www\.)?(x\.com|twitter\.com)/i.test(tab.url || '');
+            if (!isXTab) { try { wv.setAudioMuted(true); } catch {} }
             if (activeTabId === tab.id) window.__xcActiveWcId = tab.webContentsId;
             // Notify overlay to capture this tab into the xCaster channel.
             updateAllTabsForCapture();
@@ -383,7 +425,7 @@ function stopProgress() {
 // ── Address bar sync ──────────────────────────────────────────────────────────
 
 function syncAddressBar(tab) {
-    if (!tab || tab.showingHome || !tab.wv) {
+    if (!tab || tab.showingHome || (!tab.wv && !tab.xview)) {
         addressInput.value  = '';
         securityIcon.textContent = '';
         return;
@@ -399,11 +441,23 @@ function syncAddressBar(tab) {
     }
 }
 
-function syncNavButtons(tab) {
-    if (!tab || !tab.wv) {
+async function syncNavButtons(tab) {
+    if (!tab || (!tab.wv && !tab.xview)) {
         btnBack.disabled    = true;
         btnForward.disabled = true;
         btnReload.innerHTML = '&#8635;';
+        return;
+    }
+    if (tab.xview) {
+        const [canBack, canFwd] = await Promise.all([
+            window.xcaster?.canGoBackXView(tab.id).catch(() => false),
+            window.xcaster?.canGoForwardXView(tab.id).catch(() => false),
+        ]);
+        if (activeTabId !== tab.id) return; // tab changed while awaiting
+        btnBack.disabled    = !canBack;
+        btnForward.disabled = !canFwd;
+        btnReload.innerHTML = tab.loading ? '&#10005;' : '&#8635;';
+        btnReload.title     = tab.loading ? 'Stop' : 'Reload (Ctrl+R)';
         return;
     }
     try { btnBack.disabled    = !tab.wv.canGoBack();    } catch { btnBack.disabled = false; }
@@ -641,6 +695,7 @@ function waitForWebviewReady(wv, timeoutMs = 8000) {
 
 function mixerTargetTab() {
     let tab = activeTab();
+    if (tab?.xview) return tab;
     // Already on a real page - use it.
     if (tab?.wv && !tab.showingHome) return tab;
     // On the home view but webview exists - show it.
@@ -653,7 +708,7 @@ function mixerTargetTab() {
         return tab;
     }
     // Fall back to any open site tab.
-    const openSiteTab = tabs.find(t => t.wv && !t.showingHome);
+    const openSiteTab = tabs.find(t => (t.xview || (t.wv && !t.showingHome)));
     if (openSiteTab) { activateTab(openSiteTab.id); return openSiteTab; }
     // No webview at all - return null; gear click will be a no-op.
     return null;
@@ -725,12 +780,15 @@ function ensureShellOverlay() {
     }
 }
 
-// Gear button: open the mixer panel in the shell window (works even with no tabs).
+// Gear button: open the mixer in the active xview or webview.
 if (btnMixer) {
-    btnMixer.addEventListener('click', () => {
-        ensureShellOverlay();
-        if (typeof window.__xcToggleMixer === 'function') {
-            window.__xcToggleMixer();
+    btnMixer.addEventListener('click', async () => {
+        const tab = mixerTargetTab();
+        if (!tab) return;
+        if (tab.xview) {
+            window.xcaster?.toggleMixerXView(tab.id).catch(() => {});
+        } else {
+            await toggleMixerForTab(tab);
         }
     });
 }
@@ -759,27 +817,33 @@ applyShellSettings();
 
 btnBack.addEventListener('click', () => {
     const tab = activeTab();
+    if (tab?.xview) { window.xcaster?.backXView(tab.id).catch(() => {}); return; }
     if (tab?.wv) try { tab.wv.goBack(); } catch { /* ignore */ }
 });
 
 btnForward.addEventListener('click', () => {
     const tab = activeTab();
+    if (tab?.xview) { window.xcaster?.forwardXView(tab.id).catch(() => {}); return; }
     if (tab?.wv) try { tab.wv.goForward(); } catch { /* ignore */ }
 });
 
 btnReload.addEventListener('click', () => {
     const tab = activeTab();
+    if (tab?.xview) { window.xcaster?.reloadXView(tab.id).catch(() => {}); return; }
     if (!tab?.wv) return;
     try { tab.loading ? tab.wv.stop() : tab.wv.reload(); } catch { /* ignore */ }
 });
 
 btnHome.addEventListener('click', () => {
-    // Show the home page for the active tab (webview is paused but kept in DOM).
     const tab = activeTab();
     if (!tab) { createTab(); return; }
+    if (tab.xview) {
+        window.xcaster?.hideXView(tab.id).catch(() => {});
+    } else if (tab.wv) {
+        tab.wv.classList.remove('active');
+    }
     tab.showingHome = true;
     tab.title       = 'New Tab';
-    if (tab.wv) tab.wv.classList.remove('active');
     setHomeVisible(true);
     syncAddressBar(tab);
     syncNavButtons(tab);
@@ -936,6 +1000,41 @@ window.__xcasterShowTabPicker = function (incomingTabs) {
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 
 renderHomePage();
-createTab(); // start with one home tab
+
+// Listen for events from BrowserView-hosted tabs (x.com) forwarded by main.js.
+if (window.xcaster?.onXViewEvent) {
+    window.xcaster.onXViewEvent((tabId, type, data) => {
+        const tab = getTab(tabId);
+        if (!tab) return;
+        if (type === 'navigate') {
+            tab.url = data;
+            if (activeTabId === tabId) syncAddressBar(tab);
+        } else if (type === 'loading') {
+            tab.loading = !!data;
+            if (activeTabId === tabId) {
+                if (data) startProgress(); else stopProgress();
+                syncNavButtons(tab);
+            }
+            renderTabBar();
+        } else if (type === 'title') {
+            tab.title = data || domainOf(tab.url) || 'Untitled';
+            renderTabBar();
+        } else if (type === 'favicon') {
+            tab.favicon = data || null;
+            renderTabBar();
+        }
+    });
+}
+
+// Report toolbar height to main.js so BrowserViews are positioned precisely.
+function reportToolbarHeight() {
+    const tb = document.getElementById('tab-bar');
+    const nb = document.getElementById('nav-bar');
+    const h = (tb?.offsetHeight || 0) + (nb?.offsetHeight || 0);
+    if (h > 0) window.xcaster?.setToolbarHeight(h).catch(() => {});
+}
+window.addEventListener('load', reportToolbarHeight);
+
+createTab('https://x.com/'); // start on X, using BrowserView with v0.5.0 preload
 
 })();

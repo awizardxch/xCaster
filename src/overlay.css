@@ -70,8 +70,8 @@ html.xfw-skin-on #react-root {
     position: fixed;
     right: 16px;
     bottom: 76px;
-    width: 460px;
-    max-height: calc(100vh - 110px);
+    width: min(552px, calc(100vw - 32px));
+    max-height: calc(100vh - 33px);
     overflow-y: auto;
     background: var(--xfw-bg);
     border: 1px solid var(--xfw-border);

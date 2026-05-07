@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>XCaster</title>
+  <link rel="stylesheet" href="shell.css">
+</head>
+<body>
+  <div id="browser">
+
+    <!-- Tab strip -->
+    <div id="tab-bar">
+      <button id="btn-mixer" title="Audio mixer" aria-label="Audio mixer">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+        </svg>
+      </button>
+      <div id="tabs-list"></div>
+      <button id="btn-new-tab" title="New Tab (Ctrl+T)">+</button>
+      <div id="tab-bar-spacer"></div>
+    </div>
+
+    <!-- Navigation bar -->
+    <div id="nav-bar">
+      <button class="nav-btn" id="btn-back"    title="Back (Alt+Left)"    disabled>&#8592;</button>
+      <button class="nav-btn" id="btn-forward" title="Forward (Alt+Right)" disabled>&#8594;</button>
+      <button class="nav-btn" id="btn-reload"  title="Reload (Ctrl+R)">&#8635;</button>
+      <button class="nav-btn" id="btn-home"    title="New Tab">&#8962;</button>
+      <div id="address-bar-wrap">
+        <span id="security-icon"></span>
+        <input id="address-input" type="text" spellcheck="false" autocomplete="off"
+               placeholder="Search or enter URL...">
+      </div>
+      <button class="nav-btn" id="btn-bookmark" title="Bookmark this page">&#9734;</button>
+      <button class="nav-btn" id="btn-appearance" title="Appearance & background">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="3"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/>
+          <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+          <line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/>
+          <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+        </svg>
+      </button>
+    </div>
+
+    <!-- Loading progress bar (2px, no layout space) -->
+    <div id="progress-bar"><div id="progress-fill"></div></div>
+
+    <!-- Content area: home view + webviews stacked absolutely -->
+    <div id="content">
+      <video id="bg-video" src="xfw://local/background.mp4" autoplay loop muted playsinline disableremoteplayback></video>
+      <div id="bg-tint"></div>
+      <div id="home-view" class="visible"></div>
+      <div id="webviews"></div>
+    </div>
+
+  </div>
+
+  <!-- Add bookmark modal (portal-level, outside #browser) -->
+  <div id="add-bookmark-modal" role="dialog" aria-modal="true" aria-label="Add Bookmark">
+    <div class="modal-box">
+      <h3>Add Bookmark</h3>
+      <input class="modal-input" id="bm-name-input" placeholder="Name" autocomplete="off">
+      <input class="modal-input" id="bm-url-input"  placeholder="https://example.com" autocomplete="off">
+      <div class="modal-actions">
+        <button class="btn-secondary" id="bm-cancel">Cancel</button>
+        <button class="btn-primary"   id="bm-save">Add Bookmark</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tab picker modal: shown when X tab requests a source for the xCaster channel -->
+  <div id="tab-picker-modal" role="dialog" aria-modal="true" aria-label="Pick a tab">
+    <div class="modal-box modal-box-wide">
+      <h3>Pick a tab to share its audio</h3>
+      <div class="modal-help">The selected tab's audio will feed the xCaster channel in your X Spaces mix.</div>
+      <div id="tab-picker-list"></div>
+      <div class="modal-actions">
+        <button class="btn-secondary" id="tp-cancel">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Appearance dropdown: background video + opacity controls -->
+  <div id="settings-dropdown" role="dialog" aria-label="XCaster appearance">
+    <div class="sd-section">
+      <div class="sd-title">Appearance</div>
+      <div class="sd-row">
+        <label for="sd-bg-toggle">Background video</label>
+        <input type="checkbox" id="sd-bg-toggle" checked>
+      </div>
+      <div class="sd-row sd-col">
+        <label for="sd-page-opacity">Page opacity <span id="sd-page-opacity-val">100%</span></label>
+        <input type="range" id="sd-page-opacity" min="30" max="100" step="5" value="100">
+      </div>
+      <div class="sd-row sd-col">
+        <label for="sd-bg-dim">Background dim <span id="sd-bg-dim-val">55%</span></label>
+        <input type="range" id="sd-bg-dim" min="0" max="95" step="5" value="55">
+      </div>
+    </div>
+  </div>
+
+  <script src="shell.js"></script>
+</body>
+</html>

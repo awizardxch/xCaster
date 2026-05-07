@@ -28,6 +28,8 @@ const jsText = (() => {
     try { return fs.readFileSync(path.join(__dirname, 'overlay.js'), 'utf8'); } catch { return ''; }
 })();
 
+let injected = false;
+
 function injectStyle() {
     try {
         if (cssText && !document.getElementById('xfw-style')) {
@@ -40,23 +42,12 @@ function injectStyle() {
 }
 
 async function injectScript() {
-    if (!jsText) return;
+    if (injected || !jsText) return;
     try {
-        // Inject the IPC bridge + flags into the main world first so overlay.js
-        // can use them immediately when it runs.
-        await webFrame.executeJavaScript(`
-            window.__xcBroadcastBridge = {
-                getOffer:      () => require('electron').ipcRenderer.invoke('xfw:broadcast-offer'),
-                applyAnswer:   (id, sdp) => require('electron').ipcRenderer.invoke('xfw:broadcast-answer', id, sdp),
-                getSettings:   () => require('electron').ipcRenderer.invoke('xfw:get-settings'),
-                getXcastOffer: () => require('electron').ipcRenderer.invoke('xfw:get-xcast-offer'),
-            };
-            window.__xfwIsWebview = true;
-        `, false);
-        // Inject overlay.js into x.com's main world — same as v0.5.0.
-        // overlay.js patches getUserMedia synchronously when this executes,
-        // before x.com scripts run.
+        // Inject overlay.js into the page's main world — identical to v0.5.0.
+        // getUserMedia is patched synchronously before x.com scripts run.
         await webFrame.executeJavaScript(jsText, false);
+        injected = true;
         console.info('[XCaster] overlay injected');
     } catch (err) {
         console.warn('[XCaster] executeJavaScript failed, falling back to <script> tag', err);

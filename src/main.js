@@ -3,7 +3,7 @@
 // Gives streamers full control over launch flags and getUserMedia constraints,
 // plus a full DSP/mixer overlay for professional X Spaces audio.
 
-const { app, BrowserWindow, session, Menu, shell, ipcMain, dialog, protocol, net, powerSaveBlocker, webContents } = require('electron');
+const { app, BrowserWindow, BrowserView, session, Menu, shell, ipcMain, dialog, protocol, net, powerSaveBlocker, webContents } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const https = require('https');
@@ -84,6 +84,8 @@ if (!gotLock) {
 }
 
 let mainWindow = null;
+const xViews = new Map();  // tabId → BrowserView (for x.com tabs)
+let TOOLBAR_HEIGHT = 82;   // updated dynamically via xfw:set-toolbar-height
 const runtimeIntervals = new Set();
 const powerSaveBlockerIds = new Set();
 
@@ -176,6 +178,26 @@ function createWindow() {
     // event fires for (when other apps cover the window without minimizing).
     registerInterval(reassertNoThrottle, 2000);
 
+    // Resize all visible BrowserViews (x.com tabs) to match new window size.
+    // Must handle resize, maximize, fullscreen, and their reverses explicitly —
+    // Electron does not fire 'resize' reliably for all of these on Windows.
+    function updateXViewBounds() {
+        if (!mainWindow) return;
+        const [w, h] = mainWindow.getContentSize();
+        for (const [, view] of xViews) {
+            if (mainWindow.getBrowserViews().includes(view)) {
+                view.setBounds({ x: 0, y: TOOLBAR_HEIGHT, width: w, height: Math.max(0, h - TOOLBAR_HEIGHT) });
+            }
+        }
+    }
+    mainWindow.on('resize', updateXViewBounds);
+    mainWindow.on('maximize', updateXViewBounds);
+    mainWindow.on('unmaximize', updateXViewBounds);
+    mainWindow.on('enter-full-screen', updateXViewBounds);
+    mainWindow.on('leave-full-screen', updateXViewBounds);
+    mainWindow.on('enter-html-full-screen', updateXViewBounds);
+    mainWindow.on('leave-html-full-screen', updateXViewBounds);
+
     // Raise the main process priority without spawning terminal processes.
     // Renderer throttling is handled by Chromium flags and webContents settings above.
     raiseMainProcessPriorityWindows();
@@ -254,6 +276,14 @@ function createWindow() {
 
     mainWindow.loadFile(path.join(__dirname, 'shell.html'));
 
+    // Once the shell UI is ready, check for a virtual audio cable and prompt to
+    // install one if none is found — keeps XCaster's injection output isolated.
+    mainWindow.webContents.once('dom-ready', () => {
+        checkAndInstallVirtualCable().catch(err => {
+            console.warn('[XCaster] virtual cable check error', err);
+        });
+    });
+
     // Minimal menu: File / View / Help. Hidden by default (autoHideMenuBar).
     const template = [
         {
@@ -284,10 +314,11 @@ function createWindow() {
                         dialog.showMessageBox(mainWindow, {
                             type: 'info',
                             title: 'About XCaster',
-                            message: 'XCaster',
+                            message: 'XCaster v1.1.0',
                             detail:
                                 'Standalone Windows shell for x.com with WebRTC AGC, noise suppression, and echo cancellation disabled.\n\n' +
-                                'Includes a 2-channel DSP mixer (mic + aux), compressor, limiter, EQ, speaker routing, background skin, and live meters. Built for X Spaces streamers who need clean, professional audio.',
+                                'v1.0.1 — Full multi-channel DSP mixer (Mic + Aux 1 + Aux 2 + xCaster), dual output routing (X Spaces injection + monitor/cue), reapply audio graph for clean channel selection, virtual cable auto-installer, compressor, limiter, EQ, background skin, and live meters.\n\n' +
+                                'Built for X Spaces streamers who need clean, professional audio.',
                         });
                     },
                 },
@@ -402,6 +433,132 @@ ipcMain.handle('xfw:get-xcast-offer', async () => {
     }
 });
 
+// ── BrowserView management for x.com tabs (v0.5.0 audio fidelity) ───────────
+// Each x.com/twitter.com tab runs in a dedicated BrowserView with preload.js —
+// identical to v0.5.0's architecture. overlay.js patches getUserMedia directly
+// in the renderer process, so the DSP graph and WebRTC senders are in the same
+// context. This is what makes audio work reliably.
+
+ipcMain.handle('xfw:set-toolbar-height', (_e, h) => {
+    if (typeof h === 'number' && h > 0) TOOLBAR_HEIGHT = Math.ceil(h);
+});
+
+function getXViewBounds() {
+    if (!mainWindow) return { x: 0, y: TOOLBAR_HEIGHT, width: 1200, height: 600 };
+    const [w, h] = mainWindow.getContentSize();
+    return { x: 0, y: TOOLBAR_HEIGHT, width: w, height: Math.max(0, h - TOOLBAR_HEIGHT) };
+}
+
+ipcMain.handle('xfw:create-xview', (_e, tabId, url) => {
+    if (xViews.has(tabId)) return { ok: true };
+    const view = new BrowserView({
+        webPreferences: {
+            preload: path.join(__dirname, 'preload.js'), // v0.5.0 preload — direct injection
+            contextIsolation: true,
+            sandbox: false,
+            nodeIntegration: false,
+            backgroundThrottling: false,
+        },
+    });
+    // Match v0.5.0 UA (strip Electron token).
+    view.webContents.setUserAgent(
+        view.webContents.getUserAgent().replace(/Electron\/[^\s]+\s?/, '')
+    );
+    view.webContents.setBackgroundThrottling(false);
+
+    // Forward navigation/loading events back to the shell renderer.
+    const fwd = (type, data) => {
+        try { mainWindow.webContents.send('xfw:xview-event', tabId, type, data); } catch {}
+    };
+    view.webContents.on('did-navigate', (_e, u) => fwd('navigate', u));
+    view.webContents.on('did-navigate-in-page', (_e, u, isMain) => { if (isMain) fwd('navigate', u); });
+    view.webContents.on('did-start-loading', () => fwd('loading', true));
+    view.webContents.on('did-stop-loading', () => {
+        fwd('loading', false);
+        fwd('title', view.webContents.getTitle());
+    });
+    view.webContents.on('page-title-updated', (_e, title) => fwd('title', title));
+    view.webContents.on('page-favicon-updated', (_e, favicons) => fwd('favicon', favicons[0] || null));
+
+    // Open new windows: x.com links navigate in-place, others go to system browser.
+    view.webContents.setWindowOpenHandler(({ url: u }) => {
+        try {
+            const host = new URL(u).hostname;
+            if (host.endsWith('x.com') || host.endsWith('twitter.com')) {
+                view.webContents.loadURL(u);
+                return { action: 'deny' };
+            }
+        } catch {}
+        shell.openExternal(u);
+        return { action: 'deny' };
+    });
+
+    xViews.set(tabId, view);
+    view.webContents.loadURL(url);
+    return { ok: true };
+});
+
+ipcMain.handle('xfw:show-xview', (_e, tabId) => {
+    const view = xViews.get(tabId);
+    if (!view || !mainWindow) return;
+    if (!mainWindow.getBrowserViews().includes(view)) mainWindow.addBrowserView(view);
+    view.setBounds(getXViewBounds());
+    view.webContents.setBackgroundThrottling(false);
+});
+
+ipcMain.handle('xfw:hide-xview', (_e, tabId) => {
+    const view = xViews.get(tabId);
+    if (!view || !mainWindow) return;
+    mainWindow.removeBrowserView(view);
+});
+
+ipcMain.handle('xfw:destroy-xview', (_e, tabId) => {
+    const view = xViews.get(tabId);
+    if (!view) return;
+    try { if (mainWindow) mainWindow.removeBrowserView(view); } catch {}
+    try { view.webContents.destroy(); } catch {}
+    xViews.delete(tabId);
+});
+
+ipcMain.handle('xfw:navigate-xview', (_e, tabId, url) => {
+    xViews.get(tabId)?.webContents.loadURL(url);
+});
+
+ipcMain.handle('xfw:back-xview', (_e, tabId) => {
+    xViews.get(tabId)?.webContents.goBack();
+});
+
+ipcMain.handle('xfw:forward-xview', (_e, tabId) => {
+    xViews.get(tabId)?.webContents.goForward();
+});
+
+ipcMain.handle('xfw:reload-xview', (_e, tabId) => {
+    const v = xViews.get(tabId);
+    if (v) { try { v.webContents.isLoadingMainFrame() ? v.webContents.stop() : v.webContents.reload(); } catch {} }
+});
+
+ipcMain.handle('xfw:cangoback-xview', (_e, tabId) => {
+    return xViews.get(tabId)?.webContents.canGoBack() ?? false;
+});
+
+ipcMain.handle('xfw:cangoforward-xview', (_e, tabId) => {
+    return xViews.get(tabId)?.webContents.canGoForward() ?? false;
+});
+
+ipcMain.handle('xfw:devtools-xview', (_e, tabId) => {
+    xViews.get(tabId)?.webContents.toggleDevTools();
+});
+
+ipcMain.handle('xfw:toggle-mixer-xview', async (_e, tabId) => {
+    try {
+        const v = xViews.get(tabId);
+        if (!v) return false;
+        return await v.webContents.executeJavaScript(
+            'typeof window.__xcToggleMixer === "function" ? window.__xcToggleMixer() : false'
+        );
+    } catch { return false; }
+});
+
 // IPC: open a chrome-extension:// page in a real BrowserWindow so it has
 // the correct extension context (necessary for MetaMask popup / home page).
 ipcMain.handle('xfw:open-extension-page', (_e, extUrl) => {
@@ -505,6 +662,120 @@ function unzip(zipPath, destDir) {
             (err) => err ? reject(err) : resolve(destDir)
         );
     });
+}
+
+// ── Virtual cable auto-installer ────────────────────────────────────────────
+// VB-Audio Virtual Cable gives XCaster a dedicated CABLE Input / CABLE Output
+// pair so the X Spaces injection output is fully isolated from desktop audio,
+// preventing the feedback loop that occurs when both share the same cable.
+
+const CABLE_SKIP_FLAG = path.join(app.getPath('userData'), 'skip-cable-check.flag');
+
+function checkCableInstalled() {
+    return new Promise((resolve) => {
+        execFile('powershell.exe', [
+            '-NoProfile', '-NonInteractive', '-Command',
+            'try { (Get-WmiObject Win32_SoundDevice).Name | Where-Object { $_ -match "CABLE" } | ConvertTo-Json } catch { "[]" }'
+        ], { timeout: 8000 }, (err, stdout) => {
+            if (err) { resolve(false); return; }
+            try {
+                const raw = (stdout || '').trim();
+                if (!raw || raw === 'null') { resolve(false); return; }
+                const items = [].concat(JSON.parse(raw));
+                resolve(items.some(n => typeof n === 'string' && /cable/i.test(n)));
+            } catch { resolve(false); }
+        });
+    });
+}
+
+async function downloadAndInstallCable() {
+    const tmpDir = path.join(os.tmpdir(), 'xcaster-vbcable');
+    fs.mkdirSync(tmpDir, { recursive: true });
+    const zipPath = path.join(tmpDir, 'VBCABLE_Driver_Pack.zip');
+
+    await httpsDownload(
+        'https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip',
+        zipPath
+    );
+    await unzip(zipPath, tmpDir);
+    try { fs.unlinkSync(zipPath); } catch {}
+
+    // Prefer the 64-bit setup, fall back to 32-bit.
+    let setupExe = path.join(tmpDir, 'VBCABLE_Setup_x64.exe');
+    if (!fs.existsSync(setupExe)) setupExe = path.join(tmpDir, 'VBCABLE_Setup.exe');
+    if (!fs.existsSync(setupExe)) {
+        throw new Error('VB-Audio CABLE setup executable not found after extraction.');
+    }
+
+    // Run with UAC elevation — user will see the Windows security prompt.
+    await new Promise((resolve, reject) => {
+        execFile('powershell.exe', [
+            '-NoProfile', '-NonInteractive', '-Command',
+            `Start-Process -FilePath "${setupExe}" -Verb RunAs -Wait`
+        ], { timeout: 120000 }, (err) => err ? reject(err) : resolve());
+    });
+
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+}
+
+async function checkAndInstallVirtualCable() {
+    if (fs.existsSync(CABLE_SKIP_FLAG)) return; // user dismissed, don't nag again
+
+    const hasCable = await checkCableInstalled();
+    if (hasCable) return;
+
+    const { response } = await dialog.showMessageBox(mainWindow, {
+        type: 'question',
+        title: 'XCaster Virtual Cable',
+        message: 'Install a dedicated virtual audio cable?',
+        detail:
+            'No virtual audio cable was detected on this system.\n\n' +
+            'Without one, using the same cable for your desktop audio and X Spaces ' +
+            'injection causes feedback — X picks up your desktop audio as your mic.\n\n' +
+            'Clicking Install will download VB-Audio Virtual Cable (free) and launch ' +
+            'the installer. A Windows security (UAC) prompt will appear — click Yes ' +
+            'to allow the driver to install.',
+        buttons: ['Install', 'Not Now'],
+        defaultId: 0,
+        cancelId: 1,
+    });
+
+    if (response === 1) {
+        try { fs.writeFileSync(CABLE_SKIP_FLAG, ''); } catch {}
+        return;
+    }
+
+    try {
+        await downloadAndInstallCable();
+        await dialog.showMessageBox(mainWindow, {
+            type: 'info',
+            title: 'Virtual Cable Installed',
+            message: 'VB-Audio Virtual Cable installed successfully!',
+            detail:
+                'In the XCaster Speakers tab:\n' +
+                '  • "X Spaces Injection Output" → CABLE Input (VB-Audio Virtual Cable)\n' +
+                '  • "Monitor & Cue Output" → your headset\n\n' +
+                'In X Spaces settings, select "CABLE Output" as your microphone.\n' +
+                'Your desktop audio should go directly to your headset — not through the cable.',
+            buttons: ['OK'],
+        });
+        // Remove any existing skip flag now that cable is installed.
+        try { fs.unlinkSync(CABLE_SKIP_FLAG); } catch {}
+    } catch (err) {
+        console.warn('[XCaster] cable install failed', err);
+        await dialog.showMessageBox(mainWindow, {
+            type: 'warning',
+            title: 'Installation Failed',
+            message: 'Could not install the virtual cable automatically.',
+            detail:
+                `Error: ${err.message}\n\n` +
+                'Please download VB-Audio Virtual Cable manually from vb-audio.com, ' +
+                'install it, then restart XCaster.\n\n' +
+                'Once installed, set "X Spaces Injection Output" in the Speakers tab ' +
+                'to "CABLE Input (VB-Audio Virtual Cable)".',
+            buttons: ['OK'],
+        });
+    }
 }
 
 // IPC: install MetaMask from its official GitHub release.

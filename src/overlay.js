@@ -23,7 +23,7 @@
     window.__xcInstalled = true;
 
     // ---------- defaults & persistence -------------------------------------
-    const STORAGE_KEY = 'xfw.settings';
+    const STORAGE_KEY = 'xfw.settings.v4';
     const DEFAULTS = {
         // I/O — three independent input channels (mic + aux1 + aux2) summed pre-DSP.
         inputDeviceId: 'default',           // mic (headset)
@@ -69,18 +69,18 @@
         aux2Cue: false,
         // Processing chain
         bypass: false,
-        hpfHz: 90,
+        hpfHz: 30,
         eqLowDb: 0,
         eqMidDb: 0,
         eqHighDb: 0,
-        compThresholdDb: -22,
-        compRatio: 4,
-        compAttackMs: 8,
-        compReleaseMs: 140,
-        compKneeDb: 8,
-        limThresholdDb: -3,
-        limReleaseMs: 60,
-        outputGainDb: 6,
+        compThresholdDb: -16,
+        compRatio: 2,
+        compAttackMs: 20,
+        compReleaseMs: 250,
+        compKneeDb: 6,
+        limThresholdDb: -1,
+        limReleaseMs: 100,
+        outputGainDb: 1,
         // UI / skin
         bgEnabled: true,
         bgOpacity: 0.9,         // X content opacity (0.3 - 1.0)
@@ -543,7 +543,13 @@
     }
 
     async function ensureProcessedStream() {
-        ensureAudioContext();
+        const ctx = ensureAudioContext();
+        // Await resume so the graph isn't built on a suspended context.
+        // This is safe here because getUserMedia is always triggered by a
+        // user gesture (joining a Space), which allows AudioContext.resume().
+        if (ctx.state === 'suspended') {
+            try { await ctx.resume(); } catch {}
+        }
         if (!micRawStream) {
             try { micRawStream = await acquireDevice(settings.inputDeviceId, {
                 autoGainControl: settings.micAutoGainControl,
@@ -738,6 +744,7 @@
     }
 
     async function rebuildAfterDeviceChange() {
+        // Settings are in this context's own localStorage — no IPC sync needed.
         try { if (micRawStream) micRawStream.getTracks().forEach(t => t.stop()); } catch {}
         try { if (auxRawStream) auxRawStream.getTracks().forEach(t => t.stop()); } catch {}
         try { if (aux2RawStream) aux2RawStream.getTracks().forEach(t => t.stop()); } catch {}
@@ -866,55 +873,7 @@
 
     md.getUserMedia = async function (constraints) {
         try {
-            if (window.__xfwIsWebview) {
-                // ── Webview context (x.com tab) ──────────────────────────────
-                // Same approach as v0.5.0: build the DSP graph directly here in
-                // x.com's renderer so there is exactly ONE Opus encode path
-                // (x.com's WebRTC sender). No relay, no cross-process audio.
-                //
-                // We sync device settings from the shell first so mic/aux device
-                // IDs, gains, and processing toggles match what the user set in
-                // the xCaster panel.
-                if (!constraints?.audio) return __xfwOriginalGUM(constraints);
-                try {
-                    const bridge = window.__xcBroadcastBridge;
-                    if (bridge) {
-                        const settingsJson = await bridge.getSettings();
-                        if (settingsJson) {
-                            const s = JSON.parse(settingsJson);
-                            Object.assign(settings, s);
-                            saveSettings(settings);
-                        }
-                    }
-                    await ensureProcessedStream();
-                    if (!processedStream) throw new Error('processedStream null');
-                    const audioTrack = processedStream.getAudioTracks()[0];
-                    if (!audioTrack) throw new Error('no audio track');
-                    // Disable Chrome's APM on our track so its AGC/NS/EC don't
-                    // re-process what xCaster's compressor/limiter already handled.
-                    try {
-                        await audioTrack.applyConstraints({
-                            autoGainControl: false,
-                            noiseSuppression: false,
-                            echoCancellation: false,
-                        });
-                    } catch {}
-                    const out = new MediaStream([audioTrack.clone()]);
-                    if (constraints.video) {
-                        try {
-                            const v = await __xfwOriginalGUM({ video: constraints.video });
-                            v.getVideoTracks().forEach(t => out.addTrack(t));
-                        } catch {}
-                    }
-                    console.info('[XCaster] getUserMedia → webview DSP graph (single encode, APM off)');
-                    return out;
-                } catch (err) {
-                    console.warn('[XCaster] webview DSP failed, falling back to raw mic', err);
-                    return __xfwOriginalGUM(constraints);
-                }
-            }
-
-            // Shell window: intercept and return processedStream.
+            // v0.5.0: single unified path. Only intercept when audio is requested.
             const wantsAudio = constraints && constraints.audio;
             const wantsVideo = constraints && constraints.video;
 
@@ -934,7 +893,7 @@
             }
 
             const out = new MediaStream();
-            out.addTrack(audioTrack.clone()); // clone so multiple gUM callers each get a fresh ref
+            out.addTrack(audioTrack.clone());
             for (const t of videoTracks) out.addTrack(t);
             console.info('[XCaster] gUM returned processed stream');
             return out;
@@ -951,25 +910,8 @@
         window.RTCPeerConnection = function (...args) {
             const pc = new RealPC(...args);
             __xfwPCs.add(pc);
-            // Intercept createOffer/createAnswer so X's own outbound Opus encoder
-            // gets the same high-quality settings we use for the internal relay:
-            // no DTX (usedtx=0), constant bitrate (cbr=1), high bitrate, stereo.
-            // This is what fixes the "up and down" pumping remote listeners hear —
-            // it's caused by Opus DTX silencing low-energy frames during pauses.
-            const origCreateOffer = pc.createOffer.bind(pc);
-            pc.createOffer = async function (...a) {
-                const offer = await origCreateOffer(...a);
-                return { type: offer.type, sdp: patchOpusSdp(offer.sdp) };
-            };
-            const origCreateAnswer = pc.createAnswer.bind(pc);
-            pc.createAnswer = async function (...a) {
-                const answer = await origCreateAnswer(...a);
-                return { type: answer.type, sdp: patchOpusSdp(answer.sdp) };
-            };
             pc.addEventListener('connectionstatechange', () => {
                 if (['closed', 'failed'].includes(pc.connectionState)) __xfwPCs.delete(pc);
-                // When X's PC connects, push our relay/processed track into its senders
-                // so X's own AGC/NS/EC pipeline is bypassed at the WebRTC layer.
                 if (pc.connectionState === 'connected') replaceTracksOnActivePCs();
             });
             return pc;
@@ -1412,17 +1354,10 @@
             <!-- SPEAKERS PANE -->
             <div class="xfw-pane" data-pane="spk">
                 <div class="xfw-section">
-                    <label class="xfw-label" for="xfw-broadcast-out">Broadcast out (X injection)</label>
-                    <select id="xfw-broadcast-out" class="xfw-select"></select>
-                    <div class="xfw-help" style="margin-top:6px;color:var(--xfw-muted);font-size:11px;">
-                        The full mixed output is always routed here, regardless of monitor toggles. Point this at your virtual cable input, then select the cable output as the mic in X Spaces.
-                    </div>
-                </div>
-                <div class="xfw-section">
-                    <label class="xfw-label" for="xfw-output">Monitor device (your headset)</label>
+                    <label class="xfw-label" for="xfw-output">Output device (where X plays into your ears)</label>
                     <select id="xfw-output" class="xfw-select"></select>
                     <div class="xfw-help" style="margin-top:6px;color:var(--xfw-muted);font-size:11px;">
-                        What you hear in your headphones. Controlled by per-channel Monitor toggles. Cued channels play here only and are excluded from the broadcast mix.
+                        X's incoming Spaces audio plays directly to this device. The mic graph never receives this audio, so there is no feedback loop into what you transmit.
                     </div>
                 </div>
                 <div class="xfw-section">
@@ -1607,33 +1542,18 @@
         }
     }
     async function populateOutputs() {
-        const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audiooutput');
-
         const sel = document.getElementById('xfw-output');
-        if (sel) {
-            sel.innerHTML = '';
-            const opts = [{ deviceId: 'default', label: 'System default' }, ...devs];
-            for (const d of opts) {
-                const o = document.createElement('option');
-                o.value = d.deviceId || 'default';
-                o.textContent = d.label || `Output (${(d.deviceId || '').slice(0, 6)})`;
-                sel.appendChild(o);
-            }
-            sel.value = settings.outputDeviceId || 'default';
+        if (!sel) return;
+        sel.innerHTML = '';
+        const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audiooutput');
+        const opts = [{ deviceId: 'default', label: 'System default' }, ...devs];
+        for (const d of opts) {
+            const o = document.createElement('option');
+            o.value = d.deviceId || 'default';
+            o.textContent = d.label || `Output (${(d.deviceId || '').slice(0, 6)})`;
+            sel.appendChild(o);
         }
-
-        const bsel = document.getElementById('xfw-broadcast-out');
-        if (bsel) {
-            bsel.innerHTML = '';
-            const bopts = [{ deviceId: 'none', label: 'None (disabled)' }, ...devs];
-            for (const d of bopts) {
-                const o = document.createElement('option');
-                o.value = d.deviceId || 'none';
-                o.textContent = d.label || `Output (${(d.deviceId || '').slice(0, 6)})`;
-                bsel.appendChild(o);
-            }
-            bsel.value = settings.broadcastDeviceId || 'none';
-        }
+        sel.value = settings.outputDeviceId || 'default';
     }
 
     // ---------- presets ----------------------------------------------------
@@ -1861,16 +1781,6 @@
             // Reattach the monitor bus so it plays through the newly selected device.
             if (monitorDest) attachMonitorToOutput(monitorDest.stream);
         });
-
-        const broadcastOutSel = document.getElementById('xfw-broadcast-out');
-        if (broadcastOutSel) {
-            broadcastOutSel.addEventListener('change', e => {
-                settings.broadcastDeviceId = e.target.value;
-                saveSettings(settings);
-                xBroadcastCtxSink = null; // force re-bind on next attach
-                if (processedDest) attachBroadcastToOutput(processedDest.stream);
-            });
-        }
 
         const testSpkBtn = document.getElementById('xfw-test-spk');
         if (testSpkBtn) testSpkBtn.addEventListener('click', () => testOutputDevice());
@@ -2159,15 +2069,6 @@
         applyFabPos();
         applyPanelPos();
         wire();
-        // Auto-start xCaster audio capture when running in the shell window.
-        // Only starts if there is an active webview tab to capture (main.js
-        // will deny the request otherwise and overlay shows 'Not capturing').
-        if (!window.__xfwIsWebview) {
-            // Pre-build the audio graph immediately so processedStream is live
-            // before any webview calls getUserMedia and requests the relay offer.
-            buildGraph();
-            setTimeout(() => startXcast(), 300);
-        }
         startHealthWatchdog();
         startWorkerKeepalive();
     }
