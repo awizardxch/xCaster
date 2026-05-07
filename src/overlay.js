@@ -37,6 +37,14 @@
         auxMuted: false,
         aux2GainDb: 0,
         aux2Muted: false,
+        // xCaster channel — captures audio from another in-app tab via
+        // getDisplayMedia. Stream is acquired on demand (not from a device id).
+        xcastEnabled: false,
+        xcastSourceLabel: '',
+        xcastGainDb: 0,
+        xcastMuted: false,
+        xcastMonitor: true,
+        xcastCue: false,
         // Browser-side capture toggles — independent per input channel.
         // Keep all OFF for a flat signal we process ourselves.
         micAutoGainControl: false,
@@ -91,15 +99,27 @@
     }
     let settings = loadSettings();
 
+    // PAGE → SHELL: mute messages only (no tab-list IPC needed).
+    function _shellSend(msg) {
+        try {
+            if (!window.__xfwOutbox) window.__xfwOutbox = [];
+            window.__xfwOutbox.push(msg);
+        } catch {}
+    }
+
     // ---------- audio graph ------------------------------------------------
     // Three input channels (mic, aux1, aux2) -> per-channel Gain -> summing
     // bus -> DSP chain -> MediaStreamDestination handed to X.
     let audioCtx = null;
     let micRawStream = null, auxRawStream = null, aux2RawStream = null;
     let micSrcNode = null, auxSrcNode = null, aux2SrcNode = null;
-    let micGainNode = null, auxGainNode = null, aux2GainNode = null;
-    let micMixSend = null, auxMixSend = null, aux2MixSend = null;
-    let micMonitorGain = null, auxMonitorGain = null, aux2MonitorGain = null;
+    // xCaster channel — arrays so we can capture every tab simultaneously.
+    let xcastRawStreams = [];  // one MediaStream per captured tab
+    let xcastSrcNodes  = [];  // corresponding MediaStreamSourceNodes
+    const _capturedWcIds = new Set(); // wcIds currently being captured
+    let micGainNode = null, auxGainNode = null, aux2GainNode = null, xcastGainNode = null;
+    let micMixSend = null, auxMixSend = null, aux2MixSend = null, xcastMixSend = null;
+    let micMonitorGain = null, auxMonitorGain = null, aux2MonitorGain = null, xcastMonitorGain = null;
     let monitorDest = null;
     let monitorAudioEl = null;
     let mixBus = null;
@@ -109,7 +129,7 @@
     let processedStream = null;
     let inputAnalyser = null;
     let outputAnalyser = null;
-    let micAnalyser = null, auxAnalyser = null, aux2Analyser = null;
+    let micAnalyser = null, auxAnalyser = null, aux2Analyser = null, xcastAnalyser = null;
 
     // Track every AudioContext the page creates so we can rebind their sink
     // when the user changes the speaker selection.
@@ -213,21 +233,26 @@
 
     function buildGraph() {
         const ctx = ensureAudioContext();
-        if (!micSrcNode && !auxSrcNode && !aux2SrcNode) return;
+        // Allow graph build when xcast has sources even if mic/aux aren't open.
+        if (!micSrcNode && !auxSrcNode && !aux2SrcNode && !xcastSrcNodes.length) return;
 
         // Tear down existing wiring on every node we touch.
         try { micSrcNode && micSrcNode.disconnect(); } catch {}
         try { auxSrcNode && auxSrcNode.disconnect(); } catch {}
         try { aux2SrcNode && aux2SrcNode.disconnect(); } catch {}
+        for (const n of xcastSrcNodes) { try { n.disconnect(); } catch {} }
         try { micGainNode && micGainNode.disconnect(); } catch {}
         try { auxGainNode && auxGainNode.disconnect(); } catch {}
         try { aux2GainNode && aux2GainNode.disconnect(); } catch {}
+        try { xcastGainNode && xcastGainNode.disconnect(); } catch {}
         try { micMixSend && micMixSend.disconnect(); } catch {}
         try { auxMixSend && auxMixSend.disconnect(); } catch {}
         try { aux2MixSend && aux2MixSend.disconnect(); } catch {}
+        try { xcastMixSend && xcastMixSend.disconnect(); } catch {}
         try { micMonitorGain && micMonitorGain.disconnect(); } catch {}
         try { auxMonitorGain && auxMonitorGain.disconnect(); } catch {}
         try { aux2MonitorGain && aux2MonitorGain.disconnect(); } catch {}
+        try { xcastMonitorGain && xcastMonitorGain.disconnect(); } catch {}
         try { mixBus && mixBus.disconnect(); } catch {}
 
         // Per-channel input gains (with mute) and meters.
@@ -237,9 +262,12 @@
         auxGainNode.gain.value = settings.auxMuted ? 0 : dbToLin(settings.auxGainDb);
         aux2GainNode = ctx.createGain();
         aux2GainNode.gain.value = settings.aux2Muted ? 0 : dbToLin(settings.aux2GainDb);
+        xcastGainNode = ctx.createGain();
+        xcastGainNode.gain.value = settings.xcastMuted ? 0 : dbToLin(settings.xcastGainDb);
         micAnalyser = ctx.createAnalyser(); micAnalyser.fftSize = 1024;
         auxAnalyser = ctx.createAnalyser(); auxAnalyser.fftSize = 1024;
         aux2Analyser = ctx.createAnalyser(); aux2Analyser.fftSize = 1024;
+        xcastAnalyser = ctx.createAnalyser(); xcastAnalyser.fftSize = 1024;
 
         // Summing bus where all channels meet before the DSP chain.
         mixBus = ctx.createGain();
@@ -256,18 +284,24 @@
         auxMixSend.gain.value = settings.auxCue ? 0 : 1;
         aux2MixSend = ctx.createGain();
         aux2MixSend.gain.value = settings.aux2Cue ? 0 : 1;
+        xcastMixSend = ctx.createGain();
+        xcastMixSend.gain.value = settings.xcastCue ? 0 : 1;
         micMonitorGain = ctx.createGain();
         micMonitorGain.gain.value = (settings.micMonitor || settings.micCue) ? 1 : 0;
         auxMonitorGain = ctx.createGain();
         auxMonitorGain.gain.value = (settings.auxMonitor || settings.auxCue) ? 1 : 0;
         aux2MonitorGain = ctx.createGain();
         aux2MonitorGain.gain.value = (settings.aux2Monitor || settings.aux2Cue) ? 1 : 0;
+        xcastMonitorGain = ctx.createGain();
+        xcastMonitorGain.gain.value = (settings.xcastMonitor || settings.xcastCue) ? 1 : 0;
         micMixSend.connect(mixBus);
         auxMixSend.connect(mixBus);
         aux2MixSend.connect(mixBus);
+        xcastMixSend.connect(mixBus);
         micMonitorGain.connect(monitorDest);
         auxMonitorGain.connect(monitorDest);
         aux2MonitorGain.connect(monitorDest);
+        xcastMonitorGain.connect(monitorDest);
 
         if (micSrcNode) {
             micSrcNode.connect(micGainNode);
@@ -286,6 +320,16 @@
             aux2SrcNode.connect(aux2Analyser);
             aux2GainNode.connect(aux2MixSend);
             aux2GainNode.connect(aux2MonitorGain);
+        }
+        if (xcastSrcNodes.length) {
+            // Pre-mix all tab captures into one bus before the channel gain.
+            const xcastPreMix = audioCtx.createGain();
+            xcastPreMix.gain.value = 1;
+            for (const src of xcastSrcNodes) src.connect(xcastPreMix);
+            xcastPreMix.connect(xcastGainNode);
+            xcastPreMix.connect(xcastAnalyser);
+            xcastGainNode.connect(xcastMixSend);
+            xcastGainNode.connect(xcastMonitorGain);
         }
 
         // High-pass filter — kills rumble, AC hum harmonics, breath thumps.
@@ -381,13 +425,16 @@
         if (micGainNode) micGainNode.gain.value = settings.micMuted ? 0 : dbToLin(settings.micGainDb);
         if (auxGainNode) auxGainNode.gain.value = settings.auxMuted ? 0 : dbToLin(settings.auxGainDb);
         if (aux2GainNode) aux2GainNode.gain.value = settings.aux2Muted ? 0 : dbToLin(settings.aux2GainDb);
+        if (xcastGainNode) xcastGainNode.gain.value = settings.xcastMuted ? 0 : dbToLin(settings.xcastGainDb);
         if (micMixSend) micMixSend.gain.value = settings.micCue ? 0 : 1;
         if (auxMixSend) auxMixSend.gain.value = settings.auxCue ? 0 : 1;
         if (aux2MixSend) aux2MixSend.gain.value = settings.aux2Cue ? 0 : 1;
+        if (xcastMixSend) xcastMixSend.gain.value = settings.xcastCue ? 0 : 1;
         // Cue forces monitor on so you can hear the cued channel.
         if (micMonitorGain) micMonitorGain.gain.value = (settings.micMonitor || settings.micCue) ? 1 : 0;
         if (auxMonitorGain) auxMonitorGain.gain.value = (settings.auxMonitor || settings.auxCue) ? 1 : 0;
         if (aux2MonitorGain) aux2MonitorGain.gain.value = (settings.aux2Monitor || settings.aux2Cue) ? 1 : 0;
+        if (xcastMonitorGain) xcastMonitorGain.gain.value = (settings.xcastMonitor || settings.xcastCue) ? 1 : 0;
     }
 
     function applySettingsLive() {
@@ -517,6 +564,135 @@
         await ensureProcessedStream();
         replaceTracksOnActivePCs();
     }
+
+    // ── xCaster channel ────────────────────────────────────────────────────
+    // Captures audio from every tab via getDisplayMedia (one call per tab).
+    // suppressLocalAudioPlayback stops the tab from playing to system audio,
+    // so the virtual cable / Aux1 never see the tab's audio.
+    // All tab streams are pre-mixed into the xCaster channel gain/DSP chain.
+
+    async function requestXcastDisplayStream() {
+        try {
+            return await navigator.mediaDevices.getDisplayMedia({
+                video: true,
+                audio: {
+                    suppressLocalAudioPlayback: true,
+                    autoGainControl: false,
+                    noiseSuppression: false,
+                    echoCancellation: false,
+                },
+            });
+        } catch (err) {
+            console.warn('[XCaster] suppress-local capture failed, retrying', err);
+            return navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+        }
+    }
+
+    async function captureTab(wcId) {
+        if (_capturedWcIds.has(wcId)) return; // already captured
+        _capturedWcIds.add(wcId);
+        const ctx = ensureAudioContext();
+        // Tell main.js which tab to resolve this specific getDisplayMedia call with.
+        window.__xcNextCaptureWcId = wcId;
+        try {
+            const stream = await requestXcastDisplayStream();
+            for (const t of stream.getVideoTracks()) { try { t.stop(); } catch {} }
+            const audioTracks = stream.getAudioTracks();
+            if (!audioTracks.length) { _capturedWcIds.delete(wcId); return; }
+            const rawStream = new MediaStream(audioTracks);
+            const srcNode = ctx.createMediaStreamSource(rawStream);
+            xcastRawStreams.push(rawStream);
+            xcastSrcNodes.push(srcNode);
+            audioTracks[0].addEventListener('ended', () => {
+                _capturedWcIds.delete(wcId);
+                const i = xcastSrcNodes.indexOf(srcNode);
+                if (i !== -1) {
+                    try { srcNode.disconnect(); } catch {}
+                    try { rawStream.getTracks().forEach(t => t.stop()); } catch {}
+                    xcastSrcNodes.splice(i, 1);
+                    xcastRawStreams.splice(i, 1);
+                }
+                settings.xcastEnabled = xcastSrcNodes.length > 0;
+                settings.xcastSourceLabel = xcastSrcNodes.length > 0 ? xcastSrcNodes.length + ' tab(s)' : '';
+                saveSettings(settings);
+                buildGraph();
+                replaceTracksOnActivePCs();
+                paintXcastStatus();
+            });
+        } catch (err) {
+            _capturedWcIds.delete(wcId);
+            console.warn('[XCaster] captureTab failed', wcId, err);
+        } finally {
+            window.__xcNextCaptureWcId = null;
+        }
+    }
+
+    async function startXcast() {
+        ensureAudioContext();
+        // Stop all existing captures.
+        for (const s of xcastRawStreams) { try { s.getTracks().forEach(t => t.stop()); } catch {} }
+        for (const n of xcastSrcNodes) { try { n.disconnect(); } catch {} }
+        xcastRawStreams = []; xcastSrcNodes = []; _capturedWcIds.clear();
+
+        // Ensure mic/aux DSP chain is ready before wiring xcast into it.
+        await ensureProcessedStream();
+
+        const allTabs = Array.isArray(window.__xcAllTabWcIds) ? [...window.__xcAllTabWcIds] : [];
+        for (const wcId of allTabs) await captureTab(wcId);
+
+        settings.xcastEnabled = xcastSrcNodes.length > 0;
+        settings.xcastSourceLabel = xcastSrcNodes.length > 0 ? xcastSrcNodes.length + ' tab(s)' : '';
+        saveSettings(settings);
+        buildGraph();
+        replaceTracksOnActivePCs();
+        paintXcastStatus();
+    }
+
+    // Called by shell.js when the tab list changes (new tabs loaded).
+    window.__xcTabsUpdated = async (allWcIds) => {
+        if (!Array.isArray(allWcIds)) return;
+        let added = false;
+        for (const wcId of allWcIds) {
+            if (!_capturedWcIds.has(wcId)) {
+                await captureTab(wcId);
+                added = true;
+            }
+        }
+        if (added) {
+            settings.xcastEnabled = xcastSrcNodes.length > 0;
+            settings.xcastSourceLabel = xcastSrcNodes.length > 0 ? xcastSrcNodes.length + ' tab(s)' : '';
+            saveSettings(settings);
+            buildGraph();
+            replaceTracksOnActivePCs();
+            paintXcastStatus();
+        }
+    };
+
+    function stopXcast() {
+        for (const s of xcastRawStreams) { try { s.getTracks().forEach(t => t.stop()); } catch {} }
+        for (const n of xcastSrcNodes) { try { n.disconnect(); } catch {} }
+        xcastRawStreams = []; xcastSrcNodes = []; _capturedWcIds.clear();
+        settings.xcastEnabled = false;
+        settings.xcastSourceLabel = '';
+        saveSettings(settings);
+        buildGraph();
+        replaceTracksOnActivePCs();
+        paintXcastStatus();
+    }
+
+    function paintXcastStatus() {
+        const status = document.getElementById('xfw-xcast-status');
+        if (!status) return;
+        if (settings.xcastEnabled) {
+            const n = xcastSrcNodes.length;
+            status.textContent = '\u25CF Capturing ' + n + ' tab' + (n !== 1 ? 's' : '');
+            status.className = 'xfw-spk-status xfw-spk-ok';
+        } else {
+            status.textContent = 'No tabs captured. Open a tab to start.';
+            status.className = 'xfw-spk-status';
+        }
+    }
+
     async function rebuildAfterDeviceChange() {
         try { if (micRawStream) micRawStream.getTracks().forEach(t => t.stop()); } catch {}
         try { if (auxRawStream) auxRawStream.getTracks().forEach(t => t.stop()); } catch {}
@@ -845,6 +1021,7 @@
                 <div class="xfw-meter-row"><div class="xfw-meter-label">Mic</div><div class="xfw-meter"><div id="xfw-meter-mic" class="xfw-meter-fill"></div></div></div>
                 <div class="xfw-meter-row"><div class="xfw-meter-label">Aux 1</div><div class="xfw-meter"><div id="xfw-meter-aux" class="xfw-meter-fill"></div></div></div>
                 <div class="xfw-meter-row"><div class="xfw-meter-label">Aux 2</div><div class="xfw-meter"><div id="xfw-meter-aux2" class="xfw-meter-fill"></div></div></div>
+                <div class="xfw-meter-row"><div class="xfw-meter-label">xCast</div><div class="xfw-meter"><div id="xfw-meter-xcast" class="xfw-meter-fill"></div></div></div>
                 <div class="xfw-meter-row"><div class="xfw-meter-label">Mix</div><div class="xfw-meter"><div id="xfw-meter-in" class="xfw-meter-fill"></div></div></div>
                 <div class="xfw-meter-row"><div class="xfw-meter-label">Out</div><div class="xfw-meter"><div id="xfw-meter-out" class="xfw-meter-fill"></div></div></div>
                 <div class="xfw-meter-row"><div class="xfw-meter-label">GR</div><div class="xfw-meter"><div id="xfw-meter-gr" class="xfw-gr-meter-fill"></div></div></div>
@@ -854,6 +1031,7 @@
                 <button class="xfw-tab xfw-active" data-pane="mic">Mic</button>
                 <button class="xfw-tab" data-pane="aux">Aux 1</button>
                 <button class="xfw-tab" data-pane="aux2">Aux 2</button>
+                <button class="xfw-tab" data-pane="xcast">xCaster</button>
                 <button class="xfw-tab" data-pane="spk">Speakers</button>
                 <button class="xfw-tab" data-pane="dsp">Processing</button>
                 <button class="xfw-tab" data-pane="pre">Presets</button>
@@ -980,6 +1158,32 @@
                         <div>Echo Cancellation<span class="xfw-help">Only useful with speakers + open mic. Usually OFF.</span></div>
                         <div class="xfw-toggle" data-key="aux2EchoCancellation"></div>
                     </div>
+                </div>
+            </div>
+
+            <!-- xCASTER PANE — in-app tab audio capture -->
+            <div class="xfw-pane" data-pane="xcast">
+                <div class="xfw-section">
+                    <label class="xfw-label">xCaster audio channel</label>
+                    <div class="xfw-help" style="color:var(--xfw-muted);font-size:11px;">
+                        Audio from any tab in this app feeds into the xCaster channel and into your mix.
+                    </div>
+                    <div id="xfw-xcast-status" class="xfw-spk-status" style="margin-top:8px;"></div>
+                </div>
+                <div class="xfw-section">
+                    <div class="xfw-row">
+                        <div>Mute xCaster<span class="xfw-help">Silence the channel without stopping capture.</span></div>
+                        <div class="xfw-toggle" data-key="xcastMuted"></div>
+                    </div>
+                    <div class="xfw-row">
+                        <div>Monitor in headset<span class="xfw-help">Hear the captured audio in your headphones.</span></div>
+                        <div class="xfw-toggle" data-key="xcastMonitor"></div>
+                    </div>
+                    <div class="xfw-row">
+                        <div>Cue (monitor only)<span class="xfw-help">Audition without sending to the broadcast. Useful for previewing.</span></div>
+                        <div class="xfw-toggle" data-key="xcastCue"></div>
+                    </div>
+                    <div class="xfw-slider-row" data-slider="xcastGainDb" data-min="-40" data-max="18" data-step="0.5" data-suffix=" dB" data-label="xCaster level"></div>
                 </div>
             </div>
 
@@ -1118,6 +1322,7 @@
                 valSpan.textContent = formatVal(settings[key], suffix);
                 saveSettings(settings);
                 if (key === 'micGainDb' || key === 'auxGainDb' || key === 'aux2GainDb') applyMixerLive();
+                else if (key === 'xcastGainDb') applyMixerLive();
                 else applySettingsLive();
             });
         });
@@ -1243,11 +1448,13 @@
         const micFill = document.getElementById('xfw-meter-mic');
         const auxFill = document.getElementById('xfw-meter-aux');
         const aux2Fill = document.getElementById('xfw-meter-aux2');
+        const xcastFill = document.getElementById('xfw-meter-xcast');
         const inBuf = inputAnalyser ? new Uint8Array(inputAnalyser.fftSize) : null;
         const outBuf = outputAnalyser ? new Uint8Array(outputAnalyser.fftSize) : null;
         const micBuf = micAnalyser ? new Uint8Array(micAnalyser.fftSize) : null;
         const auxBuf = auxAnalyser ? new Uint8Array(auxAnalyser.fftSize) : null;
         const aux2Buf = aux2Analyser ? new Uint8Array(aux2Analyser.fftSize) : null;
+        const xcastBuf = xcastAnalyser ? new Uint8Array(xcastAnalyser.fftSize) : null;
         const tick = () => {
             if (micAnalyser && micFill && micBuf) {
                 micAnalyser.getByteTimeDomainData(micBuf);
@@ -1261,6 +1468,10 @@
                 aux2Analyser.getByteTimeDomainData(aux2Buf);
                 aux2Fill.style.width = peakPct(aux2Buf);
             } else if (aux2Fill) { aux2Fill.style.width = '0%'; }
+            if (xcastAnalyser && xcastFill && xcastBuf) {
+                xcastAnalyser.getByteTimeDomainData(xcastBuf);
+                xcastFill.style.width = peakPct(xcastBuf);
+            } else if (xcastFill) { xcastFill.style.width = '0%'; }
             if (inputAnalyser && inFill && inBuf) {
                 inputAnalyser.getByteTimeDomainData(inBuf);
                 inFill.style.width = peakPct(inBuf);
@@ -1292,8 +1503,18 @@
         const fab = document.getElementById('xfw-fab');
         const panel = document.getElementById('xfw-panel');
 
-        fab.addEventListener('click', async () => {
-            const opening = !panel.classList.contains('xfw-open');
+        function selectPane(name) {
+            if (!name) return;
+            const tab = panel.querySelector(`.xfw-tab[data-pane="${name}"]`);
+            if (tab) tab.click();
+        }
+
+        async function setMixerOpen(opening, paneName) {
+            const alreadyOpen = panel.classList.contains('xfw-open');
+            if (opening === alreadyOpen) {
+                if (opening) selectPane(paneName);
+                return true;
+            }
             panel.classList.toggle('xfw-open', opening);
             if (opening) {
                 buildSliders();
@@ -1307,6 +1528,16 @@
                 stopMeters();
                 stopSinkScan();
             }
+            if (opening) selectPane(paneName);
+            return true;
+        }
+
+        window.__xcOpenMixer = (paneName) => setMixerOpen(true, paneName);
+        window.__xcCloseMixer = () => setMixerOpen(false);
+        window.__xcToggleMixer = (paneName) => setMixerOpen(!panel.classList.contains('xfw-open'), paneName);
+
+        fab.addEventListener('click', () => {
+            window.__xcToggleMixer();
         });
 
         window.addEventListener('keydown', e => {
@@ -1335,8 +1566,11 @@
             if (key === 'bypass') { buildGraph(); replaceTracksOnActivePCs(); }
             // mute toggles update the per-channel gain live
             if (key === 'micMuted' || key === 'auxMuted' || key === 'aux2Muted') applyMixerLive();
+            if (key === 'xcastMuted') applyMixerLive();
             if (key === 'micMonitor' || key === 'auxMonitor' || key === 'aux2Monitor') applyMixerLive();
+            if (key === 'xcastMonitor') applyMixerLive();
             if (key === 'micCue' || key === 'auxCue' || key === 'aux2Cue') applyMixerLive();
+            if (key === 'xcastCue') applyMixerLive();
             // browser-side capture toggles need a fresh raw stream — only rebuild the affected channel
             if (['micAutoGainControl', 'micNoiseSuppression', 'micEchoCancellation'].includes(key)) {
                 rebuildMic();
@@ -1380,10 +1614,14 @@
             clearSinkError();
             applySinkToAll();
             applySinkToAllContexts();
+            // Reattach the monitor bus so it plays through the newly selected device.
+            if (monitorDest) attachMonitorToOutput(monitorDest.stream);
         });
 
         const testSpkBtn = document.getElementById('xfw-test-spk');
         if (testSpkBtn) testSpkBtn.addEventListener('click', () => testOutputDevice());
+
+        paintXcastStatus();
 
         // presets
         panel.querySelectorAll('.xfw-preset').forEach(b => {
@@ -1666,6 +1904,12 @@
         applyFabPos();
         applyPanelPos();
         wire();
+        // Auto-start xCaster audio capture when running in the shell window.
+        // Only starts if there is an active webview tab to capture (main.js
+        // will deny the request otherwise and overlay shows 'Not capturing').
+        if (!window.__xfwIsWebview) {
+            setTimeout(() => startXcast(), 300);
+        }
         startHealthWatchdog();
         startWorkerKeepalive();
     }

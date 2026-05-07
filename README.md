@@ -1,33 +1,56 @@
 # XCaster
 
-**XCaster** is a standalone Windows desktop app for [x.com](https://x.com) built for X Spaces streamers who need professional, consistent audio — without BlueStacks, virtual cables, or browser limitations.
+**XCaster** is a standalone Windows desktop app for [x.com](https://x.com) built for X Spaces streamers who need professional, isolated audio — no BlueStacks, no browser limitations, no audio leaking where it shouldn't.
 
-It ships its own Chromium (via Electron), disables WebRTC's automatic gain control at the engine level, and injects a full DSP mixer overlay directly into the X interface.
+It ships its own Chromium (via Electron), disables WebRTC AGC at the engine level, and injects a full DSP mixer into the app itself — turning XCaster into a global audio surface where every tab is an independent, isolated input channel.
 
 ---
 
 ## Download
 
-**[XCaster v0.5.0 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v0.5.0/XCaster-win32-x64.zip)**
+**[XCaster v1.0.0 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.0.0/XCaster-win32-x64.zip)**
 
 Extract the zip and run `XCaster.exe` — no installer required.
+
+---
+
+## What's new in v1.0.0
+
+### Global audio surface
+The mixer gear now lives in the **app itself**, not inside a specific tab. It opens instantly with no tabs loaded and stays accessible regardless of what page you're on.
+
+### xCaster channel — isolated per-tab audio
+Every browser tab in XCaster is **automatically muted from your system output** (virtual cable, speakers, everything) the moment it loads. Their audio is captured directly via the Electron frame API and fed exclusively into the **xCaster channel** in the mixer — completely bypassing your PC's audio devices.
+
+- No tab audio leaks to your virtual cable or Aux inputs
+- No feedback loop when Aux 1 and xCaster are both monitored
+- New tabs are captured automatically as you open them
+- Multiple tabs mix together in the xCaster channel pre-gain
+- `suppressLocalAudioPlayback` is honoured at the frame level — the OS never sees the audio
+
+### Mixer is app-wide
+- **Gear opens on any tab** — or even with no tabs open
+- Monitor, Cue, Mute, and level controls all work independently of which page is active
+- xCaster channel plays to your **selected speaker output only** — not to PC default
 
 ---
 
 ## Features
 
 - **WebRTC AGC disabled** — X Spaces cannot auto-level, duck, or re-process your microphone
-- **3-channel mixer** — Mic + Aux 1 (desktop audio) + Aux 2 (external receiver/mixer) summed pre-DSP
-- **Per-channel controls** — Level, Mute, Monitor in headset, Cue (PFL), AGC/NS/EC toggles per channel
-- **Cue (PFL)** — Hear a channel in your headset without sending it to X. Preload audio before going live.
-- **Output routing** — All X Spaces + page audio routed through a dedicated AudioContext to your chosen headset device
+- **4-channel mixer** — Mic + Aux 1 + Aux 2 + xCaster (in-app tab audio), all summed pre-DSP
+- **xCaster channel** — captures all open tabs simultaneously, isolated from system audio
+- **Per-channel controls** — Level, Mute, Monitor in headset, Cue (PFL) per channel
+- **Cue (PFL)** — audition a channel in your headset without sending it to X
+- **Output routing** — monitor bus and X Spaces playback routed to your chosen output device via `AudioContext.setSinkId`
 - **Full DSP chain** — High-pass filter → 3-band EQ → Compressor → Limiter → Makeup gain
-- **Live meters** — Mic / Aux 1 / Aux 2 / Mix / Out / Gain Reduction (persistent bar above tabs)
-- **Background priority** — Pinned to High process priority every 3 s via PowerShell; Web Worker keepalive prevents audio choppiness when minimized or covered by other apps
-- **Background skin** — Your `background.mp4` plays behind a semi-transparent X content window
-- **Draggable UI** — Drag the gear button anywhere on screen
+- **Live meters** — Mic / Aux 1 / Aux 2 / xCaster / Mix / Out / Gain Reduction
+- **Background audio stability** — Chromium background throttling disabled; Web Worker keepalive prevents choppy audio when minimized
+- **Built-in browser** — tabs for X, YouTube, TibetSwap, MintGarden, and your custom bookmarks
+- **Background skin** — `background.mp4` plays behind a semi-transparent content window
+- **Draggable UI** — drag the gear anywhere on screen
 - **Presets** — Spaces loud+steady / Podcast / Music / Off (raw bypass)
-- **Persists settings** — All knobs saved in localStorage between sessions
+- **Persists settings** — all knobs saved in localStorage between sessions
 
 ---
 
@@ -54,25 +77,41 @@ Output: `XForWindows/dist/XCaster-win32-x64/XCaster.exe`
 ## Usage
 
 1. Launch **XCaster.exe**
-2. Click the **⚙ gear** button (bottom-right, or wherever you dragged it)
+2. Click the **⚙ gear** button (bottom-right, or wherever you dragged it) — works with or without tabs open
 3. **Mic tab** — pick your microphone, set level
-4. **Aux tab** — optionally pick a second audio source to mix in
-5. **Speakers tab** — pick where X's incoming audio plays (headphones, not your speakers, to avoid feedback)
-6. **Processing tab** — tune HPF, EQ, compressor, limiter
-7. **Skin tab** — enable background video, set content opacity, drag positions
-8. **Presets tab** — one-click starting points
+4. **Aux 1 / Aux 2 tabs** — optionally pick desktop audio or an external source
+5. **xCaster tab** — shows how many tabs are captured; use Mute / Monitor / Cue / Level to control them
+6. **Speakers tab** — pick where the monitor bus plays (headphones, to avoid feedback)
+7. **Processing tab** — tune HPF, EQ, compressor, limiter
+8. **Skin tab** — background video, content opacity, drag positions
+9. **Presets tab** — one-click starting points
 
 Press `Ctrl+,` to toggle the panel at any time.
 
 ---
 
+## Audio routing architecture
+
+```
+[Mic]  ──────────────────┐
+[Aux 1 (virtual cable)]  ├──► per-channel Gain ──► mixBus ──► DSP ──► X Spaces (getUserMedia)
+[Aux 2 (ext. mixer)]  ───┤
+[xCaster (all tabs)]  ───┘
+
+               monitorBus ──► AudioContext.setSinkId ──► selected headset
+```
+
+Tab audio **never touches the system audio device**. The virtual cable on Aux 1 only captures what you explicitly route there — not xCaster tab audio.
+
+---
+
 ## Why it exists
 
-Desktop X in Chrome/Edge forces WebRTC's auto gain control onto every mic. There is no UI toggle. XCaster launches with Chromium flags that disable the audio service APM and patches `getUserMedia` in a preload so X receives a flat, unprocessed signal — then lets *you* apply dynamics and EQ with full visibility via meters.
+Desktop X in Chrome/Edge forces WebRTC AGC onto every mic with no UI toggle. XCaster launches with Chromium flags that disable the audio service APM, patches `getUserMedia` so X receives a flat signal, and adds a full DSP chain with metering so you control your sound — not X's algorithm.
 
 ---
 
 ## Requirements
 
 - Windows 10/11 x64
-- No virtual cable required (optional if you want to route from another app)
+- No virtual cable required (optional for routing from external apps into Aux 1/2)

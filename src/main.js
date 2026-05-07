@@ -3,8 +3,11 @@
 // Gives streamers full control over launch flags and getUserMedia constraints,
 // plus a full DSP/mixer overlay for professional X Spaces audio.
 
-const { app, BrowserWindow, session, Menu, shell, ipcMain, dialog, protocol, net, powerSaveBlocker } = require('electron');
+const { app, BrowserWindow, session, Menu, shell, ipcMain, dialog, protocol, net, powerSaveBlocker, webContents } = require('electron');
 const path = require('path');
+const fs = require('fs');
+const https = require('https');
+const os = require('os');
 const { pathToFileURL } = require('url');
 const { execFile } = require('child_process');
 
@@ -81,6 +84,41 @@ if (!gotLock) {
 }
 
 let mainWindow = null;
+const runtimeIntervals = new Set();
+const powerSaveBlockerIds = new Set();
+
+function registerInterval(callback, delay) {
+    const timer = setInterval(callback, delay);
+    runtimeIntervals.add(timer);
+    return timer;
+}
+
+function startPowerSaveBlocker(type) {
+    try {
+        const id = powerSaveBlocker.start(type);
+        if (id) powerSaveBlockerIds.add(id);
+    } catch {}
+}
+
+function cleanupRuntimeGuards() {
+    for (const timer of runtimeIntervals) clearInterval(timer);
+    runtimeIntervals.clear();
+
+    for (const id of powerSaveBlockerIds) {
+        try {
+            if (powerSaveBlocker.isStarted(id)) powerSaveBlocker.stop(id);
+        } catch {}
+    }
+    powerSaveBlockerIds.clear();
+}
+
+function raiseMainProcessPriorityWindows() {
+    if (process.platform !== 'win32') return;
+    try {
+        const highPriority = os.constants?.priority?.PRIORITY_HIGH ?? -14;
+        os.setPriority(process.pid, highPriority);
+    } catch {}
+}
 
 function createWindow() {
     mainWindow = new BrowserWindow({
@@ -92,47 +130,35 @@ function createWindow() {
         title: 'XCaster',
         autoHideMenuBar: true,
         webPreferences: {
-            preload: path.join(__dirname, 'preload.js'),
+            preload: path.join(__dirname, 'shell-preload.js'),
             contextIsolation: true,
-            // sandbox:false so the preload can read overlay.css/overlay.js from disk.
-            // contextIsolation still keeps the page from touching Node APIs.
+            // sandbox:false so the preload can use Node APIs (path, url) for contextBridge.
             sandbox: false,
             nodeIntegration: false,
+            webviewTag: true,          // enables <webview> in shell.html
             backgroundThrottling: false,
         },
     });
 
-    // Auto-grant microphone permission only for x.com / twitter.com.
-    session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
-        const url = details?.requestingUrl ?? webContents.getURL();
-        const allowedHosts = ['x.com', 'twitter.com', 'pbs.twimg.com', 'video.twimg.com'];
-        const host = (() => {
-            try { return new URL(url).hostname; } catch { return ''; }
-        })();
-        const isAllowedHost = allowedHosts.some(h => host === h || host.endsWith('.' + h));
-
-        if (permission === 'media' && isAllowedHost) {
-            callback(true);
-            return;
-        }
-        if (permission === 'notifications' && isAllowedHost) {
-            callback(true);
-            return;
-        }
-        callback(false);
+    // Grant media / notification permissions for all sites loaded in this trusted browser.
+    // The user explicitly chose to open a site in XCaster, so we treat every tab as trusted.
+    session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
+        const allowed = ['media', 'notifications', 'geolocation', 'pointerLock', 'clipboard-read', 'clipboard-sanitized-write'];
+        callback(allowed.includes(permission));
     });
 
-    // Use a recent desktop Chrome UA so X serves the desktop experience cleanly.
-    mainWindow.webContents.setUserAgent(
-        mainWindow.webContents.getUserAgent().replace(/Electron\/[^\s]+\s?/, '')
+    // Strip the Electron token from the UA at the session level so all webviews
+    // (and the shell itself) present as a standard Chrome desktop browser.
+    session.defaultSession.setUserAgent(
+        session.defaultSession.getUserAgent().replace(/Electron\/[^\s]+\s?/, '')
     );
 
     // Keep system + display awake while XCaster runs so Windows doesn't
     // throttle the audio capture pipeline when minimized.
-    try { powerSaveBlocker.start('prevent-app-suspension'); } catch {}
+    startPowerSaveBlocker('prevent-app-suspension');
     // 'prevent-display-sleep' also keeps the renderer at full priority on
     // Windows when the window is occluded (covered by other apps).
-    try { powerSaveBlocker.start('prevent-display-sleep'); } catch {}
+    startPowerSaveBlocker('prevent-display-sleep');
 
     // Re-assert no-throttling whenever the window is minimized, hidden, or
     // restored — Chromium can re-enable throttling on these transitions.
@@ -148,43 +174,92 @@ function createWindow() {
     mainWindow.on('focus', reassertNoThrottle);
     // Periodic re-assertion catches occlusion-driven throttling that no
     // event fires for (when other apps cover the window without minimizing).
-    setInterval(reassertNoThrottle, 2000);
+    registerInterval(reassertNoThrottle, 2000);
 
-    // Pin all XCaster processes (main + renderers + GPU + audio service) to
-    // HIGH priority on Windows. Chromium silently demotes renderer priority
-    // when occluded, which is the root cause of background audio choppiness.
-    // Re-pinning every 3s catches any renderer that gets demoted.
-    function pinProcessPriorityWindows() {
-        if (process.platform !== 'win32') return;
-        try { process.priority = 'high'; } catch {}
-        // Use PowerShell to set every XCaster process to High priority.
-        // This includes the renderer that hosts the audio graph.
-        const cmd = `Get-Process -Name XCaster -ErrorAction SilentlyContinue | ForEach-Object { try { $_.PriorityClass = 'High' } catch {} }`;
-        execFile('powershell.exe', ['-NoProfile', '-WindowStyle', 'Hidden', '-Command', cmd], () => {});
-    }
-    pinProcessPriorityWindows();
-    setInterval(pinProcessPriorityWindows, 3000);
+    // Raise the main process priority without spawning terminal processes.
+    // Renderer throttling is handled by Chromium flags and webContents settings above.
+    raiseMainProcessPriorityWindows();
 
-    // Open external links (non-x.com) in the user's default browser.
-    mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    // The shell window (shell.html) does not itself open new windows.
+    // New-window events from webviews are handled inside shell.js.
+    mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+
+    // ── Display-media handler ────────────────────────────────────────────
+    // Fired when a webview calls navigator.mediaDevices.getDisplayMedia.
+    // If the overlay dropdown pre-selected a tab (stored in window.__xcPendingCapture
+    // on the shell window), resolve immediately with that tab — no picker modal.
+    // Falls back to the interactive picker if no target was pre-set.
+    session.defaultSession.setDisplayMediaRequestHandler(async (request, callback) => {
         try {
-            const host = new URL(url).hostname;
-            if (host.endsWith('x.com') || host.endsWith('twitter.com')) {
-                return { action: 'allow' };
+            // Check for pre-selected capture target from the overlay dropdown.
+            let pendingId = null;
+            try {
+                pendingId = await mainWindow.webContents.executeJavaScript('window.__xcPendingCapture || null');
+            } catch {}
+
+            if (pendingId != null) {
+                // Clear immediately so a second call starts fresh.
+                try { await mainWindow.webContents.executeJavaScript('window.__xcPendingCapture = null'); } catch {}
+                const target = webContents.fromId(+pendingId);
+                if (target && !target.isDestroyed()) {
+                    callback({ video: target.mainFrame, audio: target.mainFrame });
+                    return;
+                }
             }
-        } catch { /* ignore */ }
-        shell.openExternal(url);
-        return { action: 'deny' };
+
+            // If the request comes from the shell window itself (no tab selected),
+            // capture the tab whose wcId the overlay set in __xcNextCaptureWcId.
+            // The overlay sets this before each getDisplayMedia call so each
+            // per-tab capture resolves with the right tab's audio frame.
+            // suppressLocalAudioPlayback in the overlay request stops that tab
+            // from playing to system output (virtual cable stays clean).
+            const isShellFrame = mainWindow?.webContents?.mainFrame === request.frame;
+            if (isShellFrame) {
+                let wcId = null;
+                try { wcId = await mainWindow.webContents.executeJavaScript('window.__xcNextCaptureWcId || null'); } catch {}
+                if (wcId != null) {
+                    const target = webContents.fromId(+wcId);
+                    if (target && !target.isDestroyed()) {
+                        callback({ video: target.mainFrame, audio: target.mainFrame });
+                        return;
+                    }
+                }
+                // No specific tab set — deny so overlay shows 'No tabs captured'.
+                callback();
+                return;
+            }
+
+            // Fall back to the interactive tab-picker modal.
+            const requestor = request.frame?.frameTreeNodeId ?? null;
+            const tabsList = webContents.getAllWebContents()
+                .filter(wc => !wc.isDestroyed() && wc.getType() === 'webview')
+                .map(wc => ({ id: wc.id, url: wc.getURL(), title: wc.getTitle() || wc.getURL() }))
+                .filter(t => t.id !== requestor);
+
+            const json = JSON.stringify(tabsList).replace(/`/g, '\\`');
+            const picked = await mainWindow.webContents.executeJavaScript(
+                `(window.__xcasterShowTabPicker && window.__xcasterShowTabPicker(${json})) || null`
+            );
+            if (!picked) { callback(); return; }
+
+            const target = webContents.fromId(picked);
+            if (!target || target.isDestroyed()) { callback(); return; }
+
+            callback({ video: target.mainFrame, audio: target.mainFrame });
+        } catch (err) {
+            console.warn('[XCaster] display media handler failed', err);
+            try { callback(); } catch { /* ignore */ }
+        }
     });
 
-    mainWindow.loadURL('https://x.com/');
+    mainWindow.loadFile(path.join(__dirname, 'shell.html'));
 
     // Minimal menu: File / View / Help. Hidden by default (autoHideMenuBar).
     const template = [
         {
             label: 'File',
             submenu: [
-                { label: 'Reload X', accelerator: 'CmdOrCtrl+R', click: () => mainWindow.reload() },
+                { label: 'New Tab',  accelerator: 'CmdOrCtrl+T', click: () => mainWindow.webContents.executeJavaScript('document.dispatchEvent(new KeyboardEvent("keydown",{key:"t",ctrlKey:true,bubbles:true}))') },
                 { type: 'separator' },
                 { role: 'quit' },
             ],
@@ -262,15 +337,179 @@ app.whenReady().then(() => {
         callback({ responseHeaders: stripped });
     });
 
-    createWindow();
+    // Load any extensions placed in <userData>/extensions before opening the window.
+    autoLoadExtensions().finally(() => createWindow());
 });
 
 app.on('window-all-closed', () => {
     app.quit();
 });
 
-// Diagnostic IPC: preload can ping us to confirm the patch ran.
+app.on('before-quit', cleanupRuntimeGuards);
+app.on('will-quit', cleanupRuntimeGuards);
+
+// Diagnostic IPC: webview preload notifies when overlay is injected.
 ipcMain.on('xfw:gum-patched', (_e, info) => {
-    // eslint-disable-next-line no-console
     console.log('[XCaster] getUserMedia patched on', info?.url);
+});
+
+// IPC: open a URL in the system default browser (called from shell renderer).
+ipcMain.handle('xfw:open-external', (_e, url) => {
+    try {
+        const parsed = new URL(url);
+        if (parsed.protocol === 'https:' || parsed.protocol === 'http:') {
+            shell.openExternal(url);
+        }
+    } catch { /* ignore invalid URLs */ }
+});
+
+// IPC: open a chrome-extension:// page in a real BrowserWindow so it has
+// the correct extension context (necessary for MetaMask popup / home page).
+ipcMain.handle('xfw:open-extension-page', (_e, extUrl) => {
+    try {
+        const parsed = new URL(extUrl);
+        if (parsed.protocol !== 'chrome-extension:') return;
+        const win = new BrowserWindow({
+            width: 400, height: 620,
+            title: 'Extension',
+            webPreferences: { sandbox: false, contextIsolation: true },
+            parent: mainWindow,
+            modal: false,
+            autoHideMenuBar: true,
+        });
+        win.loadURL(extUrl);
+    } catch (err) { console.warn('[XCaster] open-extension-page failed', err); }
+});
+
+// ── Chrome-extension management (MetaMask, etc.) ────────────────────────────
+// Extensions live in <userData>/extensions/<id>/ as unpacked folders. They are
+// auto-loaded into defaultSession on app start so any webview can use them.
+
+function extensionsRoot() {
+    return path.join(app.getPath('userData'), 'extensions');
+}
+
+async function autoLoadExtensions() {
+    const root = extensionsRoot();
+    try { fs.mkdirSync(root, { recursive: true }); } catch { /* ignore */ }
+    let entries = [];
+    try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const dir = path.join(root, entry.name);
+        // Walk into nested folders if manifest.json isn't at the top level
+        // (zip layouts vary).
+        const manifestPath = findManifest(dir);
+        if (!manifestPath) continue;
+        try {
+            await session.defaultSession.loadExtension(path.dirname(manifestPath), { allowFileAccess: true });
+            console.log('[XCaster] loaded extension', entry.name);
+        } catch (err) {
+            console.warn('[XCaster] loadExtension failed for', entry.name, err);
+        }
+    }
+}
+
+function findManifest(dir, depth = 0) {
+    if (depth > 3) return null;
+    try {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const e of entries) {
+            if (e.isFile() && e.name === 'manifest.json') return path.join(dir, e.name);
+        }
+        for (const e of entries) {
+            if (e.isDirectory()) {
+                const found = findManifest(path.join(dir, e.name), depth + 1);
+                if (found) return found;
+            }
+        }
+    } catch { /* ignore */ }
+    return null;
+}
+
+function httpsGetJSON(url) {
+    return new Promise((resolve, reject) => {
+        https.get(url, { headers: { 'User-Agent': 'XCaster' } }, res => {
+            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                return resolve(httpsGetJSON(res.headers.location));
+            }
+            if (res.statusCode !== 200) { reject(new Error('HTTP ' + res.statusCode)); return; }
+            let data = '';
+            res.on('data', d => data += d);
+            res.on('end', () => { try { resolve(JSON.parse(data)); } catch (e) { reject(e); } });
+        }).on('error', reject);
+    });
+}
+
+function httpsDownload(url, destPath) {
+    return new Promise((resolve, reject) => {
+        const file = fs.createWriteStream(destPath);
+        const req = https.get(url, { headers: { 'User-Agent': 'XCaster' } }, res => {
+            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                file.close(); fs.unlinkSync(destPath);
+                return resolve(httpsDownload(res.headers.location, destPath));
+            }
+            if (res.statusCode !== 200) { reject(new Error('HTTP ' + res.statusCode)); return; }
+            res.pipe(file);
+            file.on('finish', () => file.close(() => resolve(destPath)));
+        });
+        req.on('error', err => { try { fs.unlinkSync(destPath); } catch {} reject(err); });
+    });
+}
+
+function unzip(zipPath, destDir) {
+    return new Promise((resolve, reject) => {
+        fs.mkdirSync(destDir, { recursive: true });
+        // Use PowerShell's Expand-Archive — built into Windows, no extra deps.
+        execFile('powershell.exe',
+            ['-NoProfile', '-Command', `Expand-Archive -Path "${zipPath}" -DestinationPath "${destDir}" -Force`],
+            (err) => err ? reject(err) : resolve(destDir)
+        );
+    });
+}
+
+// IPC: install MetaMask from its official GitHub release.
+ipcMain.handle('xfw:install-metamask', async () => {
+    const releaseAPI = 'https://api.github.com/repos/MetaMask/metamask-extension/releases/latest';
+    const release = await httpsGetJSON(releaseAPI);
+    const asset = (release.assets || []).find(a => /^metamask-chrome-.*\.zip$/.test(a.name));
+    if (!asset) throw new Error('No metamask-chrome zip found in latest release');
+
+    const root = extensionsRoot();
+    fs.mkdirSync(root, { recursive: true });
+    const target = path.join(root, 'metamask');
+    // Wipe any previous install
+    try { fs.rmSync(target, { recursive: true, force: true }); } catch { /* ignore */ }
+    const zipPath = path.join(root, asset.name);
+    await httpsDownload(asset.browser_download_url, zipPath);
+    await unzip(zipPath, target);
+    try { fs.unlinkSync(zipPath); } catch { /* ignore */ }
+
+    const manifest = findManifest(target);
+    if (!manifest) throw new Error('manifest.json not found after unzip');
+    const ext = await session.defaultSession.loadExtension(path.dirname(manifest), { allowFileAccess: true });
+    return { name: ext.name, version: ext.version };
+});
+
+// IPC: list currently loaded extensions.
+ipcMain.handle('xfw:list-extensions', () => {
+    return session.defaultSession.getAllExtensions().map(e => {
+        const m = e.manifest || {};
+        const popup = (m.action && m.action.default_popup)
+            || (m.browser_action && m.browser_action.default_popup)
+            || m.default_popup
+            || null;
+        const popupUrl = popup ? `chrome-extension://${e.id}/${popup}` : null;
+        // For extensions without a popup (or as a richer alternative), fall back
+        // to the options page or home.html (MetaMask uses this).
+        const homeRel = m.options_ui?.page || m.options_page || 'home.html';
+        const homeUrl = homeRel ? `chrome-extension://${e.id}/${homeRel}` : null;
+        let icon = null;
+        if (m.icons) {
+            const sizes = Object.keys(m.icons).map(Number).sort((a, b) => a - b);
+            const pick = sizes.find(s => s >= 32) ?? sizes[sizes.length - 1];
+            if (pick) icon = `chrome-extension://${e.id}/${m.icons[pick]}`;
+        }
+        return { id: e.id, name: e.name, version: e.version, popupUrl, homeUrl, icon };
+    });
 });
