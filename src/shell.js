@@ -25,6 +25,7 @@ const TILE_COLORS      = ['#2563eb','#6366f1','#d97706','#059669','#7c3aed','#dc
 const WEBVIEW_PRELOAD  = window.xcaster?.webviewPreloadURL ?? null;
 const OVERLAY_CSS      = window.xcaster?.overlayCSS ?? '';
 const OVERLAY_JS       = window.xcaster?.overlayJS ?? '';
+const X_HOME_URL       = 'https://x.com/';
 
 // ── State ────────────────────────────────────────────────────────────────────
 
@@ -128,7 +129,7 @@ function showWebview(tab) {
 
 // ── Tab: create ───────────────────────────────────────────────────────────────
 
-function createTab(url = null) {
+function createTab(url = X_HOME_URL) {
     const id = nextTabId++;
     const useXView = !!(url && isXViewURL(url));
     const tab = {
@@ -170,7 +171,7 @@ function closeTab(id) {
         try { tab.wv.remove(); } catch { /* ignore */ }
     }
     tabs.splice(idx, 1);
-    if (tabs.length === 0) { createTab(); return; }
+    if (tabs.length === 0) { createTab(X_HOME_URL); return; }
     if (activeTabId === id) {
         activateTab(tabs[Math.min(idx, tabs.length - 1)].id);
     }
@@ -234,6 +235,40 @@ function navigateTab(tab, url) {
     tab.title       = 'Loading…';
     tab.loading     = true;
     tab.favicon     = null;
+
+    const wantsXView = isXViewURL(url);
+
+    // Keep X routes on the v0.5.0 BrowserView audio path even when navigating
+    // from an existing home/webview tab.
+    if (wantsXView && !tab.xview) {
+        if (tab.wv) {
+            try { tab.wv.remove(); } catch { /* ignore */ }
+            tab.wv = null;
+        }
+        tab.xview = true;
+
+        if (activeTabId === tab.id) setHomeVisible(false);
+        window.xcaster?.createXView(tab.id, url)
+            .then(() => {
+                if (activeTabId === tab.id) return window.xcaster?.showXView(tab.id);
+            })
+            .catch(() => {});
+
+        if (activeTabId === tab.id) {
+            syncAddressBar(tab);
+            syncNavButtons(tab);
+            startProgress();
+        }
+        renderTabBar();
+        return;
+    }
+
+    // Leaving X domain: move back to a webview-backed tab.
+    if (!wantsXView && tab.xview) {
+        tab.xview = false;
+        window.xcaster?.hideXView(tab.id).catch(() => {});
+        window.xcaster?.destroyXView(tab.id).catch(() => {});
+    }
 
     if (tab.xview) {
         window.xcaster?.navigateXView(tab.id, url).catch(() => {});
@@ -836,18 +871,8 @@ btnReload.addEventListener('click', () => {
 
 btnHome.addEventListener('click', () => {
     const tab = activeTab();
-    if (!tab) { createTab(); return; }
-    if (tab.xview) {
-        window.xcaster?.hideXView(tab.id).catch(() => {});
-    } else if (tab.wv) {
-        tab.wv.classList.remove('active');
-    }
-    tab.showingHome = true;
-    tab.title       = 'New Tab';
-    setHomeVisible(true);
-    syncAddressBar(tab);
-    syncNavButtons(tab);
-    renderTabBar();
+    if (!tab) { createTab(X_HOME_URL); return; }
+    navigateTab(tab, X_HOME_URL);
 });
 
 btnBookmark.addEventListener('click', () => {
@@ -1035,6 +1060,6 @@ function reportToolbarHeight() {
 }
 window.addEventListener('load', reportToolbarHeight);
 
-createTab('https://x.com/'); // start on X, using BrowserView with v0.5.0 preload
+createTab(X_HOME_URL); // start on X, using BrowserView with v0.5.0 preload
 
 })();

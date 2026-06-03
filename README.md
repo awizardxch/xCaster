@@ -9,17 +9,28 @@ It ships its own Chromium (via Electron), disables WebRTC AGC at the engine leve
 ## Download
 
 **Windows (x64)**
-[XCaster v1.1.2 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.1.2/XCaster-win32-x64.zip)
+[XCaster v1.1.3 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.1.3/XCaster-win32-x64.zip)
 
 **macOS (Apple Silicon / arm64)**
-[XCaster v1.1.2 — XCaster-darwin-arm64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.1.2/XCaster-darwin-arm64.zip)
+[XCaster v1.1.3 — XCaster-darwin-arm64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.1.3/XCaster-darwin-arm64.zip)
 
 **macOS (Intel / x64)**
-[XCaster v1.1.2 — XCaster-darwin-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.1.2/XCaster-darwin-x64.zip)
+[XCaster v1.1.3 — XCaster-darwin-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.1.3/XCaster-darwin-x64.zip)
 
 Extract the zip and run `XCaster.exe` (Windows) or `XCaster.app` (macOS) — no installer required.
 
 > **macOS note:** First launch requires right-click → Open to bypass Gatekeeper (app is not notarized).
+
+---
+
+## What's new in v1.1.3
+
+### X audio stability and gear behavior refinements
+- Kept x.com on the proven BrowserView path with no background throttling on active X views
+- Removed non-x.com broadcast relay path (legacy Suno-era integration) to reduce audio-side side effects
+- Gear open/close now behaves as a UI visibility/editor flow and no longer forces automatic graph reapply
+- Added sender-track self-heal safeguards for stale ended tracks without requiring a full manual rebuild
+- Improved default app behavior so X remains the primary tab experience
 
 ---
 

@@ -163,6 +163,12 @@
     // xOutputCtx must be created with this so we fully control setSinkId timing.
     const _NativeAudioContext = window.AudioContext || window.webkitAudioContext;
 
+    // Save the native RTCPeerConnection BEFORE we patch it below.
+    // xcast relay peer connections must use this so they are never added to
+    // __xfwPCs and never trigger replaceTracksOnActivePCs (which would call
+    // replaceTrack on X Spaces' live sender and cause an audible cut).
+    const RealPC = window.RTCPeerConnection;
+
     // Patch AudioContext so any context the page or our overlay creates is
     // routed to the selected output device. Without this, WebRTC remote
     // audio paths that go through ctx.destination land on system default
@@ -756,24 +762,6 @@
         replaceTracksOnActivePCs();
     }
 
-    // ---------- broadcast relay (shell side) --------------------------------
-    // Creates a local WebRTC peer connection that sends the fully processed mix
-    // to a webview tab. The webview intercepts getUserMedia and receives this
-    // track instead of using a physical virtual cable. No OS-level routing
-    // needed — the audio stays entirely inside the Electron process.
-    // Patch Opus SDP parameters for maximum audio quality.
-    // - maxaveragebitrate=510000 : 510 kbps — effectively transparent
-    // - stereo=1 / sprop-stereo=1 : stereo if source is stereo
-    // - usedtx=0 : disable Discontinuous Transmission (causes pumping/silence)
-    // - useinbandfec=0 : disable FEC (local relay, zero packet loss)
-    // - cbr=1 : constant bitrate — prevents bitrate dips during silence
-    function _patchOpusSdp(sdp) {
-        return sdp.replace(/(a=rtpmap:\d+ opus\/48000\/2\r?\n)/g, (m) => {
-            return m + 'a=fmtp:' + m.match(/(\d+)/)[1] +
-                ' minptime=10;useinbandfec=0;usedtx=0;stereo=1;sprop-stereo=1;maxaveragebitrate=510000;cbr=1\r\n';
-        // Replace any existing fmtp line for opus payload type too
-        });
-    }
     // More robust version: find opus PT and set/replace its fmtp line entirely.
     function patchOpusSdp(sdp) {
         const ptMatch = sdp.match(/a=rtpmap:(\d+) opus\/48000/i);
@@ -787,48 +775,6 @@
     }
 
     const _broadcastPCs = {};
-    window.__xcCreateBroadcastOffer = async () => {
-        try {
-            if (!processedStream) buildGraph();
-            if (!processedStream) await ensureProcessedStream();
-            // Last resort: wait up to 2 s for the graph to become ready.
-            if (!processedStream) {
-                await new Promise(r => setTimeout(r, 2000));
-                buildGraph();
-            }
-            if (!processedStream) return null;
-            const pc = new RTCPeerConnection({ iceServers: [] });
-            const id = 'bc_' + Date.now() + '_' + Math.random().toString(36).slice(2);
-            _broadcastPCs[id] = pc;
-            for (const t of processedStream.getAudioTracks()) pc.addTrack(t.clone());
-            // Gather all ICE candidates before returning (trickle-off approach).
-            const offerSdp = await new Promise((resolve) => {
-                let settled = false;
-                const finish = () => { if (!settled) { settled = true; resolve(pc.localDescription?.sdp || null); } };
-                pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') finish(); };
-                pc.createOffer().then(o => {
-                    const patched = { type: o.type, sdp: patchOpusSdp(o.sdp) };
-                    return pc.setLocalDescription(patched);
-                });
-                setTimeout(finish, 3000); // hard timeout
-            });
-            if (!offerSdp) { delete _broadcastPCs[id]; return null; }
-            return { id, sdp: offerSdp };
-        } catch (err) {
-            console.warn('[XCaster] createBroadcastOffer failed', err);
-            return null;
-        }
-    };
-    window.__xcApplyBroadcastAnswer = async (id, answerSdp) => {
-        try {
-            const pc = _broadcastPCs[id];
-            if (!pc) return;
-            await pc.setRemoteDescription({ type: 'answer', sdp: answerSdp });
-        } catch (err) {
-            console.warn('[XCaster] applyBroadcastAnswer failed', err);
-        }
-    };
-
     // Expose current settings to webview so it can mirror our device selection.
     window.__xcGetSettings = () => JSON.stringify(settings);
 
@@ -843,7 +789,7 @@
             const premix = ctx.createGain();
             premix.connect(xcastOnlyDest);
             for (const node of xcastSrcNodes) { try { node.connect(premix); } catch {} }
-            const pc = new RTCPeerConnection({ iceServers: [] });
+            const pc = new RealPC({ iceServers: [] }); // unpatched — keep out of __xfwPCs
             const id = 'xc_' + Date.now() + '_' + Math.random().toString(36).slice(2);
             _broadcastPCs[id] = pc;
             for (const t of xcastOnlyDest.stream.getAudioTracks()) pc.addTrack(t);
@@ -881,6 +827,11 @@
                 return __xfwOriginalGUM(constraints);
             }
 
+            const isXDomain = /(?:^|\.)(?:x\.com|twitter\.com)$/.test(location.hostname);
+            if (!isXDomain) {
+                return __xfwOriginalGUM(constraints);
+            }
+
             await ensureProcessedStream();
             const audioTrack = processedStream.getAudioTracks()[0];
             if (!audioTrack) return __xfwOriginalGUM(constraints);
@@ -905,7 +856,7 @@
 
     // Track active peer connections so device-change can swap the sender's track live.
     const __xfwPCs = new Set();
-    const RealPC = window.RTCPeerConnection;
+    // RealPC was saved earlier (before patchAudioContext) — no re-declaration needed.
     if (RealPC) {
         window.RTCPeerConnection = function (...args) {
             const pc = new RealPC(...args);
@@ -935,6 +886,32 @@
                 }
             } catch (e) { /* ignore */ }
         }
+    }
+
+    async function healActiveAudioSendersIfNeeded() {
+        let hasStaleSender = false;
+        for (const pc of __xfwPCs) {
+            try {
+                for (const sender of pc.getSenders()) {
+                    const track = sender?.track;
+                    if (!track || track.kind !== 'audio') continue;
+                    if (track.readyState === 'ended') {
+                        hasStaleSender = true;
+                        break;
+                    }
+                }
+            } catch { /* ignore */ }
+            if (hasStaleSender) break;
+        }
+        if (!hasStaleSender) return false;
+
+        // Ensure we have a live processed source before swapping sender tracks.
+        const live = processedStream?.getAudioTracks?.()[0];
+        if (!live || live.readyState === 'ended') {
+            await ensureProcessedStream();
+        }
+        replaceTracksOnActivePCs();
+        return true;
     }
 
     // ---------- output (speaker) routing -----------------------------------
@@ -1105,7 +1082,6 @@
             document.querySelectorAll('audio, video').forEach(registerMedia);
         }, 2000);
     }
-    function stopSinkScan() { clearInterval(sinkScanInterval); sinkScanInterval = 0; }
 
     const origPlay = HTMLMediaElement.prototype.play;
     HTMLMediaElement.prototype.play = function () {
@@ -1177,7 +1153,7 @@
         <div id="xfw-panel" role="dialog" aria-label="XCaster audio">
             <div class="xfw-header">
                 <div class="xfw-title">XCaster</div>
-                <div class="xfw-version">v0.5.0</div>
+                <div class="xfw-version">v1.1.3</div>
             </div>
 
             <!-- PERSISTENT METERS (always visible) -->
@@ -1500,10 +1476,6 @@
         const sel = document.getElementById('xfw-input');
         if (!sel) return;
         sel.innerHTML = '';
-        try {
-            const probe = await __xfwOriginalGUM.call(navigator.mediaDevices, { audio: true });
-            probe.getTracks().forEach(t => t.stop());
-        } catch {}
         const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audioinput');
         const opts = [{ deviceId: 'default', label: 'System default' }, ...devs];
         for (const d of opts) {
@@ -1652,7 +1624,6 @@
         };
         tick();
     }
-    function stopMeters() { cancelAnimationFrame(meterRaf); meterRaf = 0; }
     function peakPct(buf) {
         let p = 0;
         for (let i = 0; i < buf.length; i++) {
@@ -1685,12 +1656,10 @@
                 paintToggles();
                 await populateInputs();
                 await populateOutputs();
-                await ensureProcessedStream();
+                // Start once and keep running; panel visibility must not affect
+                // active Space audio state.
                 startMeters();
                 startSinkScan();
-            } else {
-                stopMeters();
-                stopSinkScan();
             }
             if (opening) selectPane(paneName);
             return true;
@@ -2036,6 +2005,7 @@
                 const t = aux2RawStream.getAudioTracks()[0];
                 if (t && t.readyState === 'ended') rebuildAux2();
             }
+            healActiveAudioSendersIfNeeded().catch(() => {});
         }, 4000);
     }
 

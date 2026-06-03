@@ -17,7 +17,7 @@
 
 'use strict';
 
-const { webFrame, ipcRenderer } = require('electron');
+const { webFrame } = require('electron');
 const fs   = require('fs');
 const path = require('path');
 

@@ -122,6 +122,19 @@ function raiseMainProcessPriorityWindows() {
     } catch {}
 }
 
+function enforceNoThrottleOnWebContents(contents) {
+    if (!contents || contents.isDestroyed()) return;
+    try { contents.setBackgroundThrottling(false); } catch {}
+    try { contents.setFrameRate(60); } catch {}
+}
+
+function enforceNoThrottleOnAllViews() {
+    if (mainWindow?.webContents) enforceNoThrottleOnWebContents(mainWindow.webContents);
+    for (const [, view] of xViews) {
+        if (view?.webContents) enforceNoThrottleOnWebContents(view.webContents);
+    }
+}
+
 function createWindow() {
     mainWindow = new BrowserWindow({
         width: 1200,
@@ -165,8 +178,7 @@ function createWindow() {
     // Re-assert no-throttling whenever the window is minimized, hidden, or
     // restored — Chromium can re-enable throttling on these transitions.
     const reassertNoThrottle = () => {
-        try { mainWindow.webContents.setBackgroundThrottling(false); } catch {}
-        try { mainWindow.webContents.setFrameRate(60); } catch {}
+        enforceNoThrottleOnAllViews();
     };
     mainWindow.on('minimize', reassertNoThrottle);
     mainWindow.on('restore', reassertNoThrottle);
@@ -314,7 +326,7 @@ function createWindow() {
                         dialog.showMessageBox(mainWindow, {
                             type: 'info',
                             title: 'About XCaster',
-                            message: 'XCaster v1.1.2',
+                            message: 'XCaster v1.1.3',
                             detail:
                                 'Standalone Windows shell for x.com with WebRTC AGC, noise suppression, and echo cancellation disabled.\n\n' +
                                 'v1.0.1 — Full multi-channel DSP mixer (Mic + Aux 1 + Aux 2 + xCaster), dual output routing (X Spaces injection + monitor/cue), reapply audio graph for clean channel selection, virtual cable auto-installer, compressor, limiter, EQ, background skin, and live meters.\n\n' +
@@ -402,28 +414,6 @@ ipcMain.handle('xfw:open-external', (_e, url) => {
     } catch { /* ignore invalid URLs */ }
 });
 
-// IPC: broadcast relay — webview asks shell for a WebRTC offer carrying the
-// fully processed mix. Shell creates an RTCPeerConnection, adds the processed
-// stream track, and returns the SDP offer + session id. The webview then
-// completes the handshake so it receives the mix as a local MediaStreamTrack,
-// which it returns from getUserMedia — no physical virtual cable required.
-ipcMain.handle('xfw:broadcast-offer', async () => {
-    try {
-        return await mainWindow.webContents.executeJavaScript('window.__xcCreateBroadcastOffer()');
-    } catch (err) {
-        console.warn('[XCaster] broadcast-offer IPC failed', err);
-        return null;
-    }
-});
-ipcMain.handle('xfw:broadcast-answer', async (_e, id, answerSdp) => {
-    try {
-        const idJ = JSON.stringify(String(id));
-        const sdpJ = JSON.stringify(String(answerSdp));
-        await mainWindow.webContents.executeJavaScript(`window.__xcApplyBroadcastAnswer(${idJ}, ${sdpJ})`);
-    } catch (err) {
-        console.warn('[XCaster] broadcast-answer IPC failed', err);
-    }
-});
 ipcMain.handle('xfw:get-settings', async () => {
     try {
         return await mainWindow.webContents.executeJavaScript('window.__xcGetSettings()');
@@ -472,7 +462,7 @@ ipcMain.handle('xfw:create-xview', (_e, tabId, url) => {
     view.webContents.setUserAgent(
         view.webContents.getUserAgent().replace(/Electron\/[^\s]+\s?/, '')
     );
-    view.webContents.setBackgroundThrottling(false);
+    enforceNoThrottleOnWebContents(view.webContents);
 
     // Forward navigation/loading events back to the shell renderer.
     const fwd = (type, data) => {
@@ -482,6 +472,7 @@ ipcMain.handle('xfw:create-xview', (_e, tabId, url) => {
     view.webContents.on('did-navigate-in-page', (_e, u, isMain) => { if (isMain) fwd('navigate', u); });
     view.webContents.on('did-start-loading', () => fwd('loading', true));
     view.webContents.on('did-stop-loading', () => {
+        enforceNoThrottleOnWebContents(view.webContents);
         fwd('loading', false);
         fwd('title', view.webContents.getTitle());
     });
@@ -511,7 +502,7 @@ ipcMain.handle('xfw:show-xview', (_e, tabId) => {
     if (!view || !mainWindow) return;
     if (!mainWindow.getBrowserViews().includes(view)) mainWindow.addBrowserView(view);
     view.setBounds(getXViewBounds());
-    view.webContents.setBackgroundThrottling(false);
+    enforceNoThrottleOnWebContents(view.webContents);
 });
 
 ipcMain.handle('xfw:hide-xview', (_e, tabId) => {
