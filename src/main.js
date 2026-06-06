@@ -11,6 +11,15 @@ const os = require('os');
 const { pathToFileURL } = require('url');
 const { execFile } = require('child_process');
 
+// True only for x.com / twitter.com (and their subdomains). Used to scope both
+// the response-header stripping and the sensitive permission grants (mic,
+// geolocation) to X — so no other tab (YouTube, a bookmark, a malicious link
+// opened in the built-in browser) can silently capture the microphone or
+// location just because the app is, by design, permissive for X Spaces.
+function isXUrl(url) {
+    return /^https?:\/\/([a-z0-9-]+\.)?(x\.com|twitter\.com)(\/|$)/i.test(url || '');
+}
+
 // Register custom protocol so the in-page overlay can load packaged assets
 // (e.g. background.mp4) from an https origin without tripping CSP/CORS.
 protocol.registerSchemesAsPrivileged([
@@ -155,11 +164,28 @@ function createWindow() {
         },
     });
 
-    // Grant media / notification permissions for all sites loaded in this trusted browser.
-    // The user explicitly chose to open a site in XCaster, so we treat every tab as trusted.
-    session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
-        const allowed = ['media', 'notifications', 'geolocation', 'pointerLock', 'clipboard-read', 'clipboard-sanitized-write'];
-        callback(allowed.includes(permission));
+    // Permission policy: low-risk grants (notifications, clipboard, pointer lock)
+    // are allowed for any tab; the sensitive ones (microphone/camera, location)
+    // are restricted to x.com/twitter.com so an arbitrary site opened in the
+    // built-in browser can't silently capture them.
+    session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
+        // Low-risk permissions are allowed anywhere in the app.
+        const globallyAllowed = ['notifications', 'pointerLock', 'clipboard-read', 'clipboard-sanitized-write'];
+        if (globallyAllowed.includes(permission)) { callback(true); return; }
+        // Sensitive permissions — microphone/camera ('media') and 'geolocation'
+        // — are granted ONLY to x.com/twitter.com, the app's reason to exist.
+        // Any other origin loaded in the built-in browser is denied so it can't
+        // silently grab the mic or location. Falls back to the webContents URL
+        // when the requesting URL isn't supplied.
+        if (permission === 'media' || permission === 'geolocation') {
+            const reqUrl = (details && details.requestingUrl)
+                || (webContents && typeof webContents.getURL === 'function' && webContents.getURL())
+                || '';
+            callback(isXUrl(reqUrl));
+            return;
+        }
+        // Anything else: deny by default.
+        callback(false);
     });
 
     // Strip the Electron token from the UA at the session level so all webviews
@@ -365,9 +391,7 @@ app.whenReady().then(() => {
     //   globally; we scope the strip to x.com so other sites keep their headers.
     //   SharedArrayBuffer still works in Electron without cross-origin isolation.
     session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
-        const url = details.url || '';
-        const isXDomain = /^https?:\/\/([a-z0-9-]+\.)?(x\.com|twitter\.com)(\/|$)/i.test(url);
-        if (!isXDomain) { callback({}); return; }
+        if (!isXUrl(details.url)) { callback({}); return; }
 
         const headers = details.responseHeaders || {};
         const stripped = {};
