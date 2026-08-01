@@ -27,12 +27,36 @@ Extract the zip and run `XCaster.exe` (Windows) or `XCaster.app` (macOS) — no 
 
 > This is a **beta** build — the `Download` links above still point to the stable v1.2.0 release. Grab the v1.3.0 beta build from the [Releases page](https://github.com/awizardxch/xCaster/releases) (marked **Pre-release**), or build it yourself from source (see **Run from source** / **Build standalone exe** below).
 
-### Loop Station overhaul
-- Fixed silent/incomplete loop recordings — recording now taps a dedicated bus that bypasses Cue muting so it always captures exactly what's audible
-- Fixed pads and the synth not being captured into loop recordings (only mic/aux/xCaster were being captured before)
-- Fixed a MIDI hardware transport bug where a single Record/Play button press was firing twice (start-then-stop) because CC messages fire on both button-down and button-up
-- Redesigned the Loop Station transport from one ambiguous multi-function pad into 4 explicit buttons — ● Record, ▶ Play, ❚❚ Stop/Pause, ✕ Clear — so it's always clear what a press will do
+This is a major release that adds a full **Soundboard + MIDI instrument + Loop Station** rig to the mixer, on top of X Spaces reliability fixes.
+
+### MIDI instrument integration
+- Full Web MIDI support — pick your input device and channel in the new **Sounds → MIDI** pane, with a live raw-message monitor so you can confirm hardware is being seen even before anything is mapped
+- Learn mode for mapping any pad, and for mapping a hardware Record/Play transport button (e.g. Launchkey-style controllers), with unlearn buttons and auto-cancel so a bad mapping can't get stuck
+- Built-in **synth layer** — "Enable synth" routes MIDI notes to an oscillator + filter voice (waveform, attack/decay/sustain/release, filter cutoff/resonance, octave shift, velocity sensitivity) that plays *on top of* whatever pad is mapped to that key, not instead of it
+- Fixed piano/guitar/synth-keys pads being silent outside their fixed 16-key range (e.g. using a controller's Octave +/- button) — melodic kits now pitch-shift across the full keyboard instead of only responding to one octave
+- Fixed a mis-learn race where a stray pad hit while clicking "Learn" could get captured as the transport mapping, and fixed MIDI keys/pads going silent after a mapping change (MIDI init is now idempotent)
+
+### Soundboard & preset kits
+- New 16-pad soundboard with drag-and-drop custom samples per pad, right-click pad editor (name, volume, MIDI note, loop toggle), and a separate movable Pads window
+- 7 built-in preset kits, one click to fill all 16 pads: 🥁 Drums, 🔊 808, 📻 Lo-Fi (real recorded drum-machine samples with automatic offline fallback), 🎹 Piano, 🎸 Guitar, 🎛 Synth keys, 🎉 Sound FX (crowd cheer/boo, applause, airhorn, laugh, and more)
+- Fixed pads and the synth not being captured in stream/loop recordings — they were previously audible live but silent in anything recorded
+
+### Loop Station (5-track RC-505-style looper)
+- Redesigned the transport from one ambiguous multi-function pad into 4 explicit buttons — ● Record, ▶ Play, ❚❚ Stop/Pause, ✕ Clear — so it's always clear what a press will do, per track
 - Added quantized recording start: Record/Overdub now snap to the beat grid instead of starting the instant you press the button, with a default of 1/4-bar (one beat) and a per-track dial to pick Off / Auto / 1/4 / 1/8 / 1/16 / 1/32
+- Fixed silent/incomplete loop recordings — recording now taps a dedicated bus that bypasses Cue muting so it always captures exactly what's audible, regardless of a channel's monitor-only state
+- Fixed a MIDI hardware transport bug where a single Record/Play button press was firing twice (start-then-stop) because CC messages fire on both button-down and button-up
+- Per-track bar length + quantize dials, per-track level fader, tap-tempo, and a live fill-ring on the Record button showing progress toward auto-stop
+
+### Autotune / pitch FX
+- Real-time pitch shifter and autotune on the mic signal (Sounds → FX pane) — manual semitone shift or auto snap-to-scale/key correction with adjustable correction strength, so your voice (not just pads/synth) can be tuned before it reaches listeners
+
+### X Spaces reliability
+- Fixed background X tabs staying pinned at full, unthrottled CPU/GPU forever, which caused the whole app to slow down the longer you had multiple tabs open — only the currently visible tab is now kept unthrottled
+- Added crash/hang recovery for X tabs: an unresponsive-page banner with a one-click Reload, and automatic tab recreation if X's renderer crashes, instead of a permanently frozen tab
+- Granted MIDI/MIDI-Sysex permissions so hardware controllers work inside X tabs as well as the mixer
+
+### Interface cleanup
 - Removed the redundant ✕ close buttons from the Pads and Loop Station popup windows — they already hide automatically when you switch away from the Sounds tab
 
 ---

@@ -1082,6 +1082,42 @@ registerProcessor('xcaster-pitch',XCasterPitch);
 
     function stopAllPads() { for (let i=0;i<16;i++) stopPad(i); }
 
+    // Melodic kits (Piano/Guitar/Synth keys) render each of the 16 pads at a
+    // fixed baked-in MIDI note (see the piano/guitar/synthkeys entries in
+    // _SOUND_KITS), but pads only ever TRIGGER from midiNote 36-51 — so
+    // shifting a MIDI keyboard's octave (+/-) outside that fixed 16-note
+    // range used to produce silence for these kits, even though "Enable
+    // synth" worked fine at any octave. This extends melodic kits across the
+    // WHOLE keyboard: find whichever pad's baked note is closest to the note
+    // actually played, and pitch-shift its rendered buffer (via playbackRate)
+    // by the semitone difference — the same trick a basic sampler uses to
+    // cover a full keyboard from one recorded note.
+    function _melodicPadForNote(note) {
+        let best = null, bestDist = Infinity;
+        for (let i = 0; i < 16; i++) {
+            const m = /^(?:piano|guitar|synthkeys):(\d+)$/.exec(settings.sbPads[i]?.builtin || '');
+            if (!m) continue;
+            const baked = +m[1];
+            const dist = Math.abs(baked - note);
+            if (dist < bestDist) { bestDist = dist; best = { index: i, baked }; }
+        }
+        return best;
+    }
+
+    async function playPadPitched(index, semitones) {
+        if (!sbBus) { try { await ensureProcessedStream(); } catch {} }
+        const ab = await loadPadBuffer(index);
+        if (!ab || !sbSourceBus) return;
+        const ctx = ensureAudioContext();
+        const src = ctx.createBufferSource();
+        src.buffer = ab;
+        src.playbackRate.value = Math.pow(2, semitones / 12);
+        const vol = ctx.createGain();
+        vol.gain.value = settings.sbPads[index]?.volume ?? 0.8;
+        src.connect(vol); vol.connect(sbSourceBus);
+        src.start();
+    }
+
     function _paintPadState(index, playing) {
         const btn = document.querySelector(`[data-pad="${index}"]`);
         if (btn) btn.classList.toggle('xfw-pad-playing', playing);
@@ -1227,7 +1263,16 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             // synth tone as an EFFECT on top of whatever pad/key you hit (or plays
             // alone if the note isn't mapped to a pad). synthNoteOn() already no-ops
             // when settings.synthEnabled is off, so this is safe either way.
-            if (pi>=0) playPad(pi);
+            if (pi>=0) {
+                playPad(pi);
+            } else {
+                // No pad is mapped to this exact note — if a melodic kit (Piano/
+                // Guitar/Synth keys) is loaded, extend it across the whole
+                // keyboard instead of staying silent outside the fixed 16-note
+                // pad range (e.g. after using the controller's Octave +/- button).
+                const melodic = _melodicPadForNote(note);
+                if (melodic) playPadPitched(melodic.index, note - melodic.baked);
+            }
             synthNoteOn(note, val);
             _reportMidiActivity(note, pi);
         } else if (type===0x80 || (type===0x90&&val===0)) {

@@ -346,7 +346,7 @@ function createWindow() {
                             message: 'XCaster v1.3.0',
                             detail:
                                 'Standalone Windows shell for x.com with WebRTC AGC, noise suppression, and echo cancellation disabled.\n\n' +
-                                'v1.3.0 — Loop Station overhaul: fixed silent/incomplete recordings, MIDI transport double-trigger, pads/synth not captured in loops, redesigned the 4-button Record/Play/Stop/Clear transport, and added quantized (snap-to-beat) recording start with a per-track resolution dial.\n\n' +
+                                'v1.3.0 — Added a full Soundboard + MIDI instrument + Loop Station rig: 16-pad soundboard with 7 built-in kits (Drums/808/Lo-Fi/Piano/Guitar/Synth keys/Sound FX), MIDI keyboard support with a synth layer and pad/transport learn mode, real-time mic pitch shift/autotune, a redesigned 5-track Loop Station with quantized recording, and fixes for background-tab slowdowns and X tab crash recovery.\n\n' +
                                 'v1.0.1 — Full multi-channel DSP mixer (Mic + Aux 1 + Aux 2 + xCaster), dual output routing (X Spaces injection + monitor/cue), reapply audio graph for clean channel selection, virtual cable auto-installer, compressor, limiter, EQ, background skin, and live meters.\n\n' +
                                 'Built for X Spaces streamers who need clean, professional audio.',
                         });
