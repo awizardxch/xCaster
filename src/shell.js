@@ -962,15 +962,16 @@ function esc(str) {
         .replace(/"/g, '&quot;');
 }
 
-// ── Tab picker (called by main process for getDisplayMedia) ─────────────────
-// main.js evaluates `window.__xcasterShowTabPicker(tabs)` when an X tab requests
-// audio capture from another tab. We resolve with a webContentsId or null.
+// ── Tab picker (invoked by main process for getDisplayMedia) ────────────────
+// main.js sends the candidate tab list over IPC (structured data, never a
+// string to be parsed as code) when an X tab requests audio capture from
+// another tab. We send the chosen webContentsId (or null) back the same way.
 
 const pickerModal = document.getElementById('tab-picker-modal');
 const pickerList  = document.getElementById('tab-picker-list');
 
-window.__xcasterShowTabPicker = function (incomingTabs) {
-    return new Promise((resolve) => {
+if (window.xcaster?.onShowTabPicker) {
+    window.xcaster.onShowTabPicker((incomingTabs) => {
         const localById = new Map();
         for (const t of tabs) {
             if (typeof t.webContentsId === 'number') localById.set(t.webContentsId, t);
@@ -1011,7 +1012,7 @@ window.__xcasterShowTabPicker = function (incomingTabs) {
             document.getElementById('tp-cancel').removeEventListener('click', onCancel);
             pickerModal.removeEventListener('click', onBackdrop);
             document.removeEventListener('keydown', onEsc);
-            resolve(result);
+            window.xcaster.sendTabPickerChoice(result);
         }
 
         document.getElementById('tp-cancel').addEventListener('click', onCancel);
@@ -1021,7 +1022,7 @@ window.__xcasterShowTabPicker = function (incomingTabs) {
         pickerModal.classList.add('open');
         modalOpen = true;
     });
-};
+}
 
 // ── Bootstrap ─────────────────────────────────────────────────────────────────
 

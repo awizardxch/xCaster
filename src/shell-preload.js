@@ -47,4 +47,10 @@ contextBridge.exposeInMainWorld('xcaster', {
     devtoolsXView:       (id)      => ipcRenderer.invoke('xfw:devtools-xview', id),
     toggleMixerXView:    (id)      => ipcRenderer.invoke('xfw:toggle-mixer-xview', id),
     onXViewEvent: (cb) => ipcRenderer.on('xfw:xview-event', (_e, id, type, data) => cb(id, type, data)),
+
+    // Tab picker for getDisplayMedia (main.js sends the candidate tab list as
+    // structured data over IPC — never as a string to be parsed/executed —
+    // and the renderer sends the chosen id back the same way).
+    onShowTabPicker: (cb) => ipcRenderer.on('xfw:show-tab-picker', (_e, tabs) => cb(tabs)),
+    sendTabPickerChoice: (id) => ipcRenderer.send('xfw:tab-picker-choice', id),
 });

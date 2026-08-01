@@ -287,10 +287,16 @@ function createWindow() {
                 .map(wc => ({ id: wc.id, url: wc.getURL(), title: wc.getTitle() || wc.getURL() }))
                 .filter(t => t.id !== requestor);
 
-            const json = JSON.stringify(tabsList).replace(/`/g, '\\`');
-            const picked = await mainWindow.webContents.executeJavaScript(
-                `(window.__xcasterShowTabPicker && window.__xcasterShowTabPicker(${json})) || null`
-            );
+            // Tab titles/URLs come from arbitrary (possibly untrusted) web
+            // content, so they're sent to the renderer as structured IPC data
+            // via webContents.send/ipcRenderer — never built into a string and
+            // handed to executeJavaScript, which would let a malicious page
+            // title break out of the script text and run arbitrary code in
+            // the trusted shell window.
+            const picked = await new Promise((resolve) => {
+                ipcMain.once('xfw:tab-picker-choice', (_e, id) => resolve(id));
+                mainWindow.webContents.send('xfw:show-tab-picker', tabsList);
+            });
             if (!picked) { callback(); return; }
 
             const target = webContents.fromId(picked);
@@ -709,8 +715,16 @@ function unzip(zipPath, destDir) {
     return new Promise((resolve, reject) => {
         fs.mkdirSync(destDir, { recursive: true });
         // Use PowerShell's Expand-Archive — built into Windows, no extra deps.
+        // zipPath/destDir are passed via environment variables rather than
+        // string-interpolated into the -Command text: PowerShell re-parses any
+        // argv tokens that follow -Command as more script text (quotes/`;`/`` ` ``
+        // are NOT safely "just data" there), but $env:VAR values are always
+        // treated as opaque literal strings, so this can't be used to inject
+        // additional PowerShell commands even if a path ever contained
+        // shell/PowerShell metacharacters.
         execFile('powershell.exe',
-            ['-NoProfile', '-Command', `Expand-Archive -Path "${zipPath}" -DestinationPath "${destDir}" -Force`],
+            ['-NoProfile', '-NonInteractive', '-Command', 'Expand-Archive -LiteralPath $env:XCASTER_ZIP -DestinationPath $env:XCASTER_DEST -Force'],
+            { env: { ...process.env, XCASTER_ZIP: zipPath, XCASTER_DEST: destDir } },
             (err) => err ? reject(err) : resolve(destDir)
         );
     });
@@ -760,11 +774,13 @@ async function downloadAndInstallCable() {
     }
 
     // Run with UAC elevation — user will see the Windows security prompt.
+    // setupExe is passed via an environment variable, not interpolated into
+    // the -Command text — see the comment in unzip() for why that matters.
     await new Promise((resolve, reject) => {
         execFile('powershell.exe', [
             '-NoProfile', '-NonInteractive', '-Command',
-            `Start-Process -FilePath "${setupExe}" -Verb RunAs -Wait`
-        ], { timeout: 120000 }, (err) => err ? reject(err) : resolve());
+            'Start-Process -FilePath $env:XCASTER_SETUP_EXE -Verb RunAs -Wait'
+        ], { timeout: 120000, env: { ...process.env, XCASTER_SETUP_EXE: setupExe } }, (err) => err ? reject(err) : resolve());
     });
 
     try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
