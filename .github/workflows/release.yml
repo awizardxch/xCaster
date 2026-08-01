@@ -133,13 +133,30 @@ jobs:
           echo "$msg" >> "$GITHUB_OUTPUT"
           echo "$delimiter" >> "$GITHUB_OUTPUT"
 
+      # Tags with a SemVer prerelease suffix (e.g. v1.3.0-beta.1, v1.3.0-rc.1)
+      # are published as a GitHub prerelease and are NOT marked "Latest" —
+      # only plain "vX.Y.Z" tags become the Latest release. This lets a beta
+      # build be pushed/released without moving "Latest" off the current
+      # stable version.
+      - name: Determine release channel (stable vs beta/prerelease)
+        id: channel
+        run: |
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "make_latest=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "make_latest=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           name: "XCaster ${{ github.ref_name }}"
           body: ${{ steps.notes.outputs.notes }}
           draft: false
-          prerelease: false
+          prerelease: ${{ steps.channel.outputs.prerelease }}
+          make_latest: ${{ steps.channel.outputs.make_latest }}
           files: |
             XCaster-win32-x64.zip
             XCaster-darwin-arm64.zip

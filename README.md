@@ -25,7 +25,7 @@ Extract the zip and run `XCaster.exe` (Windows) or `XCaster.app` (macOS) — no 
 
 ## What's new in v1.3.0 (beta)
 
-> This is a **beta** build — the `Download` links above still point to the stable v1.2.0 release. Build v1.3.0 yourself from the `beta` branch (see **Run from source** / **Build standalone exe** below) if you want to try it early.
+> This is a **beta** build — the `Download` links above still point to the stable v1.2.0 release. Grab the v1.3.0 beta build from the [Releases page](https://github.com/awizardxch/xCaster/releases) (marked **Pre-release**), or build it yourself from source (see **Run from source** / **Build standalone exe** below).
 
 ### Loop Station overhaul
 - Fixed silent/incomplete loop recordings — recording now taps a dedicated bus that bypasses Cue muting so it always captures exactly what's audible
