@@ -87,6 +87,34 @@
         bgTint: 0,              // black tint between video and content (0 - 0.8)
         fabPos: null,           // {x, y} or null = default (bottom-right)
         panelPos: null,         // {x, y} or null = default (anchored to fab)
+        padsPopupPos: null,     // {x, y} or null = default position
+        loopPopupPos: null,     // {x, y} or null = default position
+        padsPopupOpen: true,    // whether the Pads window should auto-show with the Sounds tab
+        loopPopupOpen: true,    // whether the Looper window should auto-show with the Sounds tab
+        // FX / Autotune
+        autotuneEnabled: false,
+        pitchShiftSemitones: 0, // -12 to +12
+        autotuneAuto: false,    // false = manual shift, true = snap-to-scale
+        autotuneKey: 0,         // 0=C, 1=C#, 2=D … 11=B
+        autotuneStrength: 1.0,  // 0–1 how hard to correct
+        // Soundboard channel
+        sbGainDb: 0, sbMuted: false, sbMonitor: true, sbCue: false,
+        sbPads: null,           // array of 16 pad configs — initialised post-load
+        // Synthesizer (MIDI keyboard)
+        synthEnabled: false, synthWave: 'sawtooth',
+        synthAttackMs: 10, synthDecayMs: 80, synthSustain: 0.7, synthReleaseMs: 200,
+        synthFilterHz: 8000, synthFilterQ: 1.5, synthGainDb: -6, synthOctave: 0,
+        midiVelocitySensitive: true,
+        // MIDI routing
+        midiDeviceId: 'all', midiChannel: 0,
+        midiRecordMap: null,    // {type:'note'|'cc', number} — hardware Record button (e.g. Launchkey)
+        midiPlayMap: null,      // {type:'note'|'cc', number} — hardware Play button
+        // Looper — RC-505-style 5-track Loop Station
+        loopGainDb: 0,                          // master looper output level
+        loopBpm: 120,                            // shared tempo; drives auto-loop bar length + tap tempo
+        loopBars: [16, 16, 16, 16, 16],          // per-track auto-loop length in bars; null/0 = Manual
+        loopTrackGainDb: [0, 0, 0, 0, 0],        // per-track level (like the RC-505's 5 track faders)
+        loopQuantize: ['auto', 'auto', 'auto', 'auto', 'auto'], // per-track record/overdub start snap: 'off' | 'auto' (=1/4) | 4|8|16|32 (snap to 1/N of a bar)
     };
 
     function loadSettings() {
@@ -99,6 +127,25 @@
         try { localStorage.setItem(STORAGE_KEY, JSON.stringify(s)); } catch {}
     }
     let settings = loadSettings();
+    // Ensure sbPads array is always 16 entries.
+    if (!Array.isArray(settings.sbPads) || settings.sbPads.length < 16) {
+        const PAD_COLORS = ['#2563eb','#6366f1','#d97706','#059669','#7c3aed','#dc2626','#0891b2','#65a30d',
+                            '#1d4ed8','#4f46e5','#b45309','#047857','#6d28d9','#b91c1c','#0369a1','#4d7c0f'];
+        settings.sbPads = Array.from({length:16}, (_,i) => ({
+            name: `Pad ${i+1}`, midiNote: 36+i, volume: 0.8,
+            color: PAD_COLORS[i], loop: false, builtin: null,
+        }));
+    }
+    // Ensure looper per-track arrays always cover all 5 tracks (RC-505-style Loop Station).
+    if (!Array.isArray(settings.loopBars) || settings.loopBars.length < 5) {
+        settings.loopBars = [16, 16, 16, 16, 16];
+    }
+    if (!Array.isArray(settings.loopTrackGainDb) || settings.loopTrackGainDb.length < 5) {
+        settings.loopTrackGainDb = [0, 0, 0, 0, 0];
+    }
+    if (!Array.isArray(settings.loopQuantize) || settings.loopQuantize.length < 5) {
+        settings.loopQuantize = ['auto', 'auto', 'auto', 'auto', 'auto'];
+    }
 
     // PAGE → SHELL: mute messages only (no tab-list IPC needed).
     function _shellSend(msg) {
@@ -121,6 +168,8 @@
     let micGainNode = null, auxGainNode = null, aux2GainNode = null, xcastGainNode = null;
     let micMixSend = null, auxMixSend = null, aux2MixSend = null, xcastMixSend = null;
     let micMonitorGain = null, auxMonitorGain = null, aux2MonitorGain = null, xcastMonitorGain = null;
+    // Soundboard channel nodes
+    let sbBus = null, sbSourceBus = null, sbGainNode = null, sbMixSend = null, sbMonitorGain = null, sbAnalyser = null;
     let monitorDest = null;
     let monitorAudioEl = null;
     let mixBus = null;
@@ -128,6 +177,14 @@
     let comp = null, limiter = null, makeup = null;
     let processedDest = null;
     let processedStream = null;
+    // Dedicated Loop Station recording tap — sums mic/aux/aux2/xcast right
+    // after their per-channel gain (mute), BEFORE the mixSend/Cue split. This
+    // means Loop Station recording always captures whatever you can hear on
+    // those channels, regardless of whether a channel's "Cue (monitor only)"
+    // toggle is on (which intentionally zeroes mixBus/processedStream so that
+    // channel doesn't reach the X broadcast) — otherwise a cued channel would
+    // record as total silence even though you can hear it in your headset.
+    let loopRecordBus = null, loopRecordDest = null, loopRecordStream = null;
     let xBroadcastCtx = null;       // dedicated AudioContext for broadcast out device
     let xBroadcastCtxSink = null;   // last sinkId applied to xBroadcastCtx
     let broadcastSrcNode = null;    // source node inside xBroadcastCtx
@@ -138,6 +195,1475 @@
     // Track every AudioContext the page creates so we can rebind their sink
     // when the user changes the speaker selection.
     const __xfwContexts = new Set();
+
+    // ── Pitch Shifter / Autotune ──────────────────────────────────────────────
+    // Loaded as an AudioWorklet via a Blob URL so no separate file is needed.
+    const _PITCH_WORKLET_SRC = `
+'use strict';
+class XCasterPitch extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    const N=2048,HOP=512,OVL=4;
+    this.N=N; this.HOP=HOP; this.OVL=OVL;
+    this.ratio=1.0; this.enabled=false;
+    this.autoMode=false; this.scaleKey=0; this.strength=1.0;
+    this.scaleDef=[0,2,4,5,7,9,11]; // major by default
+    this.win=new Float32Array(N);
+    for(let i=0;i<N;i++) this.win[i]=0.5*(1-Math.cos(2*Math.PI*i/N));
+    this.lp=new Float32Array(N); this.sp=new Float32Array(N);
+    this.inRing=new Float32Array(N*2); this.inWr=0; this.sinceHop=0; this.tot=0;
+    this.outBuf=new Float32Array(N*4); this.outWr=0; this.outRd=0; this.outAvail=0;
+    this.re=new Float32Array(N); this.im=new Float32Array(N);
+    this.smoothPitch=0; this.SMOOTH=0.85;
+    this.port.onmessage=({data:d})=>{
+      if(d.ratio   !=null)this.ratio    =+d.ratio;
+      if(d.enable  !=null)this.enabled  =!!d.enable;
+      if(d.auto    !=null)this.autoMode =!!d.auto;
+      if(d.key     !=null)this.scaleKey =+d.key;
+      if(d.scale   !=null)this.scaleDef =d.scale;
+      if(d.strength!=null)this.strength =+d.strength;
+      if(d.reset   )     {this.lp.fill(0);this.sp.fill(0);}
+    };
+  }
+  _fft(re,im,inv){
+    const n=re.length;
+    for(let i=1,j=0;i<n;i++){
+      let b=n>>1;for(;j&b;b>>=1)j^=b;j^=b;
+      if(i<j){let t=re[i];re[i]=re[j];re[j]=t;t=im[i];im[i]=im[j];im[j]=t;}
+    }
+    for(let len=2;len<=n;len<<=1){
+      const ang=(inv?2:-2)*Math.PI/len;
+      const wr=Math.cos(ang),wi=Math.sin(ang);
+      for(let i=0;i<n;i+=len){
+        let cr=1,ci=0;
+        for(let j=0;j<len>>1;j++){
+          const h=i+j+(len>>1);
+          const vr=re[h]*cr-im[h]*ci,vi=re[h]*ci+im[h]*cr;
+          re[h]=re[i+j]-vr;im[h]=im[i+j]-vi;
+          re[i+j]+=vr;im[i+j]+=vi;
+          const nr=cr*wr-ci*wi;ci=cr*wi+ci*wr;cr=nr;
+        }
+      }
+    }
+    if(inv)for(let i=0;i<n;i++){re[i]/=n;im[i]/=n;}
+  }
+  _detectPitch(frame){
+    const M=Math.min(1024,frame.length);
+    const minLag=Math.ceil(sampleRate/1100),maxLag=Math.min(M-2,Math.floor(sampleRate/60));
+    let e=0;for(let i=0;i<M;i++)e+=frame[i]*frame[i];
+    if(e/M<5e-5||maxLag<minLag)return 0;
+    let best=0,bestLag=-1;
+    for(let lag=minLag;lag<=maxLag;lag++){
+      let r=0;for(let i=0;i<M-lag;i++)r+=frame[i]*frame[i+lag];
+      r/=(M-lag);
+      if(r>best){best=r;bestLag=lag;}
+    }
+    return(bestLag<0||best<e/M*0.3)?0:sampleRate/bestLag;
+  }
+  _snapToScale(midiF){
+    const key=this.scaleKey,scale=this.scaleDef;
+    const nr=Math.round(midiF);
+    const nOct=((nr-key)%12+12)%12;
+    let best=scale[0],bestD=Infinity;
+    for(const s of scale){let d=((s-nOct)%12+12)%12;if(d>6)d=12-d;if(d<bestD){bestD=d;best=s;}}
+    const corr=((best-nOct)%12+12)%12;
+    return nr+(corr>6?corr-12:corr);
+  }
+  _vocoder(frame,ratio){
+    const n=this.N,hop=this.HOP,pi2=6.283185307;
+    const re=this.re,im=this.im;
+    for(let i=0;i<n;i++){re[i]=frame[i]*this.win[i];im[i]=0;}
+    this._fft(re,im,false);
+    const rO=new Float32Array(n),iO=new Float32Array(n);
+    const lp=this.lp,sp=this.sp;
+    for(let k=0;k<=(n>>1);k++){
+      const mag=Math.sqrt(re[k]*re[k]+im[k]*im[k]);
+      const ph=Math.atan2(im[k],re[k]);
+      let dp=ph-lp[k]-pi2*k*hop/n;
+      lp[k]=ph;
+      dp-=pi2*Math.round(dp/pi2);
+      const freq=k+dp*n/(pi2*hop);
+      const ok=Math.round(k*ratio);
+      if(ok>=0&&ok<=(n>>1)){
+        sp[ok]+=freq*ratio*pi2*hop/n;
+        rO[ok]+=mag*Math.cos(sp[ok]);
+        iO[ok]+=mag*Math.sin(sp[ok]);
+        if(ok>0&&ok<(n>>1)){rO[n-ok]=rO[ok];iO[n-ok]=-iO[ok];}
+      }
+    }
+    this._fft(rO,iO,true);
+    const out=new Float32Array(n);
+    for(let i=0;i<n;i++)out[i]=rO[i]*this.win[i];
+    return out;
+  }
+  process(inputs,outputs){
+    const inp=inputs[0]?.[0],out=outputs[0]?.[0];
+    if(!inp||!out)return true;
+    if(!this.enabled){out.set(inp.subarray(0,out.length));return true;}
+    const n=this.N,hop=this.HOP,rLen=this.inRing.length,oLen=this.outBuf.length;
+    for(let i=0;i<inp.length;i++){this.inRing[this.inWr]=inp[i];this.inWr=(this.inWr+1)%rLen;}
+    this.sinceHop+=inp.length;this.tot+=inp.length;
+    if(!this.ready&&this.tot>=n)this.ready=true;
+    while(this.ready&&this.sinceHop>=hop){
+      const frame=new Float32Array(n);
+      const fs=(this.inWr-n+rLen)%rLen;
+      for(let i=0;i<n;i++)frame[i]=this.inRing[(fs+i)%rLen];
+      let ratio=this.ratio;
+      if(this.autoMode){
+        const p=this._detectPitch(frame);
+        if(p>0){
+          this.smoothPitch=this.smoothPitch?this.SMOOTH*this.smoothPitch+(1-this.SMOOTH)*p:p;
+          const midi=12*Math.log2(this.smoothPitch/440)+69;
+          const target=this._snapToScale(midi);
+          ratio=Math.pow(2,(target-midi)*this.strength/12);
+        }else{this.smoothPitch*=this.SMOOTH;ratio=1.0;}
+      }
+      const result=(Math.abs(ratio-1)<0.002)?frame:this._vocoder(frame,ratio);
+      for(let i=0;i<n;i++)this.outBuf[(this.outWr+i)%oLen]+=result[i];
+      this.outWr=(this.outWr+hop)%oLen;
+      this.outAvail+=hop;
+      this.sinceHop-=hop;
+    }
+    const norm=2.0/this.OVL;
+    const toOut=Math.min(out.length,this.outAvail);
+    for(let i=0;i<toOut;i++){const p=(this.outRd+i)%oLen;out[i]=this.outBuf[p]*norm;this.outBuf[p]=0;}
+    for(let i=toOut;i<out.length;i++)out[i]=0;
+    this.outRd=(this.outRd+toOut)%oLen;
+    this.outAvail-=toOut;
+    return true;
+  }
+}
+registerProcessor('xcaster-pitch',XCasterPitch);
+`;
+
+    let _pitchWorkletURL = null;
+    let _pitchWorkletPromise = null;
+    let _pitchWorkletLoaded = false;
+    let pitchNode = null;
+
+    function ensurePitchWorklet(ctx) {
+        if (!_pitchWorkletURL) {
+            try {
+                const blob = new Blob([_PITCH_WORKLET_SRC], { type: 'application/javascript' });
+                _pitchWorkletURL = URL.createObjectURL(blob);
+            } catch (e) { return Promise.reject(e); }
+        }
+        if (!_pitchWorkletPromise) {
+            _pitchWorkletPromise = ctx.audioWorklet.addModule(_pitchWorkletURL)
+                .then(() => {
+                    _pitchWorkletLoaded = true;
+                    console.info('[XCaster] pitch worklet loaded');
+                    // If autotune is enabled and graph was already built, rebuild now.
+                    if (settings.autotuneEnabled && processedDest) {
+                        buildGraph();
+                        replaceTracksOnActivePCs();
+                    }
+                })
+                .catch(err => {
+                    console.warn('[XCaster] pitch worklet failed', err);
+                    _pitchWorkletPromise = null;
+                    _pitchWorkletURL = null;
+                });
+        }
+        return _pitchWorkletPromise;
+    }
+
+    function updatePitchNode() {
+        if (!pitchNode) return;
+        const semitones = settings.pitchShiftSemitones || 0;
+        pitchNode.port.postMessage({
+            ratio:    settings.autotuneAuto ? 1.0 : Math.pow(2, semitones / 12),
+            enable:   settings.autotuneEnabled,
+            auto:     settings.autotuneAuto,
+            key:      settings.autotuneKey || 0,
+            scale:    settings.autotuneAuto ? _AUTOTUNE_SCALES.chromatic : undefined,
+            strength: settings.autotuneStrength || 1.0,
+        });
+    }
+
+    const _AUTOTUNE_SCALES = {
+        chromatic: [0,1,2,3,4,5,6,7,8,9,10,11],
+        major:     [0,2,4,5,7,9,11],
+        minor:     [0,2,3,5,7,8,10],
+        pentatonic:[0,2,4,7,9],
+    };
+    const _NOTE_NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // SOUNDBOARD · MIDI · SYNTHESIZER · LOOPER
+    // ══════════════════════════════════════════════════════════════════════════
+
+    // ── Built-in sound kits ────────────────────────────────────────────────────
+    // Procedurally synthesized (no bundled audio assets needed / no licensing
+    // concerns). Gives the pads instant test content: a drum kit, a piano/
+    // guitar scale, X-mobile-style sound effects (clap, cheer, air horn…) and
+    // a set of synth-keys pluck tones. Rendered once per sound and cached.
+    function _noiseBuffer(ctx, durationSec) {
+        const n = Math.max(1, Math.round(ctx.sampleRate * durationSec));
+        const buf = ctx.createBuffer(1, n, ctx.sampleRate);
+        const d = buf.getChannelData(0);
+        for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
+        return buf;
+    }
+    function _renderOffline(durationSec, buildFn) {
+        const sr = 44100;
+        const ctx = new OfflineAudioContext(1, Math.max(1, Math.ceil(sr * durationSec)), sr);
+        buildFn(ctx);
+        return ctx.startRendering();
+    }
+    function _midiToFreq(note) { return 440 * Math.pow(2, (note - 69) / 12); }
+    function _midiToName(note) { return `${_NOTE_NAMES[((note % 12) + 12) % 12]}${Math.floor(note / 12) - 1}`; }
+
+    // Pitched percussive thump (kick/tom): sine with a fast downward pitch sweep.
+    function _renderThump(startHz, endHz, durationSec, decaySec) {
+        return _renderOffline(durationSec, ctx => {
+            const osc = ctx.createOscillator(), gain = ctx.createGain();
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(startHz, 0);
+            osc.frequency.exponentialRampToValueAtTime(Math.max(20, endHz), decaySec);
+            gain.gain.setValueAtTime(1, 0);
+            gain.gain.exponentialRampToValueAtTime(0.001, decaySec);
+            osc.connect(gain); gain.connect(ctx.destination);
+            osc.start(0); osc.stop(durationSec);
+        });
+    }
+    // One or more filtered-noise bursts scheduled inside a single buffer —
+    // used for hats/snare/clap/crash and the crowd/clap-style SFX.
+    function _renderNoiseBursts(durationSec, bursts) {
+        return _renderOffline(durationSec, ctx => {
+            bursts.forEach(b => {
+                const len = Math.max(0.01, durationSec - b.t);
+                const src = ctx.createBufferSource();
+                src.buffer = _noiseBuffer(ctx, len);
+                const filt = ctx.createBiquadFilter();
+                filt.type = b.type || 'bandpass';
+                filt.frequency.value = b.type === 'bandpass' ? (b.freqLo + b.freqHi) / 2 : b.freqLo;
+                if (b.type === 'bandpass') filt.Q.value = b.q || 1.2;
+                const gain = ctx.createGain();
+                gain.gain.setValueAtTime(b.gain ?? 1, b.t);
+                gain.gain.exponentialRampToValueAtTime(0.001, b.t + (b.decay || 0.12));
+                src.connect(filt); filt.connect(gain); gain.connect(ctx.destination);
+                src.start(b.t);
+            });
+        });
+    }
+    // Plucked/sustained tone (piano / guitar / synth keys): a small stack of
+    // detuned harmonics over a decaying envelope.
+    function _renderPluck(freq, durationSec, opts = {}) {
+        const { wave = 'triangle', harmonics = [1, 2, 3], harmAmp = [1, 0.45, 0.2], decaySec, detune = 0 } = opts;
+        const decay = decaySec || durationSec * 0.9;
+        return _renderOffline(durationSec, ctx => {
+            const gain = ctx.createGain();
+            gain.gain.setValueAtTime(1, 0);
+            gain.gain.linearRampToValueAtTime(1, 0.01);
+            gain.gain.exponentialRampToValueAtTime(0.001, decay);
+            gain.connect(ctx.destination);
+            harmonics.forEach((h, i) => {
+                const osc = ctx.createOscillator();
+                osc.type = wave;
+                osc.frequency.value = freq * h;
+                osc.detune.value = detune * (i % 2 === 0 ? 1 : -1);
+                const hg = ctx.createGain();
+                hg.gain.value = (harmAmp[i] ?? 0.3) / harmonics.length;
+                osc.connect(hg); hg.connect(gain);
+                osc.start(0); osc.stop(durationSec);
+            });
+        });
+    }
+    // Sustained honk (air horn): two closely-detuned sawtooths, fast attack.
+    function _renderHonk(freq, durationSec) {
+        return _renderOffline(durationSec, ctx => {
+            const gain = ctx.createGain();
+            gain.gain.setValueAtTime(0, 0);
+            gain.gain.linearRampToValueAtTime(1, 0.03);
+            gain.gain.setValueAtTime(1, durationSec * 0.7);
+            gain.gain.exponentialRampToValueAtTime(0.001, durationSec);
+            gain.connect(ctx.destination);
+            [freq, freq * 1.011].forEach(f => {
+                const osc = ctx.createOscillator();
+                osc.type = 'sawtooth'; osc.frequency.value = f;
+                const hg = ctx.createGain(); hg.gain.value = 0.5;
+                osc.connect(hg); hg.connect(gain);
+                osc.start(0); osc.stop(durationSec);
+            });
+        });
+    }
+    // Descending pitch sweep (boo).
+    function _renderSweep(startHz, endHz, durationSec) {
+        return _renderOffline(durationSec, ctx => {
+            const osc = ctx.createOscillator(), gain = ctx.createGain();
+            osc.type = 'sawtooth';
+            osc.frequency.setValueAtTime(startHz, 0);
+            osc.frequency.linearRampToValueAtTime(endHz, durationSec * 0.85);
+            gain.gain.setValueAtTime(0, 0);
+            gain.gain.linearRampToValueAtTime(1, 0.08);
+            gain.gain.exponentialRampToValueAtTime(0.001, durationSec);
+            osc.connect(gain); gain.connect(ctx.destination);
+            osc.start(0); osc.stop(durationSec);
+        });
+    }
+
+    // ── Dedicated crowd/reaction SFX renderers ──────────────────────────────
+    // The generic noise-burst helper above sounds too "one-note" for the more
+    // complex X-Spaces-style reaction sounds (applause, cheer, laughter, an
+    // air horn, etc.), so these build a more convincing timbre/envelope per
+    // sound: broadband + resonant layering for claps, multi-voice filtered
+    // noise "roar" for crowd cheer/boo, pitch-swept breath noise for gasps,
+    // pulsed formant tone for laughter, and so on — still 100% procedural
+    // (no bundled audio assets), just closer to the real-world sound.
+
+    // A single realistic hand clap: broadband snap + a short resonant "ring".
+    function _renderClapBurst(ctx, t, out) {
+        const len = 0.18;
+        const src = ctx.createBufferSource();
+        src.buffer = _noiseBuffer(ctx, len);
+        const hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 900;
+        const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 5500;
+        const snapGain = ctx.createGain();
+        snapGain.gain.setValueAtTime(1, t);
+        snapGain.gain.exponentialRampToValueAtTime(0.001, t + 0.09);
+        src.connect(hp); hp.connect(lp); lp.connect(snapGain); snapGain.connect(out);
+        const ring = ctx.createBufferSource();
+        ring.buffer = _noiseBuffer(ctx, len);
+        const bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 1800; bp.Q.value = 2.2;
+        const ringGain = ctx.createGain();
+        ringGain.gain.setValueAtTime(0.5, t);
+        ringGain.gain.exponentialRampToValueAtTime(0.001, t + 0.05);
+        ring.connect(bp); bp.connect(ringGain); ringGain.connect(out);
+        src.start(t); ring.start(t);
+    }
+    function _renderClap(durationSec) {
+        return _renderOffline(durationSec, ctx => {
+            const out = ctx.createGain(); out.connect(ctx.destination);
+            _renderClapBurst(ctx, 0, out);
+            _renderClapBurst(ctx, 0.025, out);
+            _renderClapBurst(ctx, 0.05, out);
+        });
+    }
+    // Dense, randomized crowd applause: many overlapping clap transients
+    // (denser mid-roll, thinning at the tail) over a soft continuous "room" bed.
+    function _renderApplause(durationSec) {
+        return _renderOffline(durationSec, ctx => {
+            const out = ctx.createGain(); out.connect(ctx.destination);
+            const bed = ctx.createBufferSource();
+            bed.buffer = _noiseBuffer(ctx, durationSec);
+            const bedFilt = ctx.createBiquadFilter(); bedFilt.type = 'bandpass'; bedFilt.frequency.value = 2200; bedFilt.Q.value = 0.6;
+            const bedGain = ctx.createGain();
+            bedGain.gain.setValueAtTime(0, 0);
+            bedGain.gain.linearRampToValueAtTime(0.06, durationSec * 0.15);
+            bedGain.gain.linearRampToValueAtTime(0.05, durationSec * 0.75);
+            bedGain.gain.linearRampToValueAtTime(0, durationSec);
+            bed.connect(bedFilt); bedFilt.connect(bedGain); bedGain.connect(out);
+            bed.start(0);
+            let t = 0.02;
+            while (t < durationSec - 0.05) {
+                _renderClapBurst(ctx, t, out);
+                const progress = t / durationSec;
+                const gap = progress < 0.7 ? 0.045 : 0.045 + (progress - 0.7) * 0.25;
+                t += gap + Math.random() * gap * 0.8;
+            }
+        });
+    }
+    // Swelling crowd "roar": 3 layers of filtered noise with slow independent
+    // formant-like sweeps, plus scattered claps/whoops near the peak.
+    function _renderCrowdCheer(durationSec) {
+        return _renderOffline(durationSec, ctx => {
+            const out = ctx.createGain(); out.connect(ctx.destination);
+            [{ f0: 500, f1: 1100, g: 0.55, d: 0 }, { f0: 800, f1: 1800, g: 0.4, d: 0.05 }, { f0: 1400, f1: 2600, g: 0.3, d: 0.1 }]
+                .forEach(v => {
+                    const src = ctx.createBufferSource();
+                    src.buffer = _noiseBuffer(ctx, durationSec);
+                    const filt = ctx.createBiquadFilter(); filt.type = 'bandpass'; filt.Q.value = 1.1;
+                    filt.frequency.setValueAtTime(v.f0, 0);
+                    filt.frequency.linearRampToValueAtTime(v.f1, durationSec * 0.6);
+                    filt.frequency.linearRampToValueAtTime(v.f0 * 1.1, durationSec);
+                    const g = ctx.createGain();
+                    g.gain.setValueAtTime(0, 0);
+                    g.gain.linearRampToValueAtTime(v.g, durationSec * 0.25 + v.d);
+                    g.gain.linearRampToValueAtTime(v.g * 0.9, durationSec * 0.7);
+                    g.gain.linearRampToValueAtTime(0, durationSec);
+                    src.connect(filt); filt.connect(g); g.connect(out);
+                    src.start(0);
+                });
+            let t = durationSec * 0.3;
+            while (t < durationSec * 0.85) { _renderClapBurst(ctx, t, out); t += 0.1 + Math.random() * 0.15; }
+        });
+    }
+    // Descending crowd "boo": a few detuned sawtooth voices sliding down in
+    // pitch together, over a low noise body for crowd texture.
+    function _renderCrowdBoo(durationSec) {
+        return _renderOffline(durationSec, ctx => {
+            const out = ctx.createGain(); out.connect(ctx.destination);
+            [220, 180, 260, 150].forEach((f, i) => {
+                const start = 0.05 * i;
+                const osc = ctx.createOscillator();
+                osc.type = 'sawtooth';
+                osc.frequency.setValueAtTime(f, start);
+                osc.frequency.linearRampToValueAtTime(f * 0.55, durationSec * 0.9);
+                const g = ctx.createGain();
+                g.gain.setValueAtTime(0, start);
+                g.gain.linearRampToValueAtTime(0.22, start + 0.12);
+                g.gain.exponentialRampToValueAtTime(0.001, durationSec);
+                osc.connect(g); g.connect(out);
+                osc.start(start); osc.stop(durationSec);
+            });
+            const src = ctx.createBufferSource();
+            src.buffer = _noiseBuffer(ctx, durationSec);
+            const filt = ctx.createBiquadFilter(); filt.type = 'bandpass'; filt.frequency.value = 500; filt.Q.value = 0.7;
+            const g2 = ctx.createGain();
+            g2.gain.setValueAtTime(0, 0);
+            g2.gain.linearRampToValueAtTime(0.15, 0.15);
+            g2.gain.exponentialRampToValueAtTime(0.001, durationSec);
+            src.connect(filt); filt.connect(g2); g2.connect(out);
+            src.start(0);
+        });
+    }
+    // Air horn: quick pitch-rise attack into a sustained blast — sawtooth pair
+    // + a square sub-oscillator an octave down for body, then a fast fade.
+    function _renderAirhorn(freq, durationSec) {
+        return _renderOffline(durationSec, ctx => {
+            const attack = 0.05;
+            const gain = ctx.createGain();
+            gain.gain.setValueAtTime(0, 0);
+            gain.gain.linearRampToValueAtTime(1, attack);
+            gain.gain.setValueAtTime(1, durationSec * 0.75);
+            gain.gain.exponentialRampToValueAtTime(0.001, durationSec);
+            gain.connect(ctx.destination);
+            [1, 1.011, 0.5].forEach((mult, i) => {
+                const osc = ctx.createOscillator();
+                osc.type = i === 2 ? 'square' : 'sawtooth';
+                osc.frequency.setValueAtTime(freq * mult * 0.85, 0);
+                osc.frequency.exponentialRampToValueAtTime(freq * mult, attack);
+                const hg = ctx.createGain(); hg.gain.value = i === 2 ? 0.35 : 0.5;
+                osc.connect(hg); hg.connect(gain);
+                osc.start(0); osc.stop(durationSec);
+            });
+        });
+    }
+    // Harsh game-show-style buzzer: square wave chopped by a fast square-wave
+    // tremolo (amplitude modulation), instead of a smooth air-horn-like blast.
+    function _renderBuzzerTone(freq, durationSec) {
+        return _renderOffline(durationSec, ctx => {
+            const osc = ctx.createOscillator();
+            osc.type = 'square'; osc.frequency.value = freq;
+            const lfo = ctx.createOscillator();
+            lfo.type = 'square'; lfo.frequency.value = 26;
+            const lfoGain = ctx.createGain(); lfoGain.gain.value = 0.5;
+            const amGain = ctx.createGain(); amGain.gain.value = 0.5;
+            lfo.connect(lfoGain); lfoGain.connect(amGain.gain);
+            const env = ctx.createGain();
+            env.gain.setValueAtTime(0, 0);
+            env.gain.linearRampToValueAtTime(1, 0.02);
+            env.gain.setValueAtTime(1, durationSec * 0.85);
+            env.gain.linearRampToValueAtTime(0, durationSec);
+            osc.connect(amGain); amGain.connect(env); env.connect(ctx.destination);
+            osc.start(0); osc.stop(durationSec);
+            lfo.start(0); lfo.stop(durationSec);
+        });
+    }
+    // Confetti popper: a sharp broadband pop, then a fluttering paper crackle
+    // tail made of many tiny randomized high-frequency clicks.
+    function _renderConfettiPop(durationSec) {
+        return _renderOffline(durationSec, ctx => {
+            const out = ctx.createGain(); out.connect(ctx.destination);
+            const pop = ctx.createBufferSource();
+            pop.buffer = _noiseBuffer(ctx, 0.05);
+            const popFilt = ctx.createBiquadFilter(); popFilt.type = 'bandpass'; popFilt.frequency.value = 2500; popFilt.Q.value = 1.5;
+            const popGain = ctx.createGain();
+            popGain.gain.setValueAtTime(1, 0);
+            popGain.gain.exponentialRampToValueAtTime(0.001, 0.05);
+            pop.connect(popFilt); popFilt.connect(popGain); popGain.connect(out);
+            pop.start(0);
+            let t = 0.03;
+            while (t < durationSec) {
+                const len = 0.015 + Math.random() * 0.02;
+                const src = ctx.createBufferSource();
+                src.buffer = _noiseBuffer(ctx, len);
+                const filt = ctx.createBiquadFilter(); filt.type = 'highpass'; filt.frequency.value = 4000 + Math.random() * 3000;
+                const g = ctx.createGain();
+                const peak = 0.25 * (1 - t / durationSec) + 0.05;
+                g.gain.setValueAtTime(peak, t);
+                g.gain.exponentialRampToValueAtTime(0.001, t + len);
+                src.connect(filt); filt.connect(g); g.connect(out);
+                src.start(t);
+                t += 0.02 + Math.random() * 0.05;
+            }
+        });
+    }
+    // Rhythmic "ha-ha-ha" laughter: a handful of short pulsed, formant-filtered
+    // tone bursts with a bouncing pitch, gently accelerating like real laughs do.
+    function _renderLaughter(durationSec) {
+        return _renderOffline(durationSec, ctx => {
+            const out = ctx.createGain(); out.connect(ctx.destination);
+            const beats = 5;
+            let t = 0;
+            for (let i = 0; i < beats; i++) {
+                const dur = 0.14;
+                const osc = ctx.createOscillator();
+                osc.type = 'sawtooth';
+                const baseFreq = 260 - i * 8;
+                osc.frequency.setValueAtTime(baseFreq * 0.75, t);
+                osc.frequency.linearRampToValueAtTime(baseFreq, t + 0.04);
+                osc.frequency.linearRampToValueAtTime(baseFreq * 0.8, t + dur);
+                const formant = ctx.createBiquadFilter(); formant.type = 'bandpass'; formant.frequency.value = 900; formant.Q.value = 3.5;
+                const g = ctx.createGain();
+                g.gain.setValueAtTime(0, t);
+                g.gain.linearRampToValueAtTime(0.5, t + 0.03);
+                g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+                osc.connect(formant); formant.connect(g); g.connect(out);
+                osc.start(t); osc.stop(t + dur);
+                t += dur + 0.05 - i * 0.005;
+            }
+        });
+    }
+    // Sharp inhale/gasp: noise burst run through a bandpass filter that sweeps
+    // upward quickly then settles — mimics the "in-rush" of a startled breath.
+    function _renderGaspBreath(durationSec) {
+        return _renderOffline(durationSec, ctx => {
+            const src = ctx.createBufferSource();
+            src.buffer = _noiseBuffer(ctx, durationSec);
+            const filt = ctx.createBiquadFilter(); filt.type = 'bandpass'; filt.Q.value = 0.8;
+            filt.frequency.setValueAtTime(700, 0);
+            filt.frequency.exponentialRampToValueAtTime(2600, durationSec * 0.4);
+            filt.frequency.exponentialRampToValueAtTime(1500, durationSec);
+            const gain = ctx.createGain();
+            gain.gain.setValueAtTime(0, 0);
+            gain.gain.linearRampToValueAtTime(0.8, durationSec * 0.25);
+            gain.gain.exponentialRampToValueAtTime(0.001, durationSec);
+            src.connect(filt); filt.connect(gain); gain.connect(ctx.destination);
+            src.start(0);
+        });
+    }
+    // Breathy whistle: sine tone with vibrato + a touch of high-passed noise
+    // (breath) mixed underneath, instead of a bare pure tone.
+    function _renderWhistleTone(freq, durationSec) {
+        return _renderOffline(durationSec, ctx => {
+            const gain = ctx.createGain();
+            gain.gain.setValueAtTime(0, 0);
+            gain.gain.linearRampToValueAtTime(0.8, 0.06);
+            gain.gain.setValueAtTime(0.8, durationSec * 0.75);
+            gain.gain.exponentialRampToValueAtTime(0.001, durationSec);
+            gain.connect(ctx.destination);
+            const osc = ctx.createOscillator();
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(freq * 0.9, 0);
+            osc.frequency.exponentialRampToValueAtTime(freq, 0.06);
+            const vibrato = ctx.createOscillator(); vibrato.frequency.value = 6;
+            const vibratoGain = ctx.createGain(); vibratoGain.gain.value = freq * 0.01;
+            vibrato.connect(vibratoGain); vibratoGain.connect(osc.frequency);
+            osc.connect(gain);
+            const breath = ctx.createBufferSource();
+            breath.buffer = _noiseBuffer(ctx, durationSec);
+            const breathFilt = ctx.createBiquadFilter(); breathFilt.type = 'highpass'; breathFilt.frequency.value = 3500;
+            const breathGain = ctx.createGain(); breathGain.gain.value = 0.05;
+            breath.connect(breathFilt); breathFilt.connect(breathGain); breathGain.connect(gain);
+            osc.start(0); osc.stop(durationSec);
+            vibrato.start(0); vibrato.stop(durationSec);
+            breath.start(0);
+        });
+    }
+    // Cricket chirps: a few short trills, each made of several very short
+    // pulsed tone blips, instead of a single flat high-passed noise burst.
+    function _renderCricketChirps(durationSec) {
+        return _renderOffline(durationSec, ctx => {
+            const out = ctx.createGain(); out.connect(ctx.destination);
+            [0, 0.32, 0.64].forEach(start => {
+                for (let p = 0; p < 4; p++) {
+                    const t = start + p * 0.028;
+                    const osc = ctx.createOscillator();
+                    osc.type = 'triangle'; osc.frequency.value = 4200 + Math.random() * 300;
+                    const g = ctx.createGain();
+                    g.gain.setValueAtTime(0, t);
+                    g.gain.linearRampToValueAtTime(0.3, t + 0.006);
+                    g.gain.exponentialRampToValueAtTime(0.001, t + 0.02);
+                    osc.connect(g); g.connect(out);
+                    osc.start(t); osc.stop(t + 0.022);
+                }
+            });
+        });
+    }
+
+    function _synthesizeBuiltin(key) {
+        const parts = key.split(':');
+        const cat = parts[0];
+        const arg = parts.length > 1 ? parts.slice(1).join(':') : undefined;
+        const midi = arg !== undefined ? +arg : 0;
+        switch (cat) {
+            case 'kick':    return _renderThump(150, 45, 0.35, 0.22);
+            case 'kick2':   return _renderThump(120, 35, 0.4, 0.28);
+            case 'tomlo':   return _renderThump(190, 95, 0.4, 0.3);
+            case 'tommid':  return _renderThump(250, 130, 0.35, 0.26);
+            case 'tomhi':   return _renderThump(330, 170, 0.3, 0.22);
+            case 'snare':   return _renderNoiseBursts(0.25, [{ t: 0, decay: 0.15, freqLo: 1600, freqHi: 2600 }, { t: 0, decay: 0.08, freqLo: 200, freqHi: 400 }]);
+            case 'rim':     return _renderNoiseBursts(0.1, [{ t: 0, decay: 0.05, freqLo: 3000, freqHi: 5000 }]);
+            case 'hihat_closed': return _renderNoiseBursts(0.08, [{ t: 0, decay: 0.05, type: 'highpass', freqLo: 7000 }]);
+            case 'hihat_open':   return _renderNoiseBursts(0.5, [{ t: 0, decay: 0.4, type: 'highpass', freqLo: 6000 }]);
+            case 'hihat_pedal':  return _renderNoiseBursts(0.15, [{ t: 0, decay: 0.1, type: 'highpass', freqLo: 6500 }]);
+            case 'clap':    return _renderClap(0.3);
+            case 'crash':   return _renderNoiseBursts(1.6, [{ t: 0, decay: 1.4, type: 'highpass', freqLo: 5000 }]);
+            case 'ride':    return _renderNoiseBursts(1.0, [{ t: 0, decay: 0.9, type: 'highpass', freqLo: 4000 }]);
+            case 'cowbell': return _renderThump(800, 560, 0.3, 0.28);
+            case 'shaker':  return _renderNoiseBursts(0.2, [{ t: 0, decay: 0.15, type: 'highpass', freqLo: 5500 }]);
+            case 'stick':   return _renderNoiseBursts(0.06, [{ t: 0, decay: 0.03, freqLo: 2500, freqHi: 4000 }]);
+            case 'piano':   return _renderPluck(_midiToFreq(midi), 1.6, { wave: 'triangle', harmonics: [1, 2, 3, 4], harmAmp: [1, 0.5, 0.28, 0.12], decaySec: 1.4 });
+            case 'guitar':  return _renderPluck(_midiToFreq(midi), 2.0, { wave: 'sawtooth', harmonics: [1, 2, 3], harmAmp: [1, 0.35, 0.15], decaySec: 1.8, detune: 6 });
+            case 'synthkeys': return _renderPluck(_midiToFreq(midi), 0.9, { wave: 'sawtooth', harmonics: [1, 2], harmAmp: [1, 0.4], decaySec: 0.7, detune: 8 });
+            // ── 808-style kit (dedicated tuning for the signature sounds) ──────
+            case 'kick808':  return _renderThump(150, 35, 0.55, 0.45);
+            case 'kick808b': return _renderThump(110, 26, 0.7, 0.6);
+            case 'snare808': return _renderNoiseBursts(0.3, [{ t: 0, decay: 0.2, freqLo: 1800, freqHi: 3000 }, { t: 0, decay: 0.1, freqLo: 220, freqHi: 420 }]);
+            case 'clap808':  return _renderNoiseBursts(0.32, [
+                { t: 0,    decay: 0.05, freqLo: 1000, freqHi: 1800 },
+                { t: 0.025,decay: 0.05, freqLo: 1000, freqHi: 1800 },
+                { t: 0.05, decay: 0.2,  freqLo: 1000, freqHi: 1800 },
+            ]);
+            case 'subdrop':  return _renderThump(90, 20, 1.3, 1.05);
+            // ── Generic parametric drum hits — used to build kit variants
+            // (808 / Lo-Fi / future kits) without a dedicated case per sound. ──
+            case 'thump': {
+                const [s, e, d, dec] = arg.split(':').map(Number);
+                return _renderThump(s, e, d, dec);
+            }
+            case 'noise1': {
+                const [type, freqLo, freqHi, dur, decay] = arg.split(':');
+                return _renderNoiseBursts(+dur, [{ t: 0, decay: +decay, type, freqLo: +freqLo, freqHi: freqHi ? +freqHi : undefined }]);
+            }
+            case 'claplike': {
+                const [freqLo, freqHi, dur] = arg.split(':').map(Number);
+                return _renderNoiseBursts(dur, [
+                    { t: 0,     decay: 0.06,       freqLo, freqHi },
+                    { t: 0.025, decay: 0.06,       freqLo, freqHi },
+                    { t: 0.05,  decay: dur * 0.55, freqLo, freqHi },
+                ]);
+            }
+            case 'roll': {
+                const [type, freqLo, freqHi, totalDurStr, startGapStr] = arg.split(':');
+                const total = +totalDurStr;
+                const bursts = [];
+                let t = 0, gap = +startGapStr;
+                while (t < total) {
+                    bursts.push({ t, decay: gap * 0.85, type, freqLo: +freqLo, freqHi: freqHi ? +freqHi : undefined });
+                    t += gap; gap = Math.max(0.025, gap * 0.92);
+                }
+                return _renderNoiseBursts(total + 0.2, bursts);
+            }
+            case 'sfx': {
+                switch (arg) {
+                    case 'clap':      return _renderClap(0.32);
+                    case 'cheer':     return _renderCrowdCheer(2.4);
+                    case 'applause':  return _renderApplause(2.2);
+                    case 'airhorn':   return _renderAirhorn(420, 1.1);
+                    case 'drumroll': {
+                        const bursts = [];
+                        let t = 0, gap = 0.09;
+                        while (t < 1.3) { bursts.push({ t, decay: gap * 0.9, freqLo: 1500, freqHi: 2600 }); t += gap; gap = Math.max(0.03, gap * 0.94); }
+                        return _renderNoiseBursts(1.5, bursts);
+                    }
+                    case 'rimshot':   return _renderNoiseBursts(0.1, [{ t: 0, decay: 0.05, freqLo: 3000, freqHi: 5000 }]);
+                    case 'boo':       return _renderCrowdBoo(1.3);
+                    case 'confetti':  return _renderConfettiPop(0.9);
+                    case 'laugh':     return _renderLaughter(1.15);
+                    case 'gasp':      return _renderGaspBreath(0.45);
+                    case 'whistle':   return _renderWhistleTone(2200, 0.9);
+                    case 'buzzer':    return _renderBuzzerTone(190, 0.6);
+                    case 'bell':      return _renderPluck(1200, 1.2, { wave: 'sine', harmonics: [1, 2.4, 3.8], harmAmp: [1, 0.4, 0.2], decaySec: 1.1 });
+                    case 'crickets':  return _renderCricketChirps(1.0);
+                    case 'thud':      return _renderThump(100, 40, 0.3, 0.24);
+                    case 'pop':       return _renderNoiseBursts(0.15, [{ t: 0, decay: 0.03, freqLo: 2000, freqHi: 4000 }, { t: 0.02, decay: 0.12, type: 'highpass', freqLo: 5000 }]);
+                    default:          return _renderNoiseBursts(0.2, [{ t: 0, decay: 0.15, freqLo: 800, freqHi: 1600 }]);
+                }
+            }
+            default: return _renderNoiseBursts(0.2, [{ t: 0, decay: 0.15, freqLo: 800, freqHi: 1600 }]);
+        }
+    }
+
+    const _builtinBufferCache = new Map(); // builtin key → Promise<AudioBuffer>
+    function _getBuiltinBuffer(key) {
+        if (_builtinBufferCache.has(key)) return _builtinBufferCache.get(key);
+        const p = _synthesizeBuiltin(key).catch(e => { console.warn('[XCaster] builtin sound synth failed', key, e); return null; });
+        _builtinBufferCache.set(key, p);
+        return p;
+    }
+
+    // ── Real sample-based kits ────────────────────────────────────────────
+    // Free, openly-licensed drum-machine multisamples hosted by the smplr
+    // project (https://github.com/danigb/smplr, MIT) at smpldsnds.github.io.
+    // We fetch the real audio files directly (no bundler / npm runtime needed
+    // in this raw-injected overlay) and decode them into normal AudioBuffers,
+    // so they drop straight into the existing pad-playback pipeline. Every
+    // real-sample pad also keeps its original procedural `builtin` sound as
+    // an automatic offline/network-failure fallback — nothing breaks if the
+    // stream has no internet access mid-show.
+    const _realSampleCache = new Map(); // baseUrl(no ext) → AudioBuffer
+    async function _getRealSampleBuffer(baseUrlNoExt) {
+        if (_realSampleCache.has(baseUrlNoExt)) return _realSampleCache.get(baseUrlNoExt);
+        const ctx = ensureAudioContext();
+        for (const ext of ['ogg', 'm4a']) {
+            try {
+                const res = await fetch(`${baseUrlNoExt}.${ext}`);
+                if (!res.ok) continue;
+                const buf = await res.arrayBuffer();
+                const ab = await ctx.decodeAudioData(buf);
+                _realSampleCache.set(baseUrlNoExt, ab);
+                return ab;
+            } catch { /* try next format / fail silently, caller falls back */ }
+        }
+        console.warn('[XCaster] real sample fetch failed, using procedural fallback:', baseUrlNoExt);
+        return null;
+    }
+    // Warms the cache for a kit's real samples in the background so the first
+    // pad hit isn't laggy waiting on a network round-trip.
+    function _prefetchRealSamples(padList) {
+        for (const p of padList) { if (p.sample) _getRealSampleBuffer(p.sample).catch(() => {}); }
+    }
+
+    const TR808_BASE = 'https://smpldsnds.github.io/drum-machines/tr-808/';
+    const LM2_BASE    = 'https://smpldsnds.github.io/drum-machines/lm-2/';
+    const RZ1_BASE    = 'https://smpldsnds.github.io/drum-machines/casio-rz1/';
+    // Google's public "Sound Library" CDN (used by Actions on Google) — real
+    // recorded royalty-free effects, served with Access-Control-Allow-Origin: *
+    // so they can be fetched directly from the page. Used for the handful of
+    // SFX pads that have a genuine real-recording equivalent; effects with no
+    // good match (e.g. a cartoonish game-show "buzzer") stay procedural.
+    const SFX_BASE = 'https://actions.google.com/sounds/v1/';
+
+    // 16-pad kits — each entry becomes one pad's { builtin, name, sample? }.
+    // `sample` (when present) is a real recorded drum-machine hit that's tried
+    // first; `builtin` is the procedurally-synthesized sound used as a fallback.
+    const _SOUND_KITS = {
+        drums: [
+            ['kick','Kick', LM2_BASE+'kick'],['kick2','Kick 2', LM2_BASE+'kick-alt'],
+            ['snare','Snare', LM2_BASE+'snare-h'],['rim','Rimshot', LM2_BASE+'stick-h'],
+            ['hihat_closed','HH Closed', LM2_BASE+'hhclosed'],['hihat_open','HH Open', LM2_BASE+'hhopen'],
+            ['hihat_pedal','HH Pedal', LM2_BASE+'hhclosed-short'],['clap','Clap', LM2_BASE+'clap'],
+            ['tomlo','Tom Lo', LM2_BASE+'tom-l'],['tommid','Tom Mid', LM2_BASE+'tom-m'],['tomhi','Tom Hi', LM2_BASE+'tom-h'],
+            ['crash','Crash', LM2_BASE+'crash'],['ride','Ride', LM2_BASE+'ride'],['cowbell','Cowbell', LM2_BASE+'cowbell'],
+            ['shaker','Shaker', LM2_BASE+'cabasa'],['stick','Stick', LM2_BASE+'stick-l'],
+        ].map(([s, n, u]) => ({ builtin: s, name: n, sample: u })),
+        '808': [
+            ['kick808','808 Kick', TR808_BASE+'kick/bd5000'],['kick808b','808 Kick Long', TR808_BASE+'kick/bd2500'],
+            ['snare808','808 Snare', TR808_BASE+'snare/sd5000'],['clap808','808 Clap', TR808_BASE+'clap/cp'],
+            ['noise1:highpass:4000::0.08:0.045','808 Rim', TR808_BASE+'rimshot/rs'],
+            ['noise1:highpass:8000::0.06:0.045','HH Closed', TR808_BASE+'hihat-close/ch'],
+            ['noise1:highpass:7000::0.55:0.45','HH Open', TR808_BASE+'hihat-open/oh50'],
+            ['roll:highpass:7500::0.9:0.07','HH Roll'],
+            ['thump:180:80:0.4:0.32','Tom Lo', TR808_BASE+'tom-low/lt50'],
+            ['thump:240:120:0.35:0.28','Tom Mid', TR808_BASE+'mid-tom/mt50'],
+            ['thump:320:160:0.3:0.24','Tom Hi', TR808_BASE+'tom-hi/ht50'],
+            ['thump:760:540:0.28:0.26','808 Cowbell', TR808_BASE+'cowbell/cb'],
+            ['noise1:highpass:6000::0.18:0.13','Shaker', TR808_BASE+'maraca/ma'],
+            ['noise1:highpass:5500::1.4:1.2','Crash', TR808_BASE+'cymbal/cy5050'],
+            ['roll:bandpass:2000:3000:0.8:0.07','Snare Roll'],['subdrop','Sub Drop'],
+        ].map(([s, n, u]) => ({ builtin: s, name: n, sample: u })),
+        lofi: [
+            ['thump:120:38:0.5:0.34','Lofi Kick', RZ1_BASE+'kick'],['thump:95:30:0.6:0.42','Lofi Kick 2'],
+            ['noise1:lowpass:1800::0.3:0.22','Lofi Snare', RZ1_BASE+'snare'],['claplike:900:1600:0.34','Lofi Clap', RZ1_BASE+'clap'],
+            ['noise1:lowpass:3000::0.09:0.05','Lofi Rim', RZ1_BASE+'clave'],['noise1:lowpass:3800::0.08:0.06','HH Closed', RZ1_BASE+'hihat-closed'],
+            ['noise1:lowpass:3200::0.5:0.4','HH Open', RZ1_BASE+'hihat-open'],['roll:lowpass:3500::0.9:0.08','HH Roll'],
+            ['thump:160:70:0.42:0.34','Tom Lo', RZ1_BASE+'tom-1'],['thump:210:105:0.36:0.3','Tom Mid', RZ1_BASE+'tom-2'],
+            ['thump:280:140:0.3:0.26','Tom Hi', RZ1_BASE+'tom-3'],
+            ['thump:620:440:0.3:0.28','Lofi Cowbell', RZ1_BASE+'cowbell'],['noise1:lowpass:3600::0.2:0.15','Shaker'],
+            ['noise1:lowpass:3200::1.3:1.1','Crash', RZ1_BASE+'crash'],['roll:lowpass:2400::0.8:0.08','Snare Roll'],['thump:80:22:1.2:1.0','Sub Drop'],
+        ].map(([s, n, u]) => ({ builtin: s, name: n, sample: u })),
+        piano: Array.from({ length: 16 }, (_, i) => { const m = 60 + i; return { builtin: `piano:${m}`, name: _midiToName(m) }; }),
+        guitar: Array.from({ length: 16 }, (_, i) => { const m = 40 + i; return { builtin: `guitar:${m}`, name: _midiToName(m) }; }),
+        sfx: [
+            ['clap','Clap', SFX_BASE+'foley/hand_claps_close'],
+            ['cheer','Cheer', SFX_BASE+'crowds/team_cheer'],
+            ['applause','Applause'],
+            ['airhorn','Airhorn', SFX_BASE+'transportation/air_horn_in_close_hall_series'],
+            ['drumroll','Drumroll', SFX_BASE+'cartoon/drum_roll'],
+            ['rimshot','Rimshot'],
+            ['boo','Boo'],
+            ['confetti','Confetti'],
+            ['laugh','Laugh', SFX_BASE+'human_voices/man_laugh_and_knee_slap'],
+            ['gasp','Gasp'],
+            ['whistle','Whistle', SFX_BASE+'cartoon/slide_whistle'],
+            ['buzzer','Buzzer'],
+            ['bell','Bell', SFX_BASE+'alarms/medium_bell_ringing_near'],
+            ['crickets','Crickets'],
+            ['thud','Thud', SFX_BASE+'impacts/metal_thud'],
+            ['pop','Pop', SFX_BASE+'cartoon/pop'],
+        ].map(([s, n, u]) => ({ builtin: `sfx:${s}`, name: n, sample: u || null })),
+        synthkeys: Array.from({ length: 16 }, (_, i) => { const m = 60 + i; return { builtin: `synthkeys:${m}`, name: _midiToName(m) }; }),
+    };
+
+
+    function loadKit(kitName) {
+        const kit = _SOUND_KITS[kitName];
+        if (!kit) return;
+        const PAD_COLORS = ['#2563eb','#6366f1','#d97706','#059669','#7c3aed','#dc2626','#0891b2','#65a30d',
+                            '#1d4ed8','#4f46e5','#b45309','#047857','#6d28d9','#b91c1c','#0369a1','#4d7c0f'];
+        for (let i = 0; i < 16; i++) {
+            stopPad(i);
+            _padBufferCache.delete(i);
+            const item = kit[i];
+            settings.sbPads[i] = {
+                name: item.name, midiNote: 36 + i, volume: 0.8,
+                color: PAD_COLORS[i], loop: false, builtin: item.builtin,
+                sample: item.sample || null,
+            };
+        }
+        saveSettings(settings);
+        _refreshPadGridUI();
+        _prefetchRealSamples(settings.sbPads); // warm real-sample cache in the background
+    }
+
+    // ── IndexedDB pad storage (audio files persist across sessions) ──────────
+    const _padDB = (() => {
+        let _db = null;
+        const open = () => new Promise((res,rej) => {
+            if (_db) return res(_db);
+            const r = indexedDB.open('xcaster-soundboard', 1);
+            r.onupgradeneeded = e => e.target.result.createObjectStore('pads',{keyPath:'id'});
+            r.onsuccess = e => { _db = e.target.result; res(_db); };
+            r.onerror = e => rej(e.target.error);
+        });
+        return {
+            put: async (id, buf, name) => { const db=await open(); return new Promise((res,rej)=>{ const tx=db.transaction('pads','readwrite'); tx.objectStore('pads').put({id,buf,name}); tx.oncomplete=res; tx.onerror=e=>rej(e.target.error); }); },
+            get: async (id)         => { const db=await open(); return new Promise((res,rej)=>{ const tx=db.transaction('pads','readonly'); const r=tx.objectStore('pads').get(id); r.onsuccess=e=>res(e.target.result||null); r.onerror=e=>rej(e.target.error); }); },
+            del: async (id)         => { const db=await open(); return new Promise((res,rej)=>{ const tx=db.transaction('pads','readwrite'); tx.objectStore('pads').delete(id); tx.oncomplete=res; tx.onerror=e=>rej(e.target.error); }); },
+        };
+    })();
+
+    const _padBufferCache = new Map(); // padIndex → AudioBuffer
+    const _padSources     = new Map(); // padIndex → AudioBufferSourceNode
+
+    async function loadPadBuffer(index) {
+        if (_padBufferCache.has(index)) return _padBufferCache.get(index);
+        const pad = settings.sbPads[index];
+        if (pad?.sample) {
+            const ab = await _getRealSampleBuffer(pad.sample);
+            if (ab) { _padBufferCache.set(index, ab); return ab; }
+            // Network/decode failed (e.g. offline mid-show) — fall through to
+            // the procedural builtin sound below so the pad still makes noise.
+        }
+        if (pad?.builtin) {
+            const ab = await _getBuiltinBuffer(pad.builtin);
+            if (ab) _padBufferCache.set(index, ab);
+            return ab;
+        }
+        const rec = await _padDB.get(`pad-${index}`);
+        if (!rec) return null;
+        const ctx = ensureAudioContext();
+        try {
+            const ab = await ctx.decodeAudioData(rec.buf.slice(0));
+            _padBufferCache.set(index, ab);
+            return ab;
+        } catch (e) { console.warn('[XCaster] pad decode failed', index, e); return null; }
+    }
+
+    async function playPad(index) {
+        // The Sounds channel shares the main mixer graph (sbBus) with mic/aux.
+        // If the user hasn't joined a Space / granted mic access yet, that
+        // graph doesn't exist — build it now so pads actually produce sound.
+        if (!sbBus) { try { await ensureProcessedStream(); } catch {} }
+        const ab = await loadPadBuffer(index);
+        if (!ab || !sbBus) return;
+        stopPad(index);
+        const ctx = ensureAudioContext();
+        const src = ctx.createBufferSource();
+        src.buffer = ab;
+        const vol = ctx.createGain();
+        vol.gain.value = settings.sbPads[index]?.volume ?? 0.8;
+        src.loop = !!(settings.sbPads[index]?.loop);
+        src.connect(vol); vol.connect(sbSourceBus);
+        src.start();
+        src.onended = () => { if (_padSources.get(index)===src) _padSources.delete(index); _paintPadState(index,false); };
+        _padSources.set(index, src);
+        _paintPadState(index, true);
+    }
+
+    function stopPad(index) {
+        const src = _padSources.get(index);
+        if (src) { try { src.stop(); } catch {} _padSources.delete(index); }
+        _paintPadState(index, false);
+    }
+
+    function stopAllPads() { for (let i=0;i<16;i++) stopPad(i); }
+
+    function _paintPadState(index, playing) {
+        const btn = document.querySelector(`[data-pad="${index}"]`);
+        if (btn) btn.classList.toggle('xfw-pad-playing', playing);
+    }
+
+    // Refresh all 16 pad buttons' label/color/loaded-state from settings.sbPads
+    // (used after loading a built-in kit, since the grid itself is built once).
+    function _refreshPadGridUI() {
+        for (let i = 0; i < 16; i++) {
+            const pad = settings.sbPads[i];
+            const btn = document.querySelector(`[data-pad="${i}"]`);
+            if (!btn || !pad) continue;
+            btn.style.setProperty('--pad-color', pad.color);
+            btn.title = `${pad.name} (MIDI: ${pad.midiNote})`;
+            const nameEl = btn.querySelector('.xfw-pad-name');
+            if (nameEl) nameEl.textContent = pad.name;
+            btn.classList.toggle('xfw-pad-loaded', !!(pad.builtin));
+        }
+        // Refresh the editor if it's open on one of these pads.
+        const editor = document.getElementById('xfw-pad-editor');
+        if (editor && editor.style.display !== 'none' && typeof window.__xcOpenPadEditor === 'function' && editor.dataset.padIndex !== undefined) {
+            window.__xcOpenPadEditor(+editor.dataset.padIndex);
+        }
+    }
+
+    // ── Synthesizer (polyphonic, MIDI-driven) ─────────────────────────────────
+    const _SYNTH_VOICES = 8;
+    let _synthVoices = [], _synthCtx = null, _synthDest = null;
+
+    function initSynth() {
+        const ctx = ensureAudioContext();
+        if (_synthCtx === ctx && _synthDest && _synthVoices.length) return;
+        _synthCtx = ctx;
+        _synthVoices.forEach(v => { try { v.osc.stop(); } catch {} });
+        _synthVoices = [];
+        if (_synthDest) { try { _synthDest.disconnect(); } catch {} }
+        _synthDest = ctx.createGain();
+        _synthDest.gain.value = 1.0;
+        if (sbSourceBus) _synthDest.connect(sbSourceBus);
+        for (let i=0;i<_SYNTH_VOICES;i++) {
+            const osc=ctx.createOscillator(), flt=ctx.createBiquadFilter(), gain=ctx.createGain();
+            flt.type='lowpass'; flt.frequency.value=settings.synthFilterHz; flt.Q.value=settings.synthFilterQ;
+            gain.gain.value=0; osc.type=settings.synthWave;
+            osc.connect(flt); flt.connect(gain); gain.connect(_synthDest); osc.start();
+            _synthVoices.push({osc,flt,gain,note:-1,startTime:0});
+        }
+    }
+
+    function synthNoteOn(midiNote, velocity=100) {
+        if (!settings.synthEnabled) return;
+        if (!sbBus) { ensureProcessedStream().catch(()=>{}); return; } // graph not ready yet — next note-on will work
+        initSynth();
+        const ctx=_synthCtx;
+        const note=midiNote + settings.synthOctave*12;
+        const freq=440*Math.pow(2,(note-69)/12);
+        const vel=settings.midiVelocitySensitive?(velocity/127):1.0;
+        let v=_synthVoices.find(v=>v.note<0)||_synthVoices.reduce((a,b)=>a.startTime<b.startTime?a:b);
+        v.note=note; v.startTime=ctx.currentTime;
+        v.osc.type=settings.synthWave;
+        v.osc.frequency.setValueAtTime(freq, ctx.currentTime);
+        v.flt.frequency.setValueAtTime(settings.synthFilterHz, ctx.currentTime);
+        v.flt.Q.setValueAtTime(settings.synthFilterQ, ctx.currentTime);
+        const peak=vel*dbToLin(settings.synthGainDb);
+        const atk=settings.synthAttackMs/1000, dec=settings.synthDecayMs/1000, now=ctx.currentTime;
+        v.gain.gain.cancelScheduledValues(now);
+        v.gain.gain.setValueAtTime(0,now);
+        v.gain.gain.linearRampToValueAtTime(peak, now+atk);
+        v.gain.gain.linearRampToValueAtTime(peak*settings.synthSustain, now+atk+dec);
+    }
+
+    function synthNoteOff(midiNote) {
+        if (!_synthCtx) return;
+        const note=midiNote+settings.synthOctave*12, ctx=_synthCtx;
+        const rel=settings.synthReleaseMs/1000;
+        _synthVoices.filter(v=>v.note===note).forEach(v=>{
+            v.note=-1;
+            const now=ctx.currentTime;
+            v.gain.gain.cancelScheduledValues(now);
+            v.gain.gain.setValueAtTime(v.gain.gain.value,now);
+            v.gain.gain.linearRampToValueAtTime(0,now+rel);
+        });
+    }
+
+    function synthAllNotesOff() { for(let i=0;i<128;i++) synthNoteOff(i); }
+
+    // ── MIDI ──────────────────────────────────────────────────────────────────
+    let _midiAccess = null;
+
+    async function initMIDI() {
+        if (!navigator.requestMIDIAccess) { console.warn('[XCaster] Web MIDI not available'); return; }
+        // Idempotent: re-requesting MIDIAccess every time a Learn button is
+        // clicked (on top of the one requested when the Sounds tab first opens)
+        // used to re-run the whole permission handshake and re-attach a second
+        // statechange listener each time. Skip straight to a listener refresh if
+        // we already have a live access object — avoids any redundant
+        // reconnection glitch that could interrupt note/CC delivery to _onMIDIMsg.
+        if (_midiAccess) { _rebuildMIDIListeners(); paintMIDIDevices(); return; }
+        try {
+            _midiAccess = await navigator.requestMIDIAccess({sysex:false});
+            _midiAccess.addEventListener('statechange', () => { _rebuildMIDIListeners(); paintMIDIDevices(); });
+            _rebuildMIDIListeners();
+            paintMIDIDevices();
+        } catch(e) { console.warn('[XCaster] MIDI denied', e); }
+    }
+
+    function _rebuildMIDIListeners() {
+        if (!_midiAccess) return;
+        _midiAccess.inputs.forEach(inp => {
+            inp.onmidimessage = _onMIDIMsg;
+            // Assigning onmidimessage should implicitly open the port per spec, but
+            // explicitly opening it too is a harmless safety net for controllers/
+            // drivers that don't reliably auto-open (port stays "pending"/"closed"
+            // otherwise and silently never delivers messages).
+            if (typeof inp.open === 'function') inp.open().catch(() => {});
+        });
+    }
+
+    function _onMIDIMsg(msg) {
+        const [status, note, val] = msg.data;
+        if (status >= 0xf0) return; // ignore system real-time bytes (clock/active-sensing/sysex)
+        const type=status&0xf0, chan=(status&0x0f)+1;
+        // Always-on raw monitor (fires BEFORE the channel filter and BEFORE any
+        // MIDI-Learn swallow) so the Sounds panel can prove whether hardware
+        // messages are even reaching the app, and on which channel, no matter
+        // what else is going on — the quickest way to diagnose "nothing happens".
+        _reportRawMidi(type, chan, note, val);
+        if (settings.midiChannel>0 && chan!==settings.midiChannel) return;
+        if (type===0x90 && val>0) {
+            // MIDI Learn: next note-on is captured by the pad editor / transport Learn instead of playing.
+            if (typeof window.__xcMidiLearn === 'function' && window.__xcMidiLearn('note', note)) return;
+            const pi=settings.sbPads.findIndex(p=>p&&p.midiNote===note);
+            // A note that's mapped to a pad ALWAYS plays that pad — never treated as
+            // a hardware Record/Play transport trigger. This guarantees a bad/stray
+            // Record-Play mapping (e.g. accidentally learned from a pad note instead
+            // of the controller's actual transport button) can never hijack pad
+            // playback again, regardless of what got learned.
+            if (pi < 0) {
+                // Hardware Record/Play transport buttons (e.g. Launchkey Mini), if mapped.
+                if (_matchesTransport(settings.midiRecordMap, 'note', note)) { _loopRecordToggleFromMIDI(); return; }
+                if (_matchesTransport(settings.midiPlayMap, 'note', note)) { _loopPlayToggleFromMIDI(); return; }
+            }
+            // Note On — pad selection is the main trigger. "Enable synth" layers a
+            // synth tone as an EFFECT on top of whatever pad/key you hit (or plays
+            // alone if the note isn't mapped to a pad). synthNoteOn() already no-ops
+            // when settings.synthEnabled is off, so this is safe either way.
+            if (pi>=0) playPad(pi);
+            synthNoteOn(note, val);
+            _reportMidiActivity(note, pi);
+        } else if (type===0x80 || (type===0x90&&val===0)) {
+            // Note Off
+            synthNoteOff(note);
+            const pi=settings.sbPads.findIndex(p=>p&&p.midiNote===note&&p.loop);
+            if (pi>=0) stopPad(pi);
+        } else if (type===0xb0) {
+            if (note===123) { synthAllNotesOff(); return; }
+            if (typeof window.__xcMidiLearn === 'function' && window.__xcMidiLearn('cc', note)) return;
+            // Only trigger on the button-down value. Many controllers send a CC
+            // message BOTH when a transport button is pressed (val>0) AND when it
+            // is released (val===0) — without this guard, every press+release of
+            // a CC-mapped hardware Record/Play button toggled the loop twice in a
+            // row (start, then immediately stop again on release).
+            if (val > 0) {
+                if (_matchesTransport(settings.midiRecordMap, 'cc', note)) { _loopRecordToggleFromMIDI(); return; }
+                if (_matchesTransport(settings.midiPlayMap, 'cc', note)) { _loopPlayToggleFromMIDI(); return; }
+            }
+        }
+    }
+
+    function _matchesTransport(map, kind, number) {
+        return !!map && map.type === kind && map.number === number;
+    }
+
+    // Hardware Record button (e.g. Launchkey Mini transport): toggle recording
+    // on whichever track is currently recording/overdubbing (or armed, waiting
+    // for its quantize snap), or arm the first empty track (or overdub track 0
+    // if it's playing and none are empty).
+    function _loopRecordToggleFromMIDI() {
+        const activeIdx = _loops.findIndex(L => L.state === 'recording' || L.state === 'overdubbing' || L.state === 'armed-record' || L.state === 'armed-overdub');
+        if (activeIdx >= 0) { loopStopButton(activeIdx); return; }
+        const emptyIdx = _loops.findIndex(L => L.state === 'empty');
+        if (emptyIdx >= 0) { loopStartRecord(emptyIdx); return; }
+        if (_loops[0].state === 'playing') loopStartOverdub(0);
+    }
+    // Hardware Play button: play/stop every track that has a recorded loop together.
+    function _loopPlayToggleFromMIDI() {
+        const anyPlaying = _loops.some(L => L.state === 'playing' || L.state === 'overdubbing');
+        if (anyPlaying) { for (let i = 0; i < _LOOP_LAYERS; i++) loopStop(i); }
+        else { for (let i = 0; i < _LOOP_LAYERS; i++) if (_loops[i].buf) loopPlay(i); }
+    }
+
+
+    function _reportMidiActivity(note, matchedPadIndex) {
+        const el = document.getElementById('xfw-midi-lastnote');
+        if (!el) return;
+        el.textContent = matchedPadIndex >= 0
+            ? `Note ${note} (${_midiToName(note)}) → Pad ${matchedPadIndex+1}`
+            : `Note ${note} (${_midiToName(note)}) received — no pad mapped (right-click a pad → Learn)`;
+    }
+    const _MIDI_TYPE_NAMES = { 0x80:'Note Off', 0x90:'Note On', 0xa0:'Aftertouch', 0xb0:'CC', 0xc0:'Program', 0xd0:'Ch.Pressure', 0xe0:'Pitch Bend' };
+    function _reportRawMidi(type, chan, note, val) {
+        const el = document.getElementById('xfw-midi-raw');
+        if (!el) return;
+        const blocked = settings.midiChannel>0 && chan!==settings.midiChannel;
+        const name = _MIDI_TYPE_NAMES[type] || `0x${type.toString(16)}`;
+        el.textContent = `Raw: ${name} ch${chan} #${note} val${val}` + (blocked ? ` — blocked by channel filter (listening on ${settings.midiChannel})` : '');
+        el.style.color = blocked ? '#dc2626' : 'var(--xfw-muted)';
+    }
+
+    function paintMIDIDevices() {
+        const sel=document.getElementById('xfw-midi-device');
+        if (!sel) return;
+        const prev=sel.value;
+        sel.innerHTML='<option value="all">All MIDI inputs</option>';
+        if (_midiAccess) _midiAccess.inputs.forEach(inp=>{ const o=document.createElement('option'); o.value=inp.id; o.textContent=inp.name; sel.appendChild(o); });
+        if([...sel.options].some(o=>o.value===prev)) sel.value=prev;
+        const st=document.getElementById('xfw-midi-status');
+        if (st) {
+            if (!_midiAccess) {
+                st.textContent = 'MIDI not available — check browser permissions';
+            } else {
+                // List each input's NAME + connection state — e.g. some controllers
+                // (Novation Launchpad/Launchkey) expose extra "DAW"/control-surface
+                // ports alongside the real note-sending port; if the port your pads
+                // actually send on shows "closed"/"pending" here (instead of "open"),
+                // that's the port that isn't delivering to _onMIDIMsg.
+                const names = [];
+                _midiAccess.inputs.forEach(inp => names.push(`${inp.name} (${inp.connection})`));
+                st.textContent = `${_midiAccess.inputs.size} device(s): ${names.join(', ')}`;
+            }
+        }
+    }
+
+    // ── Looper (RC-505 Mk2-style Loop Station) ─────────────────────────────
+    // 5 independent tracks (like the Boss RC-505's 5 track buttons). Each has
+    // 4 explicit buttons instead of one overloaded multi-function pad (that
+    // was confusing since the same button meant different things depending
+    // on state): ● Record (fresh take from empty, or overdub on top of the
+    // current loop), ▶ Play (resume a stopped loop), ❚❚ Stop/Pause (ends
+    // whatever's active — recording/overdubbing/playback — keeping the loop),
+    // ✕ Clear (erases the loop, discarding an in-progress take if any is
+    // running). Tracks record the live mic+aux mix and loop on their own
+    // gain node into sbBus, so multiple tracks can play together to build up
+    // a beat/vocal round instead of a single overwritten loop.
+    const _LOOP_LAYERS = 5;
+    const _loops = Array.from({ length: _LOOP_LAYERS }, () => ({
+        rec: null, chunks: [], src: null, buf: null, gainNode: null,
+        state: 'empty', // 'empty' | 'armed-record' | 'recording' | 'playing' | 'armed-overdub' | 'overdubbing' | 'stopped'
+        autoStopTimer: null, armTimer: null,
+        recDeadline: null, recDurationMs: null, // known auto-stop end time, for the progress ring
+    }));
+
+    // Record/overdub progress ring: while a track has a KNOWN end time (auto-loop
+    // bar count set, or an overdub pass which is always exactly one loop-length),
+    // paint a --loop-progress (0→1) CSS var on its Record button so the ring
+    // drawn by .xfw-loop-btn-rec::before in overlay.css fills all the way
+    // around the button from start to finish — like the RC-505's segment
+    // LEDs, so you can see exactly when the take will end without a timer.
+    let _loopProgressRAF = null;
+    function _ensureLoopProgressRAF() {
+        if (_loopProgressRAF) return;
+        const tick = () => {
+            let anyActive = false;
+            for (let i = 0; i < _LOOP_LAYERS; i++) {
+                const L = _loops[i];
+                if ((L.state === 'recording' || L.state === 'overdubbing') && L.recDeadline) {
+                    anyActive = true;
+                    const total = L.recDurationMs || 1;
+                    const remaining = L.recDeadline - performance.now();
+                    const progress = Math.max(0, Math.min(1, 1 - remaining / total));
+                    const btn = document.querySelector(`[data-loop-rec="${i}"]`);
+                    if (btn) btn.style.setProperty('--loop-progress', progress);
+                }
+            }
+            _loopProgressRAF = anyActive ? requestAnimationFrame(tick) : null;
+        };
+        _loopProgressRAF = requestAnimationFrame(tick);
+    }
+
+    function _loopStatus(layer, msg) { const e = document.querySelector(`[data-loop-status="${layer}"]`); if (e) e.textContent = msg; }
+    function _loopTrackGain(layer) { return dbToLin((settings.loopGainDb || 0) + (settings.loopTrackGainDb[layer] || 0)); }
+
+    // Quantize: snaps the ACTUAL start of a recording/overdub to the tempo
+    // grid instead of starting the instant Record is pressed — since input is
+    // usually MIDI-triggered (hardware Record button / auto-loop), pressing a
+    // beat early/late would otherwise bake that timing error permanently into
+    // the loop. 'auto' resolves to 1/4 bar (one beat in 4/4) — e.g. a 4-bar
+    // auto-loop record snaps to the beat. Users can override per-track via
+    // the quantize dial in the UI (Off / Auto / 1/4 / 1/8 / 1/16 / 1/32).
+    function _resolveQuantizeDiv(layer) {
+        const q = settings.loopQuantize[layer];
+        if (q === 'off') return 0;
+        if (q === 'auto' || q == null) return 4;
+        return +q || 4;
+    }
+    function _quantizeLabel(layer) {
+        const q = settings.loopQuantize[layer];
+        if (q === 'off') return 'Off';
+        if (q === 'auto' || q == null) return 'Auto (1/4)';
+        return `1/${q}`;
+    }
+    // Milliseconds to wait (from right now) until the next grid line, using a
+    // clock anchored to the AudioContext's own time origin (ctx.currentTime=0)
+    // at the shared loopBpm — 0 means "start immediately" (quantize is Off).
+    function _quantizeDelayMs(divisor) {
+        if (!divisor) return 0;
+        const ctx = ensureAudioContext();
+        const secPerBar = (60 / (settings.loopBpm || 120)) * 4;
+        const unit = secPerBar / divisor;
+        const now = ctx.currentTime;
+        let next = Math.ceil(now / unit) * unit;
+        if (next - now < 0.005) next += unit; // avoid a near-0ms "immediate" snap right on the line
+        return Math.max(0, (next - now) * 1000);
+    }
+    function _cancelArm(layer) {
+        const L = _loops[layer];
+        if (L?.armTimer) { clearTimeout(L.armTimer); L.armTimer = null; }
+    }
+
+    async function loopStartRecord(layer) {
+        const L = _loops[layer];
+        if (!L || L.state !== 'empty') return;
+        await ensureProcessedStream();
+        if (!loopRecordStream) return;
+        const delayMs = _quantizeDelayMs(_resolveQuantizeDiv(layer));
+        if (delayMs <= 0) { _beginRecording(layer); return; }
+        L.state = 'armed-record';
+        _loopStatus(layer, `⏳ Waiting for downbeat… (${_quantizeLabel(layer)})`);
+        _updateLoopUI(layer);
+        L.armTimer = setTimeout(() => { L.armTimer = null; _beginRecording(layer); }, delayMs);
+    }
+
+    function _beginRecording(layer) {
+        const L = _loops[layer];
+        if (!L) return;
+        L.chunks = [];
+        try { L.rec = new MediaRecorder(loopRecordStream, { mimeType: 'audio/webm;codecs=opus' }); }
+        catch { L.rec = new MediaRecorder(loopRecordStream); }
+        L.rec.ondataavailable = e => { if (e.data.size > 0) L.chunks.push(e.data); };
+        L.rec.onstop = async () => {
+            if (L.autoStopTimer) { clearTimeout(L.autoStopTimer); L.autoStopTimer = null; }
+            const blob = new Blob(L.chunks, { type: L.rec.mimeType });
+            try {
+                L.buf = await ensureAudioContext().decodeAudioData(await blob.arrayBuffer());
+                L.state = 'stopped';
+                _loopStatus(layer, `Loop ready ⟳ ${L.buf.duration.toFixed(2)}s`);
+                // Auto-loop: if this track has a bar-length selected (not Manual),
+                // start looping playback immediately — one tap, hands-free.
+                if (settings.loopBars[layer]) loopPlay(layer);
+            } catch (e) { L.state = 'empty'; _loopStatus(layer, 'Record failed — retry'); }
+            _updateLoopUI(layer);
+        };
+        L.rec.start();
+        L.state = 'recording';
+        _loopStatus(layer, '● Recording…');
+        _updateLoopUI(layer);
+
+        // Auto-loop record: if a bar count is selected for this track, schedule
+        // an automatic stop after that many bars at the current BPM (4/4 time),
+        // so you can set a beat with a single tap instead of timing it yourself.
+        const bars = settings.loopBars[layer];
+        if (bars) {
+            const secPerBar = (60 / (settings.loopBpm || 120)) * 4;
+            const ms = Math.max(200, bars * secPerBar * 1000);
+            L.recDurationMs = ms;
+            L.recDeadline = performance.now() + ms;
+            L.autoStopTimer = setTimeout(() => loopStopRecord(layer), ms);
+            _ensureLoopProgressRAF();
+        } else {
+            // Manual (no bar count) recording has no known end time, so there's
+            // nothing to draw a fill-ring toward — the pulsing glow is the only
+            // indicator until you tap/hold to stop it yourself.
+            L.recDurationMs = null; L.recDeadline = null;
+        }
+    }
+
+    function loopStopRecord(layer) {
+        const L = _loops[layer];
+        if (L?.autoStopTimer) { clearTimeout(L.autoStopTimer); L.autoStopTimer = null; }
+        if (L?.rec && L.state === 'recording') { L.rec.stop(); _loopStatus(layer, 'Processing…'); }
+    }
+
+    // Sums two buffers sample-for-sample (clamped), padding the shorter one
+    // with silence — used to layer an overdub pass onto the existing loop.
+    function _mixAudioBuffers(bufA, bufB) {
+        const ctx = ensureAudioContext();
+        const length = Math.max(bufA.length, bufB.length);
+        const channels = Math.max(bufA.numberOfChannels, bufB.numberOfChannels);
+        const out = ctx.createBuffer(channels, length, bufA.sampleRate);
+        for (let ch = 0; ch < channels; ch++) {
+            const data = out.getChannelData(ch);
+            const a = bufA.getChannelData(Math.min(ch, bufA.numberOfChannels - 1));
+            const b = bufB.getChannelData(Math.min(ch, bufB.numberOfChannels - 1));
+            for (let i = 0; i < length; i++) {
+                const av = i < a.length ? a[i] : 0;
+                const bv = i < b.length ? b[i] : 0;
+                data[i] = Math.max(-1, Math.min(1, av + bv));
+            }
+        }
+        return out;
+    }
+
+    // Overdub: records one more full loop-length pass while the existing loop
+    // keeps playing, then mixes it into the loop buffer — exactly like the
+    // RC-505's OVERDUB behavior (additive, non-destructive, stays in the loop).
+    async function loopStartOverdub(layer) {
+        const L = _loops[layer];
+        if (!L?.buf || L.state !== 'playing') return;
+        await ensureProcessedStream();
+        if (!loopRecordStream) return;
+        const delayMs = _quantizeDelayMs(_resolveQuantizeDiv(layer));
+        if (delayMs <= 0) { _beginOverdub(layer); return; }
+        L.state = 'armed-overdub';
+        _loopStatus(layer, `⏳ Waiting for downbeat… (${_quantizeLabel(layer)})`);
+        _updateLoopUI(layer);
+        L.armTimer = setTimeout(() => { L.armTimer = null; _beginOverdub(layer); }, delayMs);
+    }
+
+    function _beginOverdub(layer) {
+        const L = _loops[layer];
+        if (!L?.buf) return;
+        L.chunks = [];
+        try { L.rec = new MediaRecorder(loopRecordStream, { mimeType: 'audio/webm;codecs=opus' }); }
+        catch { L.rec = new MediaRecorder(loopRecordStream); }
+        L.rec.ondataavailable = e => { if (e.data.size > 0) L.chunks.push(e.data); };
+        const baseBuf = L.buf;
+        L.rec.onstop = async () => {
+            if (L.autoStopTimer) { clearTimeout(L.autoStopTimer); L.autoStopTimer = null; }
+            const blob = new Blob(L.chunks, { type: L.rec.mimeType });
+            try {
+                const newBuf = await ensureAudioContext().decodeAudioData(await blob.arrayBuffer());
+                L.buf = _mixAudioBuffers(baseBuf, newBuf);
+            } catch (e) { console.warn('[XCaster] overdub decode failed', layer, e); }
+            L.state = 'stopped';
+            _loopStatus(layer, `Loop ready ⟳ ${L.buf.duration.toFixed(2)}s`);
+            loopPlay(layer); // resume, phase-aligned from the top of the merged loop
+            _updateLoopUI(layer);
+        };
+        // Restart playback right now from the top so what you hear (and what
+        // gets captured) is phase-aligned with the new overdub pass.
+        _restartLoopSource(layer);
+        L.rec.start();
+        L.state = 'overdubbing';
+        _loopStatus(layer, `◑ Overdubbing ⟳ ${baseBuf.duration.toFixed(2)}s`);
+        _updateLoopUI(layer);
+        const ms = Math.max(200, baseBuf.duration * 1000);
+        L.recDurationMs = ms;
+        L.recDeadline = performance.now() + ms;
+        L.autoStopTimer = setTimeout(() => loopStopOverdub(layer), ms);
+        _ensureLoopProgressRAF();
+    }
+
+    function loopStopOverdub(layer) {
+        const L = _loops[layer];
+        if (L?.autoStopTimer) { clearTimeout(L.autoStopTimer); L.autoStopTimer = null; }
+        if (L?.rec && L.state === 'overdubbing') { L.rec.stop(); _loopStatus(layer, 'Processing…'); }
+    }
+
+    // (Re)starts the loop's buffer source from t=0 without touching state/status text.
+    function _restartLoopSource(layer) {
+        const L = _loops[layer];
+        if (!L?.buf) return;
+        if (L.src) { try { L.src.stop(); } catch {} L.src = null; }
+        const ctx = ensureAudioContext();
+        if (!L.gainNode) { L.gainNode = ctx.createGain(); if (sbBus) L.gainNode.connect(sbBus); }
+        L.gainNode.gain.value = _loopTrackGain(layer);
+        L.src = ctx.createBufferSource();
+        L.src.buffer = L.buf; L.src.loop = true;
+        L.src.connect(L.gainNode); L.src.start();
+    }
+
+    function loopPlay(layer) {
+        const L = _loops[layer];
+        if (!L?.buf) return;
+        _restartLoopSource(layer);
+        L.state = 'playing';
+        _loopStatus(layer, `▶ Looping ⟳ ${L.buf.duration.toFixed(2)}s`);
+        _updateLoopUI(layer);
+    }
+
+    function loopStop(layer) {
+        const L = _loops[layer];
+        if (!L) return;
+        if (L.src) { try { L.src.stop(); } catch {} L.src = null; }
+        L.state = L.buf ? 'stopped' : 'empty';
+        _loopStatus(layer, L.buf ? `Loop ready ⟳ ${L.buf.duration.toFixed(2)}s` : 'No loop recorded');
+        _updateLoopUI(layer);
+    }
+
+    function loopClear(layer) {
+        const L = _loops[layer];
+        if (!L) return;
+        _cancelArm(layer);
+        // If a take is actively being recorded/overdubbed, discard it instead of
+        // finishing and saving it — detach the recorder's handlers first so its
+        // async onstop (decode + save) never runs on the truncated audio.
+        if (L.rec && (L.state === 'recording' || L.state === 'overdubbing')) {
+            if (L.autoStopTimer) { clearTimeout(L.autoStopTimer); L.autoStopTimer = null; }
+            try { L.rec.ondataavailable = null; L.rec.onstop = null; L.rec.stop(); } catch {}
+            L.rec = null; L.chunks = [];
+        }
+        loopStop(layer);
+        L.buf = null; L.state = 'empty';
+        L.recDeadline = null; L.recDurationMs = null;
+        _loopStatus(layer, 'No loop recorded');
+        _updateLoopUI(layer);
+    }
+
+    function loopStopAllPlaying() { for (let i = 0; i < _LOOP_LAYERS; i++) loopStop(i); }
+    function loopClearAll() { for (let i = 0; i < _LOOP_LAYERS; i++) loopClear(i); }
+
+    // Four explicit transport buttons per track (replaces the old single
+    // multi-function pad, which was confusing since the SAME button meant
+    // different things depending on state):
+    //   ● Record — starts a fresh recording on an empty track, or overdubs on
+    //     top of the current loop while it's playing/stopped.
+    //   ▶ Play — resumes a stopped loop.
+    //   ❚❚ Stop/Pause — stops whatever is currently active (recording,
+    //     overdubbing, or playback), keeping the recorded loop intact.
+    //   ✕ Clear — erases the loop on this track completely (discards an
+    //     in-progress take too, if one is running).
+    function loopRecordButton(layer) {
+        const L = _loops[layer];
+        if (!L) return;
+        if (L.state === 'empty') { loopStartRecord(layer); return; }
+        if (L.state === 'playing') { loopStartOverdub(layer); return; }
+        if (L.state === 'stopped') { loopPlay(layer); loopStartOverdub(layer); return; }
+        // 'recording'/'overdubbing' — already in progress; use Stop to finish it.
+    }
+    function loopPlayButton(layer) {
+        const L = _loops[layer];
+        if (!L || L.state !== 'stopped') return;
+        loopPlay(layer);
+    }
+    function loopStopButton(layer) {
+        const L = _loops[layer];
+        if (!L) return;
+        if (L.state === 'armed-record') { _cancelArm(layer); L.state = 'empty'; _loopStatus(layer, 'No loop recorded'); _updateLoopUI(layer); return; }
+        if (L.state === 'armed-overdub') { _cancelArm(layer); L.state = 'playing'; _loopStatus(layer, `▶ Looping ⟳ ${L.buf.duration.toFixed(2)}s`); _updateLoopUI(layer); return; }
+        if (L.state === 'recording') { loopStopRecord(layer); return; }
+        if (L.state === 'overdubbing') { loopStopOverdub(layer); return; }
+        if (L.state === 'playing') { loopStop(layer); return; }
+    }
+    function loopClearButton(layer) { loopClear(layer); }
+
+    function _updateLoopUI(layer) {
+        const L = _loops[layer];
+        if (!L) return;
+        const recBtn = document.querySelector(`[data-loop-rec="${layer}"]`);
+        const playBtn = document.querySelector(`[data-loop-play="${layer}"]`);
+        const stopBtn = document.querySelector(`[data-loop-stop="${layer}"]`);
+        const clearBtn = document.querySelector(`[data-loop-clear="${layer}"]`);
+        const armed = L.state === 'armed-record' || L.state === 'armed-overdub';
+        const recording = L.state === 'recording' || L.state === 'overdubbing';
+        const playing = L.state === 'playing' || L.state === 'overdubbing';
+        if (recBtn) {
+            recBtn.classList.toggle('xfw-loop-active', recording);
+            recBtn.classList.toggle('xfw-loop-armed', armed);
+            recBtn.disabled = !(L.state === 'empty' || L.state === 'playing' || L.state === 'stopped');
+            recBtn.title = L.state === 'empty' ? 'Record a new loop'
+                : armed ? `Waiting for downbeat… (${_quantizeLabel(layer)})`
+                : recording ? 'Recording… use Stop/Pause to finish'
+                : 'Overdub on top of the current loop';
+            // Reset the fill-ring whenever a fresh recording/overdub pass starts (or
+            // ends) — _ensureLoopProgressRAF() will drive it back up from 0 while
+            // L.state stays 'recording'/'overdubbing' with a known recDeadline.
+            if (!recording) recBtn.style.setProperty('--loop-progress', 0);
+        }
+        if (playBtn) {
+            playBtn.classList.toggle('xfw-loop-active', playing);
+            playBtn.disabled = L.state !== 'stopped';
+        }
+        if (stopBtn) {
+            stopBtn.disabled = !(recording || armed || L.state === 'playing');
+        }
+        if (clearBtn) {
+            clearBtn.disabled = L.state === 'empty';
+        }
+        _setDisabled(`[data-bar-dial="${layer}"]`, L.state !== 'empty');
+        _setDisabled(`[data-quantize-dial="${layer}"]`, !(L.state === 'empty' || L.state === 'stopped' || L.state === 'playing'));
+    }
+    function _setDisabled(selector, dis) { const e = document.querySelector(selector); if (e) e.disabled = dis; }
+
 
     function applySinkToAudioContext(ctx) {
         if (!ctx) return;
@@ -212,6 +1738,8 @@
             // audio rendering thread scheduled even when the window is minimized.
             // Without it, background CPU throttling starves the DSP callbacks.
             installAudioKeepalive(audioCtx);
+            // Pre-load the pitch worklet so it is ready when autotune is first enabled.
+            ensurePitchWorklet(audioCtx).catch(() => {});
         }
         if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
         return audioCtx;
@@ -265,6 +1793,7 @@
         try { aux2MonitorGain && aux2MonitorGain.disconnect(); } catch {}
         try { xcastMonitorGain && xcastMonitorGain.disconnect(); } catch {}
         try { mixBus && mixBus.disconnect(); } catch {}
+        try { loopRecordBus && loopRecordBus.disconnect(); } catch {}
 
         // Per-channel input gains (with mute) and meters.
         micGainNode = ctx.createGain();
@@ -283,6 +1812,17 @@
         // Summing bus where all channels meet before the DSP chain.
         mixBus = ctx.createGain();
         mixBus.gain.value = 1;
+
+        // Loop Station recording tap (see declaration above) — independent of
+        // Cue/mixSend, so recording a loop always captures live mic/aux input.
+        loopRecordBus = ctx.createGain(); loopRecordBus.gain.value = 1;
+        loopRecordDest = ctx.createMediaStreamDestination();
+        loopRecordBus.connect(loopRecordDest);
+        loopRecordStream = loopRecordDest.stream;
+        micGainNode.connect(loopRecordBus);
+        auxGainNode.connect(loopRecordBus);
+        aux2GainNode.connect(loopRecordBus);
+        xcastGainNode.connect(loopRecordBus);
 
         // Headset monitor bus — separate destination so we can hear channels
         // in our headphones without sending the monitor mix back to X.
@@ -314,8 +1854,65 @@
         aux2MonitorGain.connect(monitorDest);
         xcastMonitorGain.connect(monitorDest);
 
+        // Soundboard bus — pads, synth voices, and looper all connect here.
+        if (sbBus)  { try { sbBus.disconnect();  } catch {} }
+        if (sbSourceBus)   { try { sbSourceBus.disconnect();   } catch {} }
+        if (sbGainNode)    { try { sbGainNode.disconnect();    } catch {} }
+        if (sbMixSend)     { try { sbMixSend.disconnect();     } catch {} }
+        if (sbMonitorGain) { try { sbMonitorGain.disconnect(); } catch {} }
+        if (sbAnalyser)    { try { sbAnalyser.disconnect();    } catch {} }
+        sbBus = ctx.createGain(); sbBus.gain.value = 1;
+        // Pads + synth (live-triggered sound, NOT existing loop tracks) also feed
+        // the Loop Station recording tap — otherwise hitting a pad/MIDI key while
+        // recording is perfectly audible live but never ends up in the recorded
+        // loop, since loopRecordBus previously only tapped mic/aux/xcast. Loop
+        // tracks intentionally do NOT connect here (they connect straight to
+        // sbBus below) so overdubbing a track doesn't re-capture its own already-
+        // recorded playback into the new take. Respects the Sounds channel Mute
+        // (like mic mute does for its own recording tap) via applyMixerLive().
+        sbSourceBus = ctx.createGain();
+        sbSourceBus.gain.value = settings.sbMuted ? 0 : 1;
+        sbSourceBus.connect(sbBus);
+        sbSourceBus.connect(loopRecordBus);
+        sbGainNode = ctx.createGain();
+        sbGainNode.gain.value = (settings.sbMuted || settings.sbGainDb <= -40) ? 0 : dbToLin(settings.sbGainDb);
+        sbMixSend = ctx.createGain(); sbMixSend.gain.value = settings.sbCue ? 0 : 1;
+        sbMonitorGain = ctx.createGain();
+        sbMonitorGain.gain.value = (settings.sbMonitor || settings.sbCue) ? 1 : 0;
+        sbAnalyser = ctx.createAnalyser(); sbAnalyser.fftSize = 1024;
+        sbBus.connect(sbGainNode);
+        sbGainNode.connect(sbAnalyser);
+        sbGainNode.connect(sbMixSend);
+        sbGainNode.connect(sbMonitorGain);
+        sbMixSend.connect(mixBus);
+        sbMonitorGain.connect(monitorDest);
+        // Reconnect synth to the new pad/synth source bus, and looper layers straight to sbBus.
+        if (_synthDest) { try { _synthDest.disconnect(); } catch {} _synthDest.connect(sbSourceBus); }
+        for (const L of _loops) {
+            if (L.gainNode) { try { L.gainNode.disconnect(); } catch {} L.gainNode.connect(sbBus); }
+        }
+
+        // Pitch / autotune node — inserted between mic source and mic gain.
+        if (pitchNode) { try { pitchNode.disconnect(); } catch {} pitchNode = null; }
+        if (settings.autotuneEnabled && _pitchWorkletLoaded) {
+            try {
+                pitchNode = new AudioWorkletNode(ctx, 'xcaster-pitch', {
+                    numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1],
+                });
+                updatePitchNode();
+            } catch (e) {
+                console.warn('[XCaster] pitch node create failed', e);
+                pitchNode = null;
+            }
+        }
+
         if (micSrcNode) {
-            micSrcNode.connect(micGainNode);
+            if (pitchNode) {
+                micSrcNode.connect(pitchNode);
+                pitchNode.connect(micGainNode);
+            } else {
+                micSrcNode.connect(micGainNode);
+            }
             micSrcNode.connect(micAnalyser);
             micGainNode.connect(micMixSend);
             micGainNode.connect(micMonitorGain);
@@ -473,6 +2070,20 @@
 
     function applyMixerLive() {
         if (micGainNode) micGainNode.gain.value = settings.micMuted ? 0 : dbToLin(settings.micGainDb);
+        // Also sync the WebRTC sender track.enabled so X's native UI stays in sync.
+        const micEnabled = !settings.micMuted;
+        for (const pc of __xfwPCs) {
+            try {
+                for (const s of pc.getSenders()) {
+                    if (s.track && s.track.kind === 'audio') s.track.enabled = micEnabled;
+                }
+            } catch { /* ignore */ }
+        }
+        if (sbGainNode)    sbGainNode.gain.value    = (settings.sbMuted || settings.sbGainDb <= -40) ? 0 : dbToLin(settings.sbGainDb);
+        if (sbSourceBus)   sbSourceBus.gain.value   = settings.sbMuted ? 0 : 1;
+        if (sbMixSend)     sbMixSend.gain.value     = settings.sbCue  ? 0 : 1;
+        if (sbMonitorGain) sbMonitorGain.gain.value = (settings.sbMonitor || settings.sbCue) ? 1 : 0;
+        if (_loops) for (let i = 0; i < _loops.length; i++) { if (_loops[i].gainNode) _loops[i].gainNode.gain.value = _loopTrackGain(i); }
         if (auxGainNode) auxGainNode.gain.value = settings.auxMuted ? 0 : dbToLin(settings.auxGainDb);
         if (aux2GainNode) aux2GainNode.gain.value = settings.aux2Muted ? 0 : dbToLin(settings.aux2GainDb);
         if (xcastGainNode) xcastGainNode.gain.value = settings.xcastMuted ? 0 : dbToLin(settings.xcastGainDb);
@@ -878,7 +2489,10 @@
             try {
                 for (const sender of pc.getSenders()) {
                     if (sender.track && sender.track.kind === 'audio') {
+                        // Preserve the mute state X or the host applied to the current track.
+                        const wasEnabled = sender.track.enabled;
                         const t = newTrack.clone();
+                        t.enabled = wasEnabled; // keep existing mute state
                         // Disable APM so Chrome's AGC doesn't pump the level.
                         t.applyConstraints({ autoGainControl: false, noiseSuppression: false, echoCancellation: false }).catch(() => {});
                         sender.replaceTrack(t);
@@ -1080,6 +2694,26 @@
             await ensureXOutputCtx();
             applySinkToAllContexts();
             document.querySelectorAll('audio, video').forEach(registerMedia);
+            // Sync XCaster mic-mute panel state with X's native mute button.
+            // X may set sender.track.enabled = false when the user/host mutes;
+            // we detect that here and reflect it in the panel toggle.
+            for (const pc of __xfwPCs) {
+                try {
+                    for (const s of pc.getSenders()) {
+                        if (s.track && s.track.kind === 'audio') {
+                            const xMuted = !s.track.enabled;
+                            if (xMuted !== settings.micMuted) {
+                                settings.micMuted = xMuted;
+                                saveSettings(settings);
+                                if (micGainNode) micGainNode.gain.value = xMuted ? 0 : dbToLin(settings.micGainDb);
+                                paintToggles();
+                            }
+                            break;
+                        }
+                    }
+                } catch { /* ignore */ }
+                break; // only check the first active PC
+            }
         }, 2000);
     }
 
@@ -1153,7 +2787,7 @@
         <div id="xfw-panel" role="dialog" aria-label="XCaster audio">
             <div class="xfw-header">
                 <div class="xfw-title">XCaster</div>
-                <div class="xfw-version">v1.2.0</div>
+                <div class="xfw-version">v1.3.0</div>
             </div>
 
             <!-- PERSISTENT METERS (always visible) -->
@@ -1162,6 +2796,7 @@
                 <div class="xfw-meter-row"><div class="xfw-meter-label">Aux 1</div><div class="xfw-meter"><div id="xfw-meter-aux" class="xfw-meter-fill"></div></div></div>
                 <div class="xfw-meter-row"><div class="xfw-meter-label">Aux 2</div><div class="xfw-meter"><div id="xfw-meter-aux2" class="xfw-meter-fill"></div></div></div>
                 <div class="xfw-meter-row"><div class="xfw-meter-label">xCast</div><div class="xfw-meter"><div id="xfw-meter-xcast" class="xfw-meter-fill"></div></div></div>
+                <div class="xfw-meter-row"><div class="xfw-meter-label">Sounds</div><div class="xfw-meter"><div id="xfw-meter-sb" class="xfw-meter-fill"></div></div></div>
                 <div class="xfw-meter-row"><div class="xfw-meter-label">Mix</div><div class="xfw-meter"><div id="xfw-meter-in" class="xfw-meter-fill"></div></div></div>
                 <div class="xfw-meter-row"><div class="xfw-meter-label">Out</div><div class="xfw-meter"><div id="xfw-meter-out" class="xfw-meter-fill"></div></div></div>
                 <div class="xfw-meter-row"><div class="xfw-meter-label">GR</div><div class="xfw-meter"><div id="xfw-meter-gr" class="xfw-gr-meter-fill"></div></div></div>
@@ -1172,9 +2807,11 @@
                 <button class="xfw-tab" data-pane="aux">Aux 1</button>
                 <button class="xfw-tab" data-pane="aux2">Aux 2</button>
                 <button class="xfw-tab" data-pane="xcast">xCaster</button>
+                <button class="xfw-tab" data-pane="sounds">Sounds</button>
                 <button class="xfw-tab" data-pane="spk">Speakers</button>
                 <button class="xfw-tab" data-pane="dsp">Processing</button>
                 <button class="xfw-tab" data-pane="pre">Presets</button>
+                <button class="xfw-tab" data-pane="fx">FX</button>
                 <button class="xfw-tab" data-pane="skin">Skin</button>
             </div>
 
@@ -1347,6 +2984,156 @@
                 </div>
             </div>
 
+            <!-- SOUNDS PANE: Soundboard / Synth / Looper -->
+            <div class="xfw-pane" data-pane="sounds">
+
+                <!-- channel strip -->
+                <div class="xfw-section">
+                    <label class="xfw-label">Sounds channel</label>
+                    <div class="xfw-row">
+                        <div>Mute sounds<span class="xfw-help">Silence all pads, synth and looper without stopping playback.</span></div>
+                        <div class="xfw-toggle" data-key="sbMuted"></div>
+                    </div>
+                    <div class="xfw-row">
+                        <div>Monitor in headset<span class="xfw-help">Hear sounds locally while broadcasting.</span></div>
+                        <div class="xfw-toggle" data-key="sbMonitor"></div>
+                    </div>
+                    <div class="xfw-row">
+                        <div>Cue (monitor only)<span class="xfw-help">Hear it in your headset but DON'T send to X. Use to preload/test sounds.</span></div>
+                        <div class="xfw-toggle" data-key="sbCue"></div>
+                    </div>
+                    <div class="xfw-slider-row" data-slider="sbGainDb" data-min="-40" data-max="12" data-step="0.5" data-suffix=" dB" data-label="Sounds level"></div>
+                    <div class="xfw-help" style="color:var(--xfw-muted);font-size:11px;">Drag all the way left to fully silence — one live slider for the whole Sounds channel.</div>
+                </div>
+
+                <!-- sub-tabs -->
+                <div class="xfw-tabs xfw-sub-tabs">
+                    <button class="xfw-tab xfw-sub-tab xfw-active" data-sub="pads">Pads</button>
+                    <button class="xfw-tab xfw-sub-tab" data-sub="synth">Synth</button>
+                    <button class="xfw-tab xfw-sub-tab" data-sub="looper">Looper</button>
+                </div>
+
+                <!-- PADS sub-pane -->
+                <div class="xfw-sub-pane xfw-active" data-sub="pads">
+                    <div class="xfw-section">
+                        <div class="xfw-row xfw-row-select">
+                            <div>MIDI input<span class="xfw-help">MIDI device used to trigger pads and play the synth.</span></div>
+                            <select id="xfw-midi-device" class="xfw-select xfw-select-sm"><option value="all">All inputs</option></select>
+                        </div>
+                        <div class="xfw-row xfw-row-select">
+                            <div>MIDI channel</div>
+                            <select id="xfw-midi-channel" class="xfw-select xfw-select-sm">
+                                <option value="0">All channels</option>
+                                <option value="1">Ch 1</option><option value="2">Ch 2</option>
+                                <option value="3">Ch 3</option><option value="4">Ch 4</option>
+                                <option value="5">Ch 5</option><option value="6">Ch 6</option>
+                                <option value="7">Ch 7</option><option value="8">Ch 8</option>
+                                <option value="9">Ch 9</option><option value="10">Ch 10</option>
+                                <option value="11">Ch 11</option><option value="12">Ch 12</option>
+                                <option value="13">Ch 13</option><option value="14">Ch 14</option>
+                                <option value="15">Ch 15</option><option value="16">Ch 16</option>
+                            </select>
+                        </div>
+                        <div id="xfw-midi-status" class="xfw-spk-status" style="margin-top:4px;font-size:11px;"></div>
+                        <div id="xfw-midi-lastnote" class="xfw-spk-status" style="margin-top:2px;font-size:11px;color:var(--xfw-muted);">Press a pad/key on your device to test…</div>
+                        <div id="xfw-midi-raw" class="xfw-spk-status" style="margin-top:2px;font-size:10px;color:var(--xfw-muted);opacity:0.85;"></div>
+                    </div>
+                    <div class="xfw-section">
+                        <label class="xfw-label">Default kits <span style="font-weight:400;font-size:11px;color:var(--xfw-muted)">(fills all 16 pads — like the sounds on X mobile)</span></label>
+                        <div class="xfw-buttons" style="gap:6px;flex-wrap:wrap;">
+                            <button class="xfw-btn xfw-kit-btn" data-kit="drums">🥁 Drum kit</button>
+                            <button class="xfw-btn xfw-kit-btn" data-kit="808">🔊 808 Kit</button>
+                            <button class="xfw-btn xfw-kit-btn" data-kit="lofi">📻 Lo-Fi Kit</button>
+                            <button class="xfw-btn xfw-kit-btn" data-kit="piano">🎹 Piano</button>
+                            <button class="xfw-btn xfw-kit-btn" data-kit="guitar">🎸 Guitar</button>
+                            <button class="xfw-btn xfw-kit-btn" data-kit="sfx">🎉 Sound FX</button>
+                            <button class="xfw-btn xfw-kit-btn" data-kit="synthkeys">🎛 Synth keys</button>
+                        </div>
+                    </div>
+                    <div class="xfw-section">
+                        <label class="xfw-label">Sample pads <span style="font-weight:400;font-size:11px;color:var(--xfw-muted)">(drag audio file onto pad · right-click to configure)</span></label>
+                        <div class="xfw-help" style="color:var(--xfw-muted);font-size:11px;">
+                            Pads open in a separate movable window so you can drag it anywhere on screen while you stream.
+                        </div>
+                        <div class="xfw-buttons" style="margin-top:8px;">
+                            <button id="xfw-show-pads-popup" class="xfw-btn xfw-primary">⧉ Show Pads window</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- SYNTH sub-pane -->
+                <div class="xfw-sub-pane" data-sub="synth">
+                    <div class="xfw-section">
+                        <div class="xfw-row">
+                            <div>Enable synth<span class="xfw-help">Route MIDI keyboard notes to the built-in synthesizer.</span></div>
+                            <div class="xfw-toggle" data-key="synthEnabled"></div>
+                        </div>
+                        <div class="xfw-row xfw-row-select">
+                            <div>Waveform</div>
+                            <select id="xfw-synth-wave" class="xfw-select xfw-select-sm">
+                                <option value="sawtooth">Sawtooth</option>
+                                <option value="square">Square</option>
+                                <option value="sine">Sine</option>
+                                <option value="triangle">Triangle</option>
+                            </select>
+                        </div>
+                        <div class="xfw-row xfw-row-select">
+                            <div>Octave</div>
+                            <select id="xfw-synth-octave" class="xfw-select xfw-select-sm">
+                                <option value="-2">-2</option><option value="-1">-1</option>
+                                <option value="0">0</option>
+                                <option value="1">+1</option><option value="2">+2</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="xfw-section">
+                        <label class="xfw-label">Presets</label>
+                        <div class="xfw-buttons" style="gap:6px;flex-wrap:wrap;">
+                            <button class="xfw-btn xfw-synth-preset-btn" data-synth-preset="pluck">Pluck</button>
+                            <button class="xfw-btn xfw-synth-preset-btn" data-synth-preset="pad">Warm Pad</button>
+                            <button class="xfw-btn xfw-synth-preset-btn" data-synth-preset="bass">Bass</button>
+                            <button class="xfw-btn xfw-synth-preset-btn" data-synth-preset="lead">Lead</button>
+                        </div>
+                    </div>
+                    <div class="xfw-section">
+                        <label class="xfw-label">Envelope (ADSR)</label>
+                        <div class="xfw-slider-row" data-slider="synthAttackMs"  data-min="1"   data-max="2000" data-step="1"   data-suffix=" ms" data-label="Attack"></div>
+                        <div class="xfw-slider-row" data-slider="synthDecayMs"   data-min="1"   data-max="2000" data-step="1"   data-suffix=" ms" data-label="Decay"></div>
+                        <div class="xfw-slider-row" data-slider="synthSustain"   data-min="0"   data-max="1"    data-step="0.01" data-suffix=""    data-label="Sustain"></div>
+                        <div class="xfw-slider-row" data-slider="synthReleaseMs" data-min="10"  data-max="5000" data-step="10"  data-suffix=" ms" data-label="Release"></div>
+                    </div>
+                    <div class="xfw-section">
+                        <label class="xfw-label">Filter (lowpass)</label>
+                        <div class="xfw-slider-row" data-slider="synthFilterHz" data-min="200" data-max="20000" data-step="50" data-suffix=" Hz" data-label="Cutoff"></div>
+                        <div class="xfw-slider-row" data-slider="synthFilterQ"  data-min="0.1" data-max="20"    data-step="0.1" data-suffix=""    data-label="Resonance"></div>
+                        <div class="xfw-slider-row" data-slider="synthGainDb"   data-min="-40" data-max="0"     data-step="0.5" data-suffix=" dB" data-label="Gain"></div>
+                    </div>
+                    <div class="xfw-section">
+                        <div class="xfw-row">
+                            <div>Velocity sensitive<span class="xfw-help">Louder keys play louder.</span></div>
+                            <div class="xfw-toggle" data-key="midiVelocitySensitive"></div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- LOOPER sub-pane -->
+                <div class="xfw-sub-pane" data-sub="looper">
+                    <div class="xfw-section">
+                        <label class="xfw-label">Loop Station (RC-505 Mk2-style)</label>
+                        <div class="xfw-help" style="color:var(--xfw-muted);font-size:11px;margin-bottom:8px;">
+                            5 independent tracks record your live mic+aux mix and stack together — tap a track pad to Record, tap again to stop &amp; loop, tap again to Overdub a layer on top, just like a Boss RC-505. Opens in a separate movable window.
+                        </div>
+                        <div class="xfw-buttons">
+                            <button id="xfw-show-loop-popup" class="xfw-btn xfw-primary">⧉ Show Loop Station</button>
+                        </div>
+                    </div>
+                    <div class="xfw-section">
+                        <div class="xfw-slider-row" data-slider="loopGainDb" data-min="-40" data-max="12" data-step="0.5" data-suffix=" dB" data-label="Master level"></div>
+                    </div>
+                </div>
+
+            </div>
+
             <!-- DSP PANE -->
             <div class="xfw-pane" data-pane="dsp">
                 <div class="xfw-section">
@@ -1397,6 +3184,50 @@
                 </div>
             </div>
 
+            <!-- FX PANE: Autotune / Pitch Shift -->
+            <div class="xfw-pane" data-pane="fx">
+                <div class="xfw-section">
+                    <label class="xfw-label">Pitch Shift</label>
+                    <div class="xfw-row">
+                        <div>Enable pitch FX<span class="xfw-help">Inserts a real-time pitch shifter / autotune on your mic signal.</span></div>
+                        <div class="xfw-toggle" data-key="autotuneEnabled"></div>
+                    </div>
+                    <div class="xfw-slider-row" data-slider="pitchShiftSemitones" data-min="-12" data-max="12" data-step="0.5" data-suffix=" st" data-label="Pitch shift (semitones)"></div>
+                    <div class="xfw-help" style="margin-top:6px;color:var(--xfw-muted);font-size:11px;">
+                        Shifts your voice up or down by the given number of semitones. 0 = no shift. Works in real time with ~43 ms latency.
+                    </div>
+                </div>
+                <div class="xfw-section">
+                    <label class="xfw-label">Auto-Tune (snap to scale)</label>
+                    <div class="xfw-row">
+                        <div>Auto-correct pitch<span class="xfw-help">Detects your voice pitch and snaps it to the nearest note in the selected scale — T-Pain / pitch-correction style.</span></div>
+                        <div class="xfw-toggle" data-key="autotuneAuto"></div>
+                    </div>
+                    <div class="xfw-row xfw-row-select">
+                        <div>Key<span class="xfw-help">Root note of the scale to snap to.</span></div>
+                        <select id="xfw-at-key" class="xfw-select xfw-select-sm"></select>
+                    </div>
+                    <div class="xfw-row xfw-row-select">
+                        <div>Scale<span class="xfw-help">Which notes in the key are valid targets.</span></div>
+                        <select id="xfw-at-scale" class="xfw-select xfw-select-sm">
+                            <option value="chromatic">Chromatic (all 12)</option>
+                            <option value="major">Major</option>
+                            <option value="minor">Minor</option>
+                            <option value="pentatonic">Pentatonic</option>
+                        </select>
+                    </div>
+                    <div class="xfw-slider-row" data-slider="autotuneStrength" data-min="0" data-max="1" data-step="0.05" data-suffix="" data-label="Correction strength"></div>
+                    <div class="xfw-help" style="margin-top:6px;color:var(--xfw-muted);font-size:11px;">
+                        Strength 1.0 = hard snap (classic Auto-Tune). Lower values give subtle correction. When enabled, the Pitch shift slider above is ignored.
+                    </div>
+                </div>
+                <div class="xfw-section">
+                    <div class="xfw-help" style="color:var(--xfw-muted);font-size:11px;">
+                        <b>Note on Soundboard &amp; Emoji:</b> Emoji reactions and the soundboard in X Spaces use X’s native server-side API and should work normally. If emoji don’t appear, try reloading the page (Reload button above). The Soundboard broadcasts audio via the X mobile app’s WebRTC path; on web/desktop it currently plays locally only — this is an X platform limitation.
+                    </div>
+                </div>
+            </div>
+
             <!-- SKIN PANE -->
             <div class="xfw-pane" data-pane="skin">
                 <div class="xfw-section">
@@ -1427,6 +3258,89 @@
 
             <div class="xfw-status" id="xfw-status">
                 <span class="xfw-dot"></span>Audio engine ready.
+            </div>
+        </div>
+
+        <!-- PADS POPUP — movable window, shows automatically with the Sounds tab -->
+        <div id="xfw-pads-popup" class="xfw-popup" style="display:none;">
+            <div class="xfw-popup-header">
+                <span>🎛 Pads</span>
+            </div>
+            <div class="xfw-popup-body">
+                <div id="xfw-pad-grid" class="xfw-pad-grid"></div>
+                <div id="xfw-pad-editor" class="xfw-pad-editor" style="display:none">
+                    <div class="xfw-row"><b id="xfw-pe-title">Pad 1</b>
+                        <button id="xfw-pe-close" class="xfw-btn" style="padding:2px 8px;">✕</button>
+                    </div>
+                    <div class="xfw-row">
+                        <label>Name</label>
+                        <input id="xfw-pe-name" class="xfw-modal-input" style="flex:1;margin:0;" />
+                    </div>
+                    <div class="xfw-row xfw-row-select">
+                        <label>MIDI note</label>
+                        <select id="xfw-pe-note" class="xfw-select xfw-select-sm"></select>
+                        <button id="xfw-pe-learn" class="xfw-btn" style="margin-left:6px;">Learn…</button>
+                    </div>
+                    <div class="xfw-row">
+                        <label>Volume</label>
+                        <input id="xfw-pe-vol" type="range" min="0" max="1" step="0.05" style="flex:1;" />
+                        <span id="xfw-pe-vol-val" style="width:32px;text-align:right;font-size:12px;"></span>
+                    </div>
+                    <div class="xfw-row">
+                        <div>Loop<span class="xfw-help">Looping: hold note to play, release to stop.</span></div>
+                        <div class="xfw-toggle" id="xfw-pe-loop"></div>
+                    </div>
+                    <div class="xfw-row">
+                        <button id="xfw-pe-load" class="xfw-btn xfw-primary" style="flex:1;">Load audio file…</button>
+                        <button id="xfw-pe-clear" class="xfw-btn" style="margin-left:6px;">Clear</button>
+                    </div>
+                    <input id="xfw-pe-file" type="file" accept="audio/*" style="display:none;" />
+                </div>
+            </div>
+        </div>
+
+        <!-- LOOPER POPUP — RC-505 Mk2-style 5-track Loop Station, movable window,
+             shows automatically with the Sounds tab -->
+        <div id="xfw-loop-popup" class="xfw-popup" style="display:none;">
+            <div class="xfw-popup-header">
+                <span>🔁 Loop Station</span>
+            </div>
+            <div class="xfw-popup-body">
+                <div class="xfw-row">
+                    <div>Tempo<span class="xfw-help">Shared by every track's auto-loop dial. Tap TAP a few times to set it by feel.</span></div>
+                    <div style="display:flex;align-items:center;gap:6px;">
+                        <input id="xfw-loop-bpm" type="number" min="40" max="240" step="1" class="xfw-modal-input" style="width:52px;text-align:center;" />
+                        <span style="font-size:11px;color:var(--xfw-muted);">BPM</span>
+                        <button id="xfw-loop-tap-tempo" class="xfw-btn" style="flex:0 0 auto;padding:6px 10px;">TAP</button>
+                    </div>
+                </div>
+                <div class="xfw-buttons" style="gap:6px;flex-wrap:wrap;margin-bottom:6px;">
+                    <button id="xfw-loop-stop-all" class="xfw-btn" style="flex:1;">■ Stop All</button>
+                    <button id="xfw-loop-clear-all" class="xfw-btn" style="flex:1;">✕ Clear All</button>
+                </div>
+                <div class="xfw-buttons" style="gap:6px;flex-wrap:wrap;margin-bottom:6px;">
+                    <button id="xfw-learn-loop-record" class="xfw-btn" style="flex:1;">🎙 Learn Record</button>
+                    <button id="xfw-unlearn-loop-record" class="xfw-btn" style="flex:0 0 auto;padding:6px 8px;" title="Clear Record mapping">✕</button>
+                    <button id="xfw-learn-loop-play" class="xfw-btn" style="flex:1;">▶ Learn Play</button>
+                    <button id="xfw-unlearn-loop-play" class="xfw-btn" style="flex:0 0 auto;padding:6px 8px;" title="Clear Play mapping">✕</button>
+                </div>
+                <div id="xfw-loop-transport-status" class="xfw-spk-status" style="margin-bottom:8px;">Map your controller's Record/Play buttons (e.g. Launchkey Mini) to auto-loop hands-free.</div>
+                ${[0,1,2,3,4].map(n => `
+                <div class="xfw-loop-track" data-layer="${n}">
+                    <div class="xfw-loop-track-top">
+                        <div class="xfw-loop-track-badge" style="--track-color:${['#ef4444','#f59e0b','#22c55e','#3b82f6','#a855f7'][n]}">${n+1}</div>
+                        <div class="xfw-loop-btns">
+                            <button type="button" class="xfw-loop-btn xfw-loop-btn-rec" data-loop-rec="${n}" title="Record a new loop, or overdub on top of the current one">●</button>
+                            <button type="button" class="xfw-loop-btn xfw-loop-btn-play" data-loop-play="${n}" title="Play — resume the loop">▶</button>
+                            <button type="button" class="xfw-loop-btn xfw-loop-btn-stop" data-loop-stop="${n}" title="Stop/Pause">❚❚</button>
+                            <button type="button" class="xfw-loop-btn xfw-loop-btn-clear" data-loop-clear="${n}" title="Clear this loop completely">✕</button>
+                        </div>
+                        <button type="button" class="xfw-bar-dial" data-bar-dial="${n}" title="Auto-loop length in bars — click to cycle (Manual / 4 / 8 / 16 / 32 / 64)">16</button>
+                        <button type="button" class="xfw-quantize-dial" data-quantize-dial="${n}" title="Record/overdub start snap — click to cycle (Auto / Off / 1/4 / 1/8 / 1/16 / 1/32)">A</button>
+                    </div>
+                    <input type="range" class="xfw-loop-track-vol" data-track-vol="${n}" min="-40" max="12" step="0.5" title="Track ${n+1} level" />
+                    <div data-loop-status="${n}" class="xfw-spk-status">No loop recorded</div>
+                </div>`).join('')}
             </div>
         </div>`;
         document.documentElement.appendChild(root);
@@ -1462,7 +3376,8 @@
                 valSpan.textContent = formatVal(settings[key], suffix);
                 saveSettings(settings);
                 if (key === 'micGainDb' || key === 'auxGainDb' || key === 'aux2GainDb') applyMixerLive();
-                else if (key === 'xcastGainDb') applyMixerLive();
+                else if (key === 'xcastGainDb' || key === 'sbGainDb' || key === 'loopGainDb') applyMixerLive();
+                else if (key === 'synthAttackMs' || key === 'synthDecayMs' || key === 'synthReleaseMs') { /* live - no rebuild needed */ }
                 else applySettingsLive();
             });
         });
@@ -1574,6 +3489,34 @@
         paintToggles();
     }
 
+    // ── Synth (MIDI keyboard) presets ───────────────────────────────────────
+    const SYNTH_PRESETS = {
+        pluck: { synthWave: 'triangle', synthAttackMs: 5,   synthDecayMs: 180,  synthSustain: 0.15, synthReleaseMs: 200,  synthFilterHz: 6000,  synthFilterQ: 0.7, synthGainDb: -6 },
+        pad:   { synthWave: 'sawtooth', synthAttackMs: 400, synthDecayMs: 600,  synthSustain: 0.8,  synthReleaseMs: 1200, synthFilterHz: 2200,  synthFilterQ: 0.5, synthGainDb: -8 },
+        bass:  { synthWave: 'square',   synthAttackMs: 3,   synthDecayMs: 120,  synthSustain: 0.9,  synthReleaseMs: 150,  synthFilterHz: 900,   synthFilterQ: 2,   synthGainDb: -4, synthOctave: -1 },
+        lead:  { synthWave: 'sawtooth', synthAttackMs: 15,  synthDecayMs: 100,  synthSustain: 0.7,  synthReleaseMs: 250,  synthFilterHz: 9000,  synthFilterQ: 3,   synthGainDb: -6 },
+    };
+    function applySynthPreset(name) {
+        const p = SYNTH_PRESETS[name];
+        if (!p) return;
+        Object.assign(settings, p);
+        saveSettings(settings);
+        document.querySelectorAll('#xfw-panel [data-slider]').forEach(row => {
+            const key = row.getAttribute('data-slider');
+            const input = row.querySelector('input');
+            const val = row.querySelector('.xfw-val');
+            const suffix = row.getAttribute('data-suffix') || '';
+            if (input && key in settings) {
+                input.value = settings[key];
+                val.textContent = formatVal(settings[key], suffix);
+            }
+        });
+        const waveEl2 = document.getElementById('xfw-synth-wave');
+        if (waveEl2) waveEl2.value = settings.synthWave;
+        const octEl2 = document.getElementById('xfw-synth-octave');
+        if (octEl2 && 'synthOctave' in p) octEl2.value = settings.synthOctave;
+    }
+
     // ---------- meters -----------------------------------------------------
     let meterRaf = 0;
     function startMeters() {
@@ -1585,12 +3528,14 @@
         const auxFill = document.getElementById('xfw-meter-aux');
         const aux2Fill = document.getElementById('xfw-meter-aux2');
         const xcastFill = document.getElementById('xfw-meter-xcast');
+        const sbFill    = document.getElementById('xfw-meter-sb');
         const inBuf = inputAnalyser ? new Uint8Array(inputAnalyser.fftSize) : null;
         const outBuf = outputAnalyser ? new Uint8Array(outputAnalyser.fftSize) : null;
         const micBuf = micAnalyser ? new Uint8Array(micAnalyser.fftSize) : null;
         const auxBuf = auxAnalyser ? new Uint8Array(auxAnalyser.fftSize) : null;
         const aux2Buf = aux2Analyser ? new Uint8Array(aux2Analyser.fftSize) : null;
         const xcastBuf = xcastAnalyser ? new Uint8Array(xcastAnalyser.fftSize) : null;
+        const sbBuf    = sbAnalyser    ? new Uint8Array(sbAnalyser.fftSize)    : null;
         const tick = () => {
             if (micAnalyser && micFill && micBuf) {
                 micAnalyser.getByteTimeDomainData(micBuf);
@@ -1608,6 +3553,10 @@
                 xcastAnalyser.getByteTimeDomainData(xcastBuf);
                 xcastFill.style.width = peakPct(xcastBuf);
             } else if (xcastFill) { xcastFill.style.width = '0%'; }
+            if (sbAnalyser && sbFill && sbBuf) {
+                sbAnalyser.getByteTimeDomainData(sbBuf);
+                sbFill.style.width = peakPct(sbBuf);
+            } else if (sbFill) { sbFill.style.width = '0%'; }
             if (inputAnalyser && inFill && inBuf) {
                 inputAnalyser.getByteTimeDomainData(inBuf);
                 inFill.style.width = peakPct(inBuf);
@@ -1648,6 +3597,7 @@
             const alreadyOpen = panel.classList.contains('xfw-open');
             if (opening === alreadyOpen) {
                 if (opening) selectPane(paneName);
+                syncSoundsPopups(opening && !!panel.querySelector('.xfw-tab[data-pane="sounds"].xfw-active'));
                 return true;
             }
             panel.classList.toggle('xfw-open', opening);
@@ -1662,6 +3612,7 @@
                 startSinkScan();
             }
             if (opening) selectPane(paneName);
+            syncSoundsPopups(opening && !!panel.querySelector('.xfw-tab[data-pane="sounds"].xfw-active'));
             return true;
         }
 
@@ -1677,15 +3628,65 @@
             if (e.ctrlKey && e.key === ',') { e.preventDefault(); fab.click(); }
         });
 
-        // tabs
-        panel.querySelectorAll('.xfw-tab').forEach(t => {
+        // tabs (top-level only — sub-tabs like Pads/Synth/Looper are handled separately
+        // below; they must NOT match here or they'll wipe every pane's active state)
+        panel.querySelectorAll('.xfw-tab:not(.xfw-sub-tab)').forEach(t => {
             t.addEventListener('click', () => {
-                panel.querySelectorAll('.xfw-tab').forEach(x => x.classList.remove('xfw-active'));
+                panel.querySelectorAll('.xfw-tab:not(.xfw-sub-tab)').forEach(x => x.classList.remove('xfw-active'));
                 panel.querySelectorAll('.xfw-pane').forEach(x => x.classList.remove('xfw-active'));
                 t.classList.add('xfw-active');
                 panel.querySelector(`.xfw-pane[data-pane="${t.getAttribute('data-pane')}"]`).classList.add('xfw-active');
+                syncSoundsPopups(t.getAttribute('data-pane') === 'sounds');
             });
         });
+
+        // Pads / Looper popups — movable windows shown while the Sounds tab is active.
+        const padsPopup = document.getElementById('xfw-pads-popup');
+        const loopPopup = document.getElementById('xfw-loop-popup');
+        function showPadsPopup() { if (padsPopup) { padsPopup.style.display = 'block'; applyPadsPopupPos(); } }
+        function hidePadsPopup() { if (padsPopup) padsPopup.style.display = 'none'; }
+        function showLoopPopup() { if (loopPopup) { loopPopup.style.display = 'block'; applyLoopPopupPos(); } }
+        function hideLoopPopup() { if (loopPopup) loopPopup.style.display = 'none'; }
+        function syncSoundsPopups(soundsActive) {
+            if (soundsActive && panel.classList.contains('xfw-open')) {
+                if (settings.padsPopupOpen) showPadsPopup(); else hidePadsPopup();
+                if (settings.loopPopupOpen) showLoopPopup(); else hideLoopPopup();
+            } else {
+                hidePadsPopup();
+                hideLoopPopup();
+            }
+        }
+        window.__xcSyncSoundsPopups = () => {
+            const active = panel.querySelector('.xfw-tab[data-pane="sounds"]');
+            syncSoundsPopups(!!(active && active.classList.contains('xfw-active')));
+        };
+        const showPadsBtn = document.getElementById('xfw-show-pads-popup');
+        if (showPadsBtn) showPadsBtn.addEventListener('click', () => {
+            settings.padsPopupOpen = true; saveSettings(settings); showPadsPopup();
+        });
+        const showLoopBtn = document.getElementById('xfw-show-loop-popup');
+        if (showLoopBtn) showLoopBtn.addEventListener('click', () => {
+            settings.loopPopupOpen = true; saveSettings(settings); showLoopPopup();
+        });
+        // Note: no manual close (✕) button on these popup headers — the windows
+        // already auto-hide when you switch away from the Sounds tab (via
+        // syncSoundsPopups above), so a separate close control was redundant.
+        if (padsPopup) {
+            installDrag(padsPopup.querySelector('.xfw-popup-header'), {
+                getPos: () => settings.padsPopupPos,
+                setPos: (p) => { settings.padsPopupPos = p; saveSettings(settings); applyPadsPopupPos(); },
+                apply: applyPadsPopupPos,
+                target: padsPopup,
+            });
+        }
+        if (loopPopup) {
+            installDrag(loopPopup.querySelector('.xfw-popup-header'), {
+                getPos: () => settings.loopPopupPos,
+                setPos: (p) => { settings.loopPopupPos = p; saveSettings(settings); applyLoopPopupPos(); },
+                apply: applyLoopPopupPos,
+                target: loopPopup,
+            });
+        }
 
         // toggles
         panel.addEventListener('click', e => {
@@ -1756,9 +3757,489 @@
 
         paintXcastStatus();
 
+        // ── Sounds / MIDI / Looper wiring ────────────────────────────────────
+        // Sub-tab switching inside the Sounds pane
+        panel.querySelectorAll('.xfw-sub-tab').forEach(t => {
+            t.addEventListener('click', () => {
+                const sub = t.getAttribute('data-sub');
+                const soundsPane = panel.querySelector('.xfw-pane[data-pane="sounds"]');
+                if (!soundsPane) return;
+                soundsPane.querySelectorAll('.xfw-sub-tab').forEach(x => x.classList.remove('xfw-active'));
+                soundsPane.querySelectorAll('.xfw-sub-pane').forEach(x => x.classList.remove('xfw-active'));
+                t.classList.add('xfw-active');
+                const target = soundsPane.querySelector(`.xfw-sub-pane[data-sub="${sub}"]`);
+                if (target) target.classList.add('xfw-active');
+            });
+        });
+
+        // Build the 4×4 pad grid
+        function buildPadGrid() {
+            const grid = document.getElementById('xfw-pad-grid');
+            if (!grid || grid.childElementCount) return;
+            for (let i = 0; i < 16; i++) {
+                const pad = settings.sbPads[i];
+                const btn = document.createElement('button');
+                btn.className = 'xfw-pad';
+                btn.setAttribute('data-pad', i);
+                btn.style.setProperty('--pad-color', pad.color);
+                btn.title = `${pad.name} (MIDI: ${pad.midiNote})`;
+                btn.innerHTML = `<span class="xfw-pad-name">${pad.name}</span>`;
+                // Left-click: play / toggle
+                btn.addEventListener('click', () => {
+                    if (_padSources.has(i)) stopPad(i);
+                    else playPad(i);
+                });
+                // Right-click: open pad editor
+                btn.addEventListener('contextmenu', e => { e.preventDefault(); openPadEditor(i); });
+                // Drag-and-drop audio files
+                btn.addEventListener('dragover', e => { e.preventDefault(); btn.classList.add('xfw-pad-drag'); });
+                btn.addEventListener('dragleave', () => btn.classList.remove('xfw-pad-drag'));
+                btn.addEventListener('drop', async e => {
+                    e.preventDefault(); btn.classList.remove('xfw-pad-drag');
+                    const file = [...e.dataTransfer.files].find(f => f.type.startsWith('audio/'));
+                    if (file) await loadPadFile(i, file);
+                });
+                grid.appendChild(btn);
+            }
+        }
+        buildPadGrid();
+
+        // Load audio file into a pad
+        async function loadPadFile(index, file) {
+            const buf = await file.arrayBuffer();
+            await _padDB.put(`pad-${index}`, buf, file.name);
+            _padBufferCache.delete(index); // clear cached decode
+            settings.sbPads[index].name = file.name.replace(/\.[^.]+$/, '').slice(0, 20);
+            settings.sbPads[index].builtin = null; // custom sample replaces any built-in kit sound
+            saveSettings(settings);
+            const btn = document.querySelector(`[data-pad="${index}"]`);
+            if (btn) { btn.querySelector('.xfw-pad-name').textContent = settings.sbPads[index].name; btn.title = settings.sbPads[index].name; btn.classList.add('xfw-pad-loaded'); }
+            // Update editor if open for this pad
+            const editor = document.getElementById('xfw-pad-editor');
+            if (editor && editor.dataset.padIndex == index) openPadEditor(index);
+        }
+
+        // Pad editor
+        let _peIndex = -1;
+        function openPadEditor(index) {
+            _peIndex = index;
+            const pad = settings.sbPads[index];
+            const editor = document.getElementById('xfw-pad-editor');
+            if (!editor) return;
+            editor.dataset.padIndex = index;
+            editor.style.display = '';
+            document.getElementById('xfw-pe-title').textContent = `Pad ${index+1}`;
+            document.getElementById('xfw-pe-name').value = pad.name;
+            const noteEl = document.getElementById('xfw-pe-note');
+            if (noteEl && !noteEl.options.length) {
+                for (let n = 0; n < 128; n++) {
+                    const o = document.createElement('option');
+                    o.value = n;
+                    o.textContent = `${_NOTE_NAMES[n%12]}${Math.floor(n/12)-1} (${n})`;
+                    noteEl.appendChild(o);
+                }
+            }
+            if (noteEl) noteEl.value = pad.midiNote;
+            const volEl = document.getElementById('xfw-pe-vol');
+            const volVal = document.getElementById('xfw-pe-vol-val');
+            if (volEl) { volEl.value = pad.volume; if (volVal) volVal.textContent = Math.round(pad.volume*100)+'%'; }
+            const loopEl = document.getElementById('xfw-pe-loop');
+            if (loopEl) loopEl.classList.toggle('xfw-on', !!pad.loop);
+        }
+        window.__xcOpenPadEditor = openPadEditor;
+
+        const editorEl = document.getElementById('xfw-pad-editor');
+        if (editorEl) {
+            document.getElementById('xfw-pe-close').addEventListener('click', () => { editorEl.style.display='none'; _peIndex=-1; });
+            document.getElementById('xfw-pe-name').addEventListener('input', e => {
+                if (_peIndex<0) return;
+                settings.sbPads[_peIndex].name = e.target.value;
+                saveSettings(settings);
+                const btn=document.querySelector(`[data-pad="${_peIndex}"]`);
+                if (btn) btn.querySelector('.xfw-pad-name').textContent = e.target.value;
+            });
+            document.getElementById('xfw-pe-note').addEventListener('change', e => {
+                if (_peIndex<0) return;
+                settings.sbPads[_peIndex].midiNote = +e.target.value;
+                saveSettings(settings);
+            });
+            const learnBtn = document.getElementById('xfw-pe-learn');
+            if (learnBtn) {
+                const learnDefaultLabel = learnBtn.textContent;
+                learnBtn.addEventListener('click', async () => {
+                    if (_peIndex<0) return;
+                    learnBtn.textContent = 'Connecting…';
+                    learnBtn.disabled = true;
+                    await initMIDI(); // make sure MIDI access is requested if not already
+                    learnBtn.textContent = 'Waiting for note…';
+                    const targetIndex = _peIndex;
+                    // 8s auto-cancel so a Learn arm that's never completed (e.g. user
+                    // clicked away) can't sit armed and swallow a later note-on forever.
+                    let learnTimeoutId = setTimeout(() => {
+                        window.__xcMidiLearn = null;
+                        learnBtn.textContent = learnDefaultLabel;
+                        learnBtn.disabled = false;
+                    }, 8000);
+                    window.__xcMidiLearn = (kind, number) => {
+                        if (kind !== 'note') return false;
+                        clearTimeout(learnTimeoutId);
+                        settings.sbPads[targetIndex].midiNote = number;
+                        saveSettings(settings);
+                        const noteEl2 = document.getElementById('xfw-pe-note');
+                        if (noteEl2 && _peIndex === targetIndex) noteEl2.value = number;
+                        const btn = document.querySelector(`[data-pad="${targetIndex}"]`);
+                        if (btn) btn.title = `${settings.sbPads[targetIndex].name} (MIDI: ${number})`;
+                        learnBtn.textContent = learnDefaultLabel;
+                        learnBtn.disabled = false;
+                        window.__xcMidiLearn = null;
+                        return true; // swallow this note-on so it doesn't also fire the pad/synth
+                    };
+                });
+            }
+            const volEl2=document.getElementById('xfw-pe-vol');
+            const volVal2=document.getElementById('xfw-pe-vol-val');
+            if (volEl2) volEl2.addEventListener('input', e => {
+                if (_peIndex<0) return;
+                settings.sbPads[_peIndex].volume = +e.target.value;
+                if (volVal2) volVal2.textContent = Math.round(+e.target.value*100)+'%';
+                saveSettings(settings);
+            });
+            document.getElementById('xfw-pe-loop').addEventListener('click', () => {
+                if (_peIndex<0) return;
+                settings.sbPads[_peIndex].loop = !settings.sbPads[_peIndex].loop;
+                document.getElementById('xfw-pe-loop').classList.toggle('xfw-on', settings.sbPads[_peIndex].loop);
+                saveSettings(settings);
+            });
+            const fileInput = document.getElementById('xfw-pe-file');
+            document.getElementById('xfw-pe-load').addEventListener('click', () => fileInput.click());
+            fileInput.addEventListener('change', async () => {
+                if (_peIndex<0||!fileInput.files[0]) return;
+                await loadPadFile(_peIndex, fileInput.files[0]);
+                fileInput.value='';
+            });
+            document.getElementById('xfw-pe-clear').addEventListener('click', async () => {
+                if (_peIndex<0) return;
+                await _padDB.del(`pad-${_peIndex}`);
+                _padBufferCache.delete(_peIndex);
+                stopPad(_peIndex);
+                settings.sbPads[_peIndex].name = `Pad ${_peIndex+1}`;
+                settings.sbPads[_peIndex].builtin = null;
+                saveSettings(settings);
+                const btn=document.querySelector(`[data-pad="${_peIndex}"]`);
+                if (btn) { btn.querySelector('.xfw-pad-name').textContent=settings.sbPads[_peIndex].name; btn.classList.remove('xfw-pad-loaded'); }
+                openPadEditor(_peIndex);
+            });
+        }
+
+        // Synth controls
+        const waveEl = document.getElementById('xfw-synth-wave');
+        if (waveEl) {
+            waveEl.value = settings.synthWave || 'sawtooth';
+            waveEl.addEventListener('change', () => {
+                settings.synthWave = waveEl.value;
+                saveSettings(settings);
+                _synthVoices.forEach(v => { v.osc.type = settings.synthWave; });
+            });
+        }
+        const octaveEl = document.getElementById('xfw-synth-octave');
+        if (octaveEl) {
+            octaveEl.value = settings.synthOctave || 0;
+            octaveEl.addEventListener('change', () => {
+                synthAllNotesOff();
+                settings.synthOctave = +octaveEl.value;
+                saveSettings(settings);
+            });
+        }
+
+        // MIDI controls
+        const midiDevSel = document.getElementById('xfw-midi-device');
+        if (midiDevSel) midiDevSel.addEventListener('change', () => {
+            settings.midiDeviceId = midiDevSel.value;
+            saveSettings(settings);
+        });
+        const midiChanSel = document.getElementById('xfw-midi-channel');
+        if (midiChanSel) {
+            midiChanSel.value = settings.midiChannel || 0;
+            midiChanSel.addEventListener('change', () => {
+                settings.midiChannel = +midiChanSel.value;
+                saveSettings(settings);
+            });
+        }
+
+        // Loop Station track transport buttons: four explicit buttons per track
+        // — Record (●, new take or overdub), Play (▶, resume), Stop/Pause (❚❚,
+        // ends whatever is active), Clear (✕, erases the loop). These live in
+        // the separate Loop Station popup window, not inside #xfw-panel, so
+        // query the whole document.
+        document.querySelectorAll('[data-loop-rec]').forEach(btn => {
+            const layer = +btn.getAttribute('data-loop-rec');
+            btn.addEventListener('click', () => loopRecordButton(layer));
+        });
+        document.querySelectorAll('[data-loop-play]').forEach(btn => {
+            const layer = +btn.getAttribute('data-loop-play');
+            btn.addEventListener('click', () => loopPlayButton(layer));
+        });
+        document.querySelectorAll('[data-loop-stop]').forEach(btn => {
+            const layer = +btn.getAttribute('data-loop-stop');
+            btn.addEventListener('click', () => loopStopButton(layer));
+        });
+        document.querySelectorAll('[data-loop-clear]').forEach(btn => {
+            const layer = +btn.getAttribute('data-loop-clear');
+            btn.addEventListener('click', () => loopClearButton(layer));
+        });
+        for (let i = 0; i < _LOOP_LAYERS; i++) _updateLoopUI(i);
+
+        // Master Stop All / Clear All — like the RC-505's global stop + all-erase.
+        const loopStopAllBtn = document.getElementById('xfw-loop-stop-all');
+        if (loopStopAllBtn) loopStopAllBtn.addEventListener('click', () => loopStopAllPlaying());
+        const loopClearAllBtn = document.getElementById('xfw-loop-clear-all');
+        if (loopClearAllBtn) loopClearAllBtn.addEventListener('click', () => loopClearAll());
+
+        // Per-track level fader (like the RC-505's 5 physical track faders).
+        document.querySelectorAll('[data-track-vol]').forEach(input => {
+            const layer = +input.getAttribute('data-track-vol');
+            input.value = settings.loopTrackGainDb[layer] || 0;
+            input.addEventListener('input', () => {
+                settings.loopTrackGainDb[layer] = +input.value;
+                saveSettings(settings);
+                const L = _loops[layer];
+                if (L?.gainNode) L.gainNode.gain.value = _loopTrackGain(layer);
+            });
+        });
+
+        // Tempo (BPM) — shared by all 5 tracks' auto-loop bar-length dials.
+        const bpmEl = document.getElementById('xfw-loop-bpm');
+        if (bpmEl) {
+            bpmEl.value = settings.loopBpm || 120;
+            bpmEl.addEventListener('change', () => {
+                settings.loopBpm = Math.max(40, Math.min(240, +bpmEl.value || 120));
+                bpmEl.value = settings.loopBpm;
+                saveSettings(settings);
+            });
+        }
+
+        // Tap tempo — tap a few times in rhythm to set the BPM by feel, like
+        // the RC-505's press-and-hold tempo tap.
+        const tapBtn = document.getElementById('xfw-loop-tap-tempo');
+        if (tapBtn) {
+            let tapTimes = [];
+            tapBtn.addEventListener('click', () => {
+                const now = performance.now();
+                if (tapTimes.length && now - tapTimes[tapTimes.length - 1] > 2000) tapTimes = [];
+                tapTimes.push(now);
+                if (tapTimes.length > 5) tapTimes.shift();
+                if (tapTimes.length >= 2) {
+                    const intervals = [];
+                    for (let i = 1; i < tapTimes.length; i++) intervals.push(tapTimes[i] - tapTimes[i - 1]);
+                    const avgMs = intervals.reduce((a, b) => a + b, 0) / intervals.length;
+                    const bpm = Math.max(40, Math.min(240, Math.round(60000 / avgMs)));
+                    settings.loopBpm = bpm;
+                    saveSettings(settings);
+                    if (bpmEl) bpmEl.value = bpm;
+                }
+            });
+        }
+
+        // Bar-length dial (circular selector) per layer: click cycles
+        // Manual → 4 → 8 → 16 → 32 → 64 → Manual… When a bar count is set,
+        // Rec auto-stops after that many bars (at the current BPM) and
+        // immediately starts looping — one click, hands-free.
+        const _BAR_OPTIONS = [null, 4, 8, 16, 32, 64];
+        function _paintBarDial(layer) {
+            const btn = document.querySelector(`[data-bar-dial="${layer}"]`);
+            if (!btn) return;
+            const bars = settings.loopBars[layer];
+            btn.textContent = bars ? String(bars) : 'M';
+            btn.classList.toggle('xfw-bar-dial-on', !!bars);
+            btn.title = bars
+                ? `Auto-loop: ${bars} bars @ ${settings.loopBpm || 120} BPM — click to change`
+                : 'Manual — click to set an auto-loop bar length';
+        }
+        document.querySelectorAll('[data-bar-dial]').forEach(btn => {
+            const layer = +btn.getAttribute('data-bar-dial');
+            _paintBarDial(layer);
+            btn.addEventListener('click', () => {
+                const cur = settings.loopBars[layer] || null;
+                const idx = (_BAR_OPTIONS.indexOf(cur) + 1) % _BAR_OPTIONS.length;
+                settings.loopBars[layer] = _BAR_OPTIONS[idx];
+                saveSettings(settings);
+                _paintBarDial(layer);
+            });
+        });
+
+        // Quantize dial per layer: click cycles Auto (=1/4 bar) → Off → 1/4 →
+        // 1/8 → 1/16 → 1/32 → Auto… Snaps the ACTUAL start of Record/Overdub
+        // to this grid interval (at the shared BPM) instead of starting the
+        // instant the button/hardware key is pressed — important since input
+        // is usually MIDI-triggered and a beat early/late would otherwise be
+        // baked permanently into the loop.
+        const _QUANTIZE_OPTIONS = ['auto', 'off', 4, 8, 16, 32];
+        function _paintQuantizeDial(layer) {
+            const btn = document.querySelector(`[data-quantize-dial="${layer}"]`);
+            if (!btn) return;
+            const q = settings.loopQuantize[layer];
+            btn.textContent = q === 'auto' ? 'A' : (q === 'off' ? 'off' : `⅟${q}`);
+            btn.classList.toggle('xfw-quantize-dial-on', q !== 'off');
+            btn.title = `Record/overdub start snap: ${_quantizeLabel(layer)} — click to change`;
+        }
+        document.querySelectorAll('[data-quantize-dial]').forEach(btn => {
+            const layer = +btn.getAttribute('data-quantize-dial');
+            _paintQuantizeDial(layer);
+            btn.addEventListener('click', () => {
+                const cur = settings.loopQuantize[layer];
+                const idx = (_QUANTIZE_OPTIONS.indexOf(cur) + 1) % _QUANTIZE_OPTIONS.length;
+                settings.loopQuantize[layer] = _QUANTIZE_OPTIONS[idx];
+                saveSettings(settings);
+                _paintQuantizeDial(layer);
+            });
+        });
+
+        // Learn Record / Play transport buttons (e.g. Launchkey Mini hardware
+        // Record & Play keys) — captures the next MIDI note or CC and maps it.
+        // MIDI access is awaited BEFORE arming the listener, and the arm times
+        // out after 8s, so a stray later keypress/pad hit can never be mis-
+        // captured as the transport mapping (this was the root cause of pads
+        // triggering Record instead of playing — a pad note got learned by
+        // accident because the click handler armed listening immediately, even
+        // while MIDI access was still being requested).
+        function _paintTransportStatus() {
+            const status = document.getElementById('xfw-loop-transport-status');
+            if (!status) return;
+            const fmt = (m) => m ? `${m.type === 'note' ? 'note' : 'CC'} ${m.number}` : 'not set';
+            status.textContent = (settings.midiRecordMap || settings.midiPlayMap)
+                ? `Record: ${fmt(settings.midiRecordMap)} · Play: ${fmt(settings.midiPlayMap)}`
+                : `Map your controller's Record/Play buttons (e.g. Launchkey Mini) to auto-loop hands-free.`;
+        }
+        function _wireTransportLearn(btnId, settingsKey, label) {
+            const btn = document.getElementById(btnId);
+            if (!btn) return;
+            const defaultLabel = btnId === 'xfw-learn-loop-record' ? '🎙 Learn Record' : '▶ Learn Play';
+            btn.addEventListener('click', async () => {
+                btn.textContent = 'Connecting…';
+                btn.disabled = true;
+                await initMIDI();
+                btn.textContent = `Waiting for ${label}…`;
+                let timeoutId = setTimeout(() => {
+                    window.__xcMidiLearn = null;
+                    btn.textContent = defaultLabel;
+                    btn.disabled = false;
+                }, 8000);
+                window.__xcMidiLearn = (kind, number) => {
+                    clearTimeout(timeoutId);
+                    settings[settingsKey] = { type: kind, number };
+                    saveSettings(settings);
+                    _paintTransportStatus();
+                    btn.textContent = defaultLabel;
+                    btn.disabled = false;
+                    window.__xcMidiLearn = null;
+                    return true;
+                };
+            });
+        }
+        _wireTransportLearn('xfw-learn-loop-record', 'midiRecordMap', 'Record');
+        _wireTransportLearn('xfw-learn-loop-play', 'midiPlayMap', 'Play');
+        function _wireUnlearnTransport(btnId, settingsKey) {
+            const btn = document.getElementById(btnId);
+            if (!btn) return;
+            btn.addEventListener('click', () => {
+                settings[settingsKey] = null;
+                saveSettings(settings);
+                _paintTransportStatus();
+            });
+        }
+        _wireUnlearnTransport('xfw-unlearn-loop-record', 'midiRecordMap');
+        _wireUnlearnTransport('xfw-unlearn-loop-play', 'midiPlayMap');
+        _paintTransportStatus();
+
+        // Default kit buttons (Drums / Piano / Guitar / SFX / Synth keys)
+        panel.querySelectorAll('.xfw-kit-btn').forEach(btn => {
+            btn.addEventListener('click', () => loadKit(btn.getAttribute('data-kit')));
+        });
+
+        // Synth preset buttons
+        panel.querySelectorAll('.xfw-synth-preset-btn').forEach(btn => {
+            btn.addEventListener('click', () => applySynthPreset(btn.getAttribute('data-synth-preset')));
+        });
+
+        // Toggle handler: add soundboard-specific keys
+        // (These are caught by the generic toggle handler already via data-key.
+        //  Here we add extra side effects.)
+        panel.addEventListener('click', e => {
+            const t = e.target.closest('.xfw-toggle');
+            if (!t) return;
+            const key = t.getAttribute('data-key');
+            if (key === 'sbMuted' || key === 'sbMonitor' || key === 'sbCue') applyMixerLive();
+            if (key === 'synthEnabled' && settings.synthEnabled) initSynth();
+        });
+
+        // Init MIDI + warm up the shared audio graph on first open of the Sounds pane,
+        // so pads/synth are ready to make sound the moment a MIDI device is pressed.
+        let _midiInited = false;
+        panel.querySelectorAll('.xfw-tab[data-pane]').forEach(t => {
+            t.addEventListener('click', () => {
+                if (t.getAttribute('data-pane')==='sounds' && !_midiInited) {
+                    _midiInited = true;
+                    initMIDI();
+                    ensureProcessedStream().catch(()=>{});
+                }
+            });
+        });
+
         // presets
         panel.querySelectorAll('.xfw-preset').forEach(b => {
             b.addEventListener('click', () => applyPreset(b.getAttribute('data-preset')));
+        });
+
+        // ── FX / Autotune wiring ────────────────────────────────────────────
+        // Populate key selector
+        const atKey = document.getElementById('xfw-at-key');
+        if (atKey) {
+            _NOTE_NAMES.forEach((n, i) => {
+                const o = document.createElement('option');
+                o.value = i; o.textContent = n;
+                atKey.appendChild(o);
+            });
+            atKey.value = settings.autotuneKey || 0;
+            atKey.addEventListener('change', () => {
+                settings.autotuneKey = +atKey.value;
+                saveSettings(settings);
+                updatePitchNode();
+            });
+        }
+
+        const atScale = document.getElementById('xfw-at-scale');
+        if (atScale) {
+            atScale.value = 'major'; // default shown
+            atScale.addEventListener('change', () => {
+                const def = _AUTOTUNE_SCALES[atScale.value] || _AUTOTUNE_SCALES.chromatic;
+                settings.autotuneScale = def; // store for reload
+                saveSettings(settings);
+                if (pitchNode) pitchNode.port.postMessage({ scale: def });
+            });
+        }
+
+        // When autotuneEnabled toggle fires, rebuild graph to insert/remove the node.
+        const _origToggleHandler = panel.onclick;
+        panel.addEventListener('click', e => {
+            const t = e.target.closest('.xfw-toggle');
+            if (!t) return;
+            const key = t.getAttribute('data-key');
+            if (key === 'autotuneEnabled') {
+                // Ensure worklet is loaded, then rebuild.
+                if (settings.autotuneEnabled && audioCtx) {
+                    ensurePitchWorklet(audioCtx).then(() => {
+                        buildGraph();
+                        replaceTracksOnActivePCs();
+                    }).catch(() => {});
+                } else {
+                    if (pitchNode) { try { pitchNode.disconnect(); } catch {} pitchNode = null; }
+                    buildGraph();
+                    replaceTracksOnActivePCs();
+                }
+            }
+            if (key === 'autotuneAuto') {
+                updatePitchNode();
+            }
         });
 
         // bottom buttons
@@ -1778,9 +4259,13 @@
             resetBtn.addEventListener('click', () => {
                 settings.fabPos = null;
                 settings.panelPos = null;
+                settings.padsPopupPos = null;
+                settings.loopPopupPos = null;
                 saveSettings(settings);
                 applyFabPos();
                 applyPanelPos();
+                applyPadsPopupPos();
+                applyLoopPopupPos();
             });
         }
 
@@ -1905,6 +4390,26 @@
         panel.style.top = clamp(p.y, 0, window.innerHeight - Math.min(h, window.innerHeight)) + 'px';
         panel.style.right = 'auto';
         panel.style.bottom = 'auto';
+    }
+
+    function _applyFloatingPopupPos(id, pos, defaultLeft, defaultTop) {
+        const el = document.getElementById(id);
+        if (!el) return;
+        const p = pos;
+        const w = el.offsetWidth || 220;
+        const h = el.offsetHeight || 260;
+        const x = p ? p.x : defaultLeft;
+        const y = p ? p.y : defaultTop;
+        el.style.left = clamp(x, 0, window.innerWidth - Math.min(w, window.innerWidth)) + 'px';
+        el.style.top = clamp(y, 0, window.innerHeight - Math.min(h, window.innerHeight)) + 'px';
+        el.style.right = 'auto';
+        el.style.bottom = 'auto';
+    }
+    function applyPadsPopupPos() {
+        _applyFloatingPopupPos('xfw-pads-popup', settings.padsPopupPos, 24, 90);
+    }
+    function applyLoopPopupPos() {
+        _applyFloatingPopupPos('xfw-loop-popup', settings.loopPopupPos, 300, 90);
     }
 
     function installDrag(handle, opts) {

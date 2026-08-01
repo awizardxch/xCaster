@@ -128,10 +128,27 @@ function enforceNoThrottleOnWebContents(contents) {
     try { contents.setFrameRate(60); } catch {}
 }
 
+// Let a hidden/background view be throttled normally again. Only the
+// currently VISIBLE x.com BrowserView should ever be forced to full power —
+// forcing every hidden X tab to run unthrottled at 60fps forever is what was
+// causing the app to slow down / freeze after a while (each background X tab
+// kept burning full CPU+GPU indefinitely, competing with the active one).
+function allowThrottleOnWebContents(contents) {
+    if (!contents || contents.isDestroyed()) return;
+    try { contents.setBackgroundThrottling(true); } catch {}
+}
+
 function enforceNoThrottleOnAllViews() {
     if (mainWindow?.webContents) enforceNoThrottleOnWebContents(mainWindow.webContents);
+    const visible = mainWindow ? new Set(mainWindow.getBrowserViews()) : new Set();
     for (const [, view] of xViews) {
-        if (view?.webContents) enforceNoThrottleOnWebContents(view.webContents);
+        if (!view?.webContents) continue;
+        if (visible.has(view)) {
+            enforceNoThrottleOnWebContents(view.webContents);
+        } else {
+            // Hidden X tab — let Chromium deprioritize it like any background page.
+            allowThrottleOnWebContents(view.webContents);
+        }
     }
 }
 
@@ -158,7 +175,7 @@ function createWindow() {
     // Grant media / notification permissions for all sites loaded in this trusted browser.
     // The user explicitly chose to open a site in XCaster, so we treat every tab as trusted.
     session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
-        const allowed = ['media', 'notifications', 'geolocation', 'pointerLock', 'clipboard-read', 'clipboard-sanitized-write'];
+        const allowed = ['media', 'notifications', 'geolocation', 'pointerLock', 'clipboard-read', 'clipboard-sanitized-write', 'midi', 'midiSysex'];
         callback(allowed.includes(permission));
     });
 
@@ -326,9 +343,10 @@ function createWindow() {
                         dialog.showMessageBox(mainWindow, {
                             type: 'info',
                             title: 'About XCaster',
-                            message: 'XCaster v1.2.0',
+                            message: 'XCaster v1.3.0',
                             detail:
                                 'Standalone Windows shell for x.com with WebRTC AGC, noise suppression, and echo cancellation disabled.\n\n' +
+                                'v1.3.0 — Loop Station overhaul: fixed silent/incomplete recordings, MIDI transport double-trigger, pads/synth not captured in loops, redesigned the 4-button Record/Play/Stop/Clear transport, and added quantized (snap-to-beat) recording start with a per-track resolution dial.\n\n' +
                                 'v1.0.1 — Full multi-channel DSP mixer (Mic + Aux 1 + Aux 2 + xCaster), dual output routing (X Spaces injection + monitor/cue), reapply audio graph for clean channel selection, virtual cable auto-installer, compressor, limiter, EQ, background skin, and live meters.\n\n' +
                                 'Built for X Spaces streamers who need clean, professional audio.',
                         });
@@ -447,8 +465,10 @@ function getXViewBounds() {
     return { x: 0, y: TOOLBAR_HEIGHT, width: w, height: Math.max(0, h - TOOLBAR_HEIGHT) };
 }
 
-ipcMain.handle('xfw:create-xview', (_e, tabId, url) => {
-    if (xViews.has(tabId)) return { ok: true };
+// Last-known URL per tab, used to reload a fresh BrowserView after a crash.
+const xViewLastURL = new Map();
+
+function createXViewInternal(tabId, url) {
     const view = new BrowserView({
         webPreferences: {
             preload: path.join(__dirname, 'preload.js'), // v0.5.0 preload — direct injection
@@ -468,8 +488,8 @@ ipcMain.handle('xfw:create-xview', (_e, tabId, url) => {
     const fwd = (type, data) => {
         try { mainWindow.webContents.send('xfw:xview-event', tabId, type, data); } catch {}
     };
-    view.webContents.on('did-navigate', (_e, u) => fwd('navigate', u));
-    view.webContents.on('did-navigate-in-page', (_e, u, isMain) => { if (isMain) fwd('navigate', u); });
+    view.webContents.on('did-navigate', (_e, u) => { xViewLastURL.set(tabId, u); fwd('navigate', u); });
+    view.webContents.on('did-navigate-in-page', (_e, u, isMain) => { if (isMain) { xViewLastURL.set(tabId, u); fwd('navigate', u); } });
     view.webContents.on('did-start-loading', () => fwd('loading', true));
     view.webContents.on('did-stop-loading', () => {
         enforceNoThrottleOnWebContents(view.webContents);
@@ -478,6 +498,29 @@ ipcMain.handle('xfw:create-xview', (_e, tabId, url) => {
     });
     view.webContents.on('page-title-updated', (_e, title) => fwd('title', title));
     view.webContents.on('page-favicon-updated', (_e, favicons) => fwd('favicon', favicons[0] || null));
+
+    // ── Crash / hang recovery ────────────────────────────────────────────────
+    // X is a resource-heavy site; its renderer can become unresponsive or get
+    // killed by Chromium (crash/oom) under load. Without this, the tab just
+    // sits frozen forever with no way to recover short of restarting XCaster.
+    view.webContents.on('unresponsive', () => fwd('unresponsive', true));
+    view.webContents.on('responsive', () => fwd('unresponsive', false));
+    view.webContents.on('render-process-gone', (_e, details) => {
+        console.warn('[XCaster] X view render process gone', tabId, details?.reason);
+        fwd('crashed', details?.reason || 'unknown');
+        const wasVisible = mainWindow && mainWindow.getBrowserViews().includes(view);
+        try { mainWindow?.removeBrowserView(view); } catch {}
+        try { view.webContents.destroy(); } catch {}
+        xViews.delete(tabId);
+        // Auto-heal: recreate the view with the last known URL and swap it back in.
+        const lastURL = xViewLastURL.get(tabId) || url;
+        const fresh = createXViewInternal(tabId, lastURL);
+        xViews.set(tabId, fresh);
+        if (wasVisible && mainWindow) {
+            mainWindow.addBrowserView(fresh);
+            fresh.setBounds(getXViewBounds());
+        }
+    });
 
     // Open new windows: x.com links navigate in-place, others go to system browser.
     view.webContents.setWindowOpenHandler(({ url: u }) => {
@@ -492,8 +535,15 @@ ipcMain.handle('xfw:create-xview', (_e, tabId, url) => {
         return { action: 'deny' };
     });
 
-    xViews.set(tabId, view);
+    xViewLastURL.set(tabId, url);
     view.webContents.loadURL(url);
+    return view;
+}
+
+ipcMain.handle('xfw:create-xview', (_e, tabId, url) => {
+    if (xViews.has(tabId)) return { ok: true };
+    const view = createXViewInternal(tabId, url);
+    xViews.set(tabId, view);
     return { ok: true };
 });
 
@@ -509,6 +559,8 @@ ipcMain.handle('xfw:hide-xview', (_e, tabId) => {
     const view = xViews.get(tabId);
     if (!view || !mainWindow) return;
     mainWindow.removeBrowserView(view);
+    // No longer visible — allow Chromium to throttle it like a normal background tab.
+    allowThrottleOnWebContents(view.webContents);
 });
 
 ipcMain.handle('xfw:destroy-xview', (_e, tabId) => {
@@ -517,6 +569,7 @@ ipcMain.handle('xfw:destroy-xview', (_e, tabId) => {
     try { if (mainWindow) mainWindow.removeBrowserView(view); } catch {}
     try { view.webContents.destroy(); } catch {}
     xViews.delete(tabId);
+    xViewLastURL.delete(tabId);
 });
 
 ipcMain.handle('xfw:navigate-xview', (_e, tabId, url) => {

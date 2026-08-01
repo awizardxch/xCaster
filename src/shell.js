@@ -199,6 +199,7 @@ function activateTab(id) {
     if (prevTab?.xview && prevTab.id !== id) {
         window.xcaster?.hideXView(prevTab.id).catch(() => {});
     }
+    showHangBanner(false);
 
     activeTabId = id;
     const tab = getTab(id);
@@ -1047,8 +1048,37 @@ if (window.xcaster?.onXViewEvent) {
         } else if (type === 'favicon') {
             tab.favicon = data || null;
             renderTabBar();
+        } else if (type === 'unresponsive') {
+            if (activeTabId === tabId) showHangBanner(!!data);
+        } else if (type === 'crashed') {
+            if (activeTabId === tabId) showHangBanner(false);
         }
     });
+}
+
+// Small banner shown over the content area when the active tab's X BrowserView
+// stops responding (heavy page) or was auto-reloaded after a crash, so a
+// freeze is visible/recoverable instead of the app just appearing to hang.
+let _hangBannerEl = null;
+function showHangBanner(unresponsive) {
+    if (!unresponsive) {
+        _hangBannerEl?.remove();
+        _hangBannerEl = null;
+        return;
+    }
+    if (_hangBannerEl) return;
+    const el = document.createElement('div');
+    el.className = 'xfw-hang-banner';
+    el.innerHTML = '<span>This tab isn\u2019t responding.</span>';
+    const btn = document.createElement('button');
+    btn.textContent = 'Reload';
+    btn.addEventListener('click', () => {
+        if (activeTabId) window.xcaster?.reloadXView(activeTabId).catch(() => {});
+        showHangBanner(false);
+    });
+    el.appendChild(btn);
+    document.getElementById('content')?.appendChild(el);
+    _hangBannerEl = el;
 }
 
 // Report toolbar height to main.js so BrowserViews are positioned precisely.

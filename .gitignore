@@ -1,5 +1,6 @@
 node_modules/
 dist/
+dist2/
 .cache/
 *.log
 XCaster-win32-x64.zip

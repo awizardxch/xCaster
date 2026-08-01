@@ -59,7 +59,7 @@ jobs:
         run: npm ci
 
       - name: Build
-        run: npx electron-packager . XCaster --platform=darwin --arch=arm64 --out=dist --overwrite --asar --prune=true "--ignore=^/dist$" "--ignore=\\.zip$"
+        run: npx electron-packager . XCaster --platform=darwin --arch=arm64 --out=dist --overwrite --asar --prune=true "--ignore=^/dist" "--ignore=\\.zip$"
 
       - name: Zip
         run: |
@@ -88,7 +88,7 @@ jobs:
         run: npm ci
 
       - name: Build
-        run: npx electron-packager . XCaster --platform=darwin --arch=x64 --out=dist --overwrite --asar --prune=true "--ignore=^/dist$" "--ignore=\\.zip$"
+        run: npx electron-packager . XCaster --platform=darwin --arch=x64 --out=dist --overwrite --asar --prune=true "--ignore=^/dist" "--ignore=\\.zip$"
 
       - name: Zip
         run: |

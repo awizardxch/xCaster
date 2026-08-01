@@ -295,6 +295,38 @@ html, body {
   z-index: 3;
 }
 
+/* Shown over a tab whose BrowserView renderer is unresponsive or just crashed
+   and was auto-reloaded, so a freeze is visible/recoverable instead of silent. */
+.xfw-hang-banner {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-radius: 8px;
+  background: rgba(30, 20, 20, 0.92);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: #fff;
+  font-size: 13px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+.xfw-hang-banner button {
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.xfw-hang-banner button:hover {
+  background: rgba(255, 255, 255, 0.18);
+}
+
 webview {
   position: absolute;
   inset: 0;

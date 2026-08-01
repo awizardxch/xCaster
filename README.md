@@ -23,6 +23,20 @@ Extract the zip and run `XCaster.exe` (Windows) or `XCaster.app` (macOS) — no 
 
 ---
 
+## What's new in v1.3.0 (beta)
+
+> This is a **beta** build — the `Download` links above still point to the stable v1.2.0 release. Build v1.3.0 yourself from the `beta` branch (see **Run from source** / **Build standalone exe** below) if you want to try it early.
+
+### Loop Station overhaul
+- Fixed silent/incomplete loop recordings — recording now taps a dedicated bus that bypasses Cue muting so it always captures exactly what's audible
+- Fixed pads and the synth not being captured into loop recordings (only mic/aux/xCaster were being captured before)
+- Fixed a MIDI hardware transport bug where a single Record/Play button press was firing twice (start-then-stop) because CC messages fire on both button-down and button-up
+- Redesigned the Loop Station transport from one ambiguous multi-function pad into 4 explicit buttons — ● Record, ▶ Play, ❚❚ Stop/Pause, ✕ Clear — so it's always clear what a press will do
+- Added quantized recording start: Record/Overdub now snap to the beat grid instead of starting the instant you press the button, with a default of 1/4-bar (one beat) and a per-track dial to pick Off / Auto / 1/4 / 1/8 / 1/16 / 1/32
+- Removed the redundant ✕ close buttons from the Pads and Loop Station popup windows — they already hide automatically when you switch away from the Sounds tab
+
+---
+
 ## What's new in v1.2.0
 
 ### X audio stability and gear behavior refinements

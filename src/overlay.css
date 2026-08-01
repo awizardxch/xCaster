@@ -98,6 +98,70 @@ html.xfw-skin-on #react-root {
 #xfw-fab { touch-action: none; }
 #xfw-panel .xfw-header { touch-action: none; }
 
+/* ── Floating popups (Pads / Looper) — independent movable windows ── */
+.xfw-popup {
+    position: fixed;
+    top: 90px; left: 24px;
+    width: 236px;
+    max-height: calc(100vh - 40px);
+    overflow-y: auto;
+    background: var(--xfw-bg);
+    border: 1px solid var(--xfw-border);
+    border-radius: 14px;
+    color: var(--xfw-text);
+    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.65);
+    z-index: 2147483647;
+    padding: 10px 12px 12px;
+}
+.xfw-popup.xfw-dragging { transition: none !important; }
+/* Glow while being dragged, so the move is unmistakably obvious. */
+.xfw-popup.xfw-dragging {
+    border-color: var(--xfw-accent);
+    box-shadow: 0 0 0 2px rgba(29, 155, 240, 0.55), 0 0 28px 6px rgba(29, 155, 240, 0.65), 0 18px 48px rgba(0, 0, 0, 0.65);
+}
+.xfw-popup-header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 8px; cursor: move; user-select: none; touch-action: none;
+    font-size: 13px; font-weight: 700;
+}
+.xfw-popup-close { padding: 2px 8px; }
+#xfw-loop-popup { width: 288px; }
+
+/* Circular bar-length dial (Manual / 4 / 8 / 16 / 32 / 64) next to each layer title. */
+.xfw-bar-dial {
+    width: 32px; height: 32px; border-radius: 50%; flex: 0 0 32px;
+    background: var(--xfw-panel-2); color: var(--xfw-text);
+    border: 2px solid var(--xfw-border); cursor: pointer;
+    font-size: 11px; font-weight: 700; line-height: 1;
+    display: inline-flex; align-items: center; justify-content: center;
+    transition: border-color 120ms, box-shadow 120ms;
+}
+.xfw-bar-dial:hover { border-color: var(--xfw-accent); }
+.xfw-bar-dial.xfw-bar-dial-on {
+    border-color: var(--xfw-accent);
+    box-shadow: 0 0 8px 1px rgba(29, 155, 240, 0.55);
+    color: var(--xfw-accent);
+}
+.xfw-bar-dial:disabled, .xfw-quantize-dial:disabled { opacity: 0.35; cursor: default; }
+
+/* Circular quantize dial (Auto / Off / 1/4 / 1/8 / 1/16 / 1/32) — snaps the
+   ACTUAL start of Record/Overdub to this grid interval instead of starting
+   the instant the button/hardware key is pressed. */
+.xfw-quantize-dial {
+    width: 28px; height: 28px; border-radius: 50%; flex: 0 0 28px;
+    background: var(--xfw-panel-2); color: var(--xfw-text);
+    border: 2px solid var(--xfw-border); cursor: pointer;
+    font-size: 10px; font-weight: 700; line-height: 1;
+    display: inline-flex; align-items: center; justify-content: center;
+    transition: border-color 120ms, box-shadow 120ms;
+}
+.xfw-quantize-dial:hover { border-color: var(--xfw-accent); }
+.xfw-quantize-dial.xfw-quantize-dial-on {
+    border-color: var(--xfw-accent);
+    box-shadow: 0 0 8px 1px rgba(29, 155, 240, 0.55);
+    color: var(--xfw-accent);
+}
+
 .xfw-tabs {
     display: flex; gap: 4px; margin: 6px 0 10px;
     border-bottom: 1px solid var(--xfw-border);
@@ -147,8 +211,13 @@ html.xfw-skin-on #react-root {
     display: flex; align-items: center; justify-content: space-between;
     padding: 5px 0; font-size: 13px; gap: 10px;
 }
+.xfw-row.xfw-row-select { align-items: center; }
 .xfw-row .xfw-help {
     color: var(--xfw-muted); font-size: 11px; margin-top: 2px; display: block;
+}
+.xfw-select-sm {
+    width: auto; flex: 0 0 auto; padding: 4px 8px; font-size: 12px;
+    margin-bottom: 0;
 }
 
 .xfw-toggle {
@@ -180,17 +249,135 @@ html.xfw-skin-on #react-root {
     background: var(--xfw-accent); cursor: pointer;
 }
 
-.xfw-buttons { display: flex; gap: 8px; margin-top: 12px; }
+.xfw-buttons { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
 .xfw-btn {
     flex: 1; background: var(--xfw-panel); color: var(--xfw-text);
     border: 1px solid var(--xfw-border); border-radius: 8px;
     padding: 8px; font-size: 12px; cursor: pointer;
 }
+.xfw-btn:disabled { opacity: 0.4; cursor: not-allowed; pointer-events: none; }
 .xfw-btn:hover { border-color: var(--xfw-accent); color: var(--xfw-accent); }
 .xfw-btn.xfw-primary {
     background: var(--xfw-accent); color: #fff; border-color: var(--xfw-accent);
 }
 .xfw-btn.xfw-primary:hover { color: #fff; }
+.xfw-btn.xfw-btn-rec { background: #dc2626; color: #fff; border-color: #dc2626; }
+.xfw-btn.xfw-btn-rec:hover { background: #b91c1c; }
+
+/* ── Loop Station (RC-505 Mk2-style) tracks ─────────────────────── */
+.xfw-loop-track { padding: 8px 0; border-top: 1px dashed var(--xfw-border); }
+.xfw-loop-track:first-child { border-top: 0; padding-top: 0; }
+.xfw-loop-track-top { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+
+/* Small colored track-identity badge (1-5), like the RC-505's numbered/colored tracks. */
+.xfw-loop-track-badge {
+    width: 20px; height: 20px; border-radius: 50%; flex: 0 0 20px;
+    background: var(--track-color, var(--xfw-accent));
+    color: #fff; font-size: 11px; font-weight: 700;
+    display: inline-flex; align-items: center; justify-content: center;
+    box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.35) inset;
+}
+
+/* Four explicit transport buttons per track (Record/Overdub, Play, Stop/Pause,
+   Clear) — replaces the old single multi-function pad whose meaning changed
+   depending on state (confusing). Each button now has ONE fixed meaning;
+   only its enabled/active look changes with the track's state. */
+.xfw-loop-btns { display: inline-flex; gap: 4px; }
+.xfw-loop-btn {
+    position: relative;
+    width: 30px; height: 30px; border-radius: 50%; flex: 0 0 30px;
+    background: var(--xfw-panel-2); color: var(--xfw-text);
+    border: 2px solid var(--xfw-border); cursor: pointer;
+    font-size: 12px; line-height: 1; user-select: none;
+    display: inline-flex; align-items: center; justify-content: center;
+    transition: border-color 120ms, box-shadow 120ms, background 120ms, color 120ms, opacity 120ms;
+    --loop-progress: 0;
+}
+.xfw-loop-btn:disabled { opacity: 0.35; cursor: default; }
+.xfw-loop-btn-rec { color: #dc2626; border-color: #dc2626; }
+.xfw-loop-btn-rec.xfw-loop-active {
+    background: #dc2626; border-color: #dc2626; color: #fff;
+    box-shadow: 0 0 14px 3px rgba(220, 38, 38, 0.65);
+    animation: xfw-loop-pulse 500ms infinite alternate;
+}
+/* Armed = waiting for the next quantize grid line before the recorder
+   actually starts — a distinct amber pulse so it doesn't read as "already
+   recording" (red) or a normal idle state. */
+.xfw-loop-btn-rec.xfw-loop-armed {
+    background: #d97706; border-color: #d97706; color: #fff;
+    box-shadow: 0 0 14px 3px rgba(217, 119, 6, 0.65);
+    animation: xfw-loop-pulse 350ms infinite alternate;
+}
+.xfw-loop-btn-play.xfw-loop-active {
+    background: var(--xfw-good); border-color: var(--xfw-good); color: #fff;
+    box-shadow: 0 0 12px 2px rgba(0, 186, 124, 0.55);
+}
+@keyframes xfw-loop-pulse { from { filter: brightness(1); } to { filter: brightness(1.4); } }
+
+/* Clock-style fill ring: draws clockwise from 12 o'clock as --loop-progress
+   goes 0→1 (updated every frame in JS from the known recording/overdub end
+   time), so you can see exactly how far into the take you are and when it
+   will auto-stop — like the RC-505's segment LED ring around each track.
+   Only drawn on the Record button, since that's the only one with a
+   known/animated end time. */
+.xfw-loop-btn-rec.xfw-loop-active::before {
+    content: '';
+    position: absolute;
+    inset: -4px;
+    border-radius: 50%;
+    background: conic-gradient(#fff calc(var(--loop-progress, 0) * 360deg), rgba(255, 255, 255, 0.22) 0deg);
+    -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 3px));
+    mask: radial-gradient(farthest-side, transparent calc(100% - 3px), #000 calc(100% - 3px));
+    pointer-events: none;
+}
+
+.xfw-loop-track-vol {
+    -webkit-appearance: none; appearance: none; width: 100%; height: 4px;
+    border-radius: 2px; background: var(--xfw-border); outline: none; margin: 2px 0 6px; cursor: pointer;
+}
+.xfw-loop-track-vol::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 12px; height: 12px; border-radius: 50%;
+    background: var(--xfw-accent); cursor: pointer;
+}
+
+/* ── Sub-tabs (Sounds pane) ──────────────────────────── */
+.xfw-sub-tabs { margin: 8px 0 0; }
+.xfw-sub-tabs .xfw-tab { font-size: 11px; padding: 4px 10px; }
+.xfw-sub-pane { display: none; }
+.xfw-sub-pane.xfw-active { display: block; }
+
+/* ── 4×4 Pad grid ────────────────────────────────── */
+.xfw-pad-grid {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 8px;
+}
+.xfw-pad {
+    position: relative; aspect-ratio: 1; border-radius: 8px;
+    background: var(--pad-color, #2563eb); opacity: 0.7;
+    border: 2px solid transparent; cursor: pointer;
+    display: flex; align-items: flex-end; justify-content: center;
+    padding-bottom: 4px; overflow: hidden; transition: opacity 100ms, border-color 100ms;
+    color: #fff; font-size: 10px; text-align: center;
+}
+.xfw-pad:hover { opacity: 0.9; }
+.xfw-pad.xfw-pad-loaded { opacity: 1; }
+.xfw-pad.xfw-pad-playing { border-color: #fff; opacity: 1; animation: xfw-pad-pulse 600ms infinite alternate; }
+.xfw-pad.xfw-pad-drag { border-color: #fff; opacity: 1; }
+.xfw-pad-name { font-size: 9px; line-height: 1.2; word-break: break-word; text-shadow: 0 1px 2px rgba(0,0,0,.6); }
+@keyframes xfw-pad-pulse { from { filter: brightness(1); } to { filter: brightness(1.35); } }
+
+/* ── Pad editor panel ─────────────────────────────── */
+.xfw-pad-editor {
+    margin-top: 10px; padding: 10px; border-radius: 8px;
+    background: var(--xfw-panel-2); border: 1px solid var(--xfw-border);
+    display: flex; flex-direction: column; gap: 8px; font-size: 12px;
+}
+.xfw-pad-editor label { color: var(--xfw-muted); min-width: 70px; }
+.xfw-modal-input {
+    background: var(--xfw-panel); color: var(--xfw-text);
+    border: 1px solid var(--xfw-border); border-radius: 6px; padding: 4px 8px;
+    font-size: 12px;
+}
 
 .xfw-status {
     font-size: 11px; color: var(--xfw-muted);
