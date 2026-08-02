@@ -1000,6 +1000,17 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         if (!inst) return null;
         return inst.regions.find(r => note >= r.lokey && note <= r.hikey) || null;
     }
+    // Warm the cache for every distinct sample file in an sfz instrument so
+    // the full keyboard range is available offline/lag-free on first key press.
+    function _prefetchSfzAllRegions(instrument) {
+        const inst = _SFZ_INSTRUMENTS[instrument];
+        if (!inst) return;
+        const seen = new Set();
+        for (const r of inst.regions) {
+            const url = `${inst.base}${r.sample}.${inst.ext}`;
+            if (!seen.has(url)) { seen.add(url); _getSfzSampleBuffer(instrument, r.lokey).catch(() => {}); }
+        }
+    }
     async function _getSfzSampleBuffer(instrument, note) {
         const region = _sfzRegionFor(instrument, note);
         if (!region) return null;
@@ -1018,6 +1029,34 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             console.warn('[XCaster] FreePats sample fetch failed, using procedural fallback:', url, e);
             return null;
         }
+    }
+
+    // Plays a note directly from the sfz instrument's region table — used for
+    // keyboard notes that aren't mapped to any pad, bypassing the 16-pad
+    // nearest-neighbor pitch-stretch so every semitone sounds accurate.
+    async function _playSfzNote(instrument, note) {
+        if (!sbBus) { try { await ensureProcessedStream(); } catch {} }
+        const res = await _getSfzSampleBuffer(instrument, note);
+        if (!res || !sbSourceBus) {
+            // Cache miss / offline — try nearest-pad fallback so there's always some sound
+            const melodic = _melodicPadForNote(note);
+            if (melodic) playPadPitched(melodic.index, note - melodic.baked);
+            return;
+        }
+        const ctx = ensureAudioContext();
+        const src = ctx.createBufferSource();
+        src.buffer = res.buffer;
+        src.playbackRate.value = Math.pow(2, (note - res.pitch) / 12);
+        const vol = ctx.createGain();
+        // Inherit volume from whichever pad's sfzNote is nearest — consistent with kit level
+        const refPad = settings.sbPads.reduce((best, p, i) => {
+            if (!p?.sfzNote) return best;
+            const d = Math.abs(p.sfzNote - note);
+            return (best === null || d < best.d) ? { d, v: p.volume ?? 0.8 } : best;
+        }, null);
+        vol.gain.value = refPad?.v ?? 0.8;
+        src.connect(vol); vol.connect(sbSourceBus);
+        src.start();
     }
 
     const TR808_BASE = 'https://smpldsnds.github.io/drum-machines/tr-808/';
@@ -1101,7 +1140,6 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             stopPad(i);
             _padBufferCache.delete(i);
             _padSamplePitch.delete(i);
-            _padSamplePitch.delete(i);
             const item = kit[i];
             settings.sbPads[i] = {
                 name: item.name, midiNote: 36 + i, volume: 0.8,
@@ -1113,7 +1151,8 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         }
         saveSettings(settings);
         _refreshPadGridUI();
-        _prefetchRealSamples(settings.sbPads); // warm real-sample cache in the background
+        _prefetchRealSamples(settings.sbPads); // warm 16-pad real-sample cache
+        if (kit[0]?.sfzInstrument) _prefetchSfzAllRegions(kit[0].sfzInstrument); // warm full keyboard range
     }
 
     // ── IndexedDB pad storage (audio files persist across sessions) ──────────
@@ -1425,12 +1464,19 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             if (pi>=0) {
                 playPad(pi);
             } else {
-                // No pad is mapped to this exact note — if a melodic kit (Piano/
-                // Guitar/Synth keys) is loaded, extend it across the whole
-                // keyboard instead of staying silent outside the fixed 16-note
-                // pad range (e.g. after using the controller's Octave +/- button).
-                const melodic = _melodicPadForNote(note);
-                if (melodic) playPadPitched(melodic.index, note - melodic.baked);
+                // No pad is mapped to this exact note. For real-sample melodic
+                // kits (piano/guitar) fetch the exact SFZ region for this note
+                // and play it at the correct pitch — no 16-pad nearest-neighbor
+                // stretch, so every semitone across the full keyboard sounds right.
+                // For procedural kits (synthkeys, custom) fall back to the old
+                // nearest-pad pitch-shift path.
+                const sfzKit = settings.sbPads[0]?.sfzInstrument;
+                if (sfzKit && _SFZ_INSTRUMENTS[sfzKit]) {
+                    _playSfzNote(sfzKit, note);
+                } else {
+                    const melodic = _melodicPadForNote(note);
+                    if (melodic) playPadPitched(melodic.index, note - melodic.baked);
+                }
             }
             synthNoteOn(note, val);
             _midiCaptureNoteOn(note, val);
