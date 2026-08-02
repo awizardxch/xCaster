@@ -1107,19 +1107,16 @@ registerProcessor('xcaster-pitch',XCasterPitch);
 
     async function _fetchWAFZones(url) {
         if (_wafZoneCache.has(url)) return _wafZoneCache.get(url);
-        // Prevent duplicate concurrent fetches by storing the in-flight promise.
         const loadKey = url + ':loading';
         if (_wafZoneCache.has(loadKey)) return _wafZoneCache.get(loadKey);
         const prom = (async () => {
             try {
                 const res = await fetch(url);
-                if (!res.ok) return null;
+                if (!res.ok) { console.warn('[XCaster] WAF fetch', res.status, url); _wafZoneCache.set(url, null); _wafZoneCache.delete(loadKey); return null; }
                 const text = await res.text();
                 const ctx = ensureAudioContext();
                 const zones = [];
-                // Each WAF zone looks like: {keyRangeLow:N, keyRangeHigh:N,
-                // originalPitch:N, ..., file:"data:audio/ogg;base64,<data>"}
-                // originalPitch is in centitones (6000 = MIDI 60).
+                // Each WAF zone: {keyRangeLow:N, keyRangeHigh:N, originalPitch:N (centitones), ..., file:"data:audio/...;base64,..."}
                 const fileRe = /"file"\s*:\s*"data:audio[^;]*;base64,([^"]+)"/g;
                 let m;
                 while ((m = fileRe.exec(text)) !== null) {
@@ -1129,16 +1126,23 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                     const raw   = +(/originalPitch\s*:\s*(\d+)/.exec(before)?.[1]  ?? 6000);
                     const pitch = Math.round(raw / 100);
                     try {
-                        const bin = atob(m[1]);
+                        // WAF data URIs sometimes contain embedded newlines/spaces in the base64 — strip them.
+                        const b64 = m[1].replace(/\s+/g, '');
+                        const bin = atob(b64);
                         const buf = new ArrayBuffer(bin.length);
                         const view = new Uint8Array(buf);
                         for (let i = 0; i < bin.length; i++) view[i] = bin.charCodeAt(i);
                         const ab = await ctx.decodeAudioData(buf);
                         zones.push({ lokey: lo, hikey: hi, pitch, buffer: ab });
-                    } catch {}
+                    } catch (e) { console.warn('[XCaster] WAF zone decode:', e?.message, lo, hi); }
                 }
-                if (zones.length) { _wafZoneCache.set(url, zones); _wafZoneCache.delete(loadKey); return zones; }
-            } catch {}
+                if (zones.length) {
+                    _wafZoneCache.set(url, zones); _wafZoneCache.delete(loadKey);
+                    return zones;
+                }
+                console.warn('[XCaster] WAF no zones decoded from', url);
+            } catch (e) { console.warn('[XCaster] WAF error:', e?.message, url); }
+            _wafZoneCache.set(url, null); // cache null so we don't re-fetch a broken URL
             _wafZoneCache.delete(loadKey);
             return null;
         })();
@@ -4225,7 +4229,7 @@ registerProcessor('xcaster-pitch',XCasterPitch);
 
         <!-- PIANO ROLL POPUP — Ableton-style clip view of MIDI notes played,
              either a live rolling window or a specific loop track's recording -->
-        <div id="xfw-pianoroll-popup" class="xfw-popup" style="display:none;width:640px;">
+        <div id="xfw-pianoroll-popup" class="xfw-popup" style="display:none;width:640px;min-width:360px;resize:both;overflow:auto;">
             <div class="xfw-popup-header">
                 <span>🎹 Piano Roll</span>
             </div>
@@ -4245,7 +4249,19 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                     <div>Expand keys<span class="xfw-help">Taller rows = easier to read pitches, like zooming in Ableton's piano roll.</span></div>
                     <input id="xfw-pianoroll-zoom" type="range" min="6" max="40" step="1" style="flex:1;" />
                 </div>
-                <div id="xfw-pianoroll-scroll" style="overflow:auto;max-height:480px;min-height:200px;border:1px solid var(--xfw-border);border-radius:8px;margin-top:6px;resize:vertical;">
+                <div class="xfw-row xfw-row-select">
+                    <div>Quantize<span class="xfw-help">Snap all notes in the selected track to this grid after recording.</span></div>
+                    <select id="xfw-pianoroll-quantize" class="xfw-select xfw-select-sm">
+                        <option value="1">1 bar</option>
+                        <option value="2">1/2 bar</option>
+                        <option value="4" selected>1/4 (beat)</option>
+                        <option value="8">1/8</option>
+                        <option value="16">1/16</option>
+                        <option value="32">1/32</option>
+                    </select>
+                    <button id="xfw-pianoroll-quantize-btn" class="xfw-btn" style="flex:0 0 auto;margin-left:6px;padding:4px 10px;">Apply</button>
+                </div>
+                <div id="xfw-pianoroll-scroll" style="overflow:auto;flex:1;min-height:200px;border:1px solid var(--xfw-border);border-radius:8px;margin-top:6px;">
                     <canvas id="xfw-pianoroll-canvas" width="600" height="200" style="display:block;"></canvas>
                 </div>
             </div>
@@ -4625,6 +4641,25 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                 zoomSlider.addEventListener('input', () => {
                     settings.pianoRollRowH = +zoomSlider.value;
                     saveSettings(settings);
+                    _drawPianoRoll();
+                });
+            }
+            const qBtn = document.getElementById('xfw-pianoroll-quantize-btn');
+            if (qBtn) {
+                qBtn.addEventListener('click', () => {
+                    const sel = settings.pianoRollTrack;
+                    if (sel === 'live') return;
+                    const track = +sel;
+                    const L = _loops[track];
+                    if (!L || !L.midiEvents || !L.midiEvents.length) return;
+                    const div = +( document.getElementById('xfw-pianoroll-quantize')?.value || 4 );
+                    const secPerBar = (60 / (settings.loopBpm || 120)) * 4;
+                    const grid = secPerBar / div;
+                    L.midiEvents = L.midiEvents.map(ev => {
+                        const snapped = Math.round(ev.on / grid) * grid;
+                        const dur = ev.off - ev.on;
+                        return { ...ev, on: snapped, off: snapped + Math.max(grid * 0.1, dur) };
+                    });
                     _drawPianoRoll();
                 });
             }

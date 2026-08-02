@@ -113,6 +113,9 @@ html.xfw-skin-on #react-root {
     z-index: 2147483647;
     padding: 10px 12px 12px;
 }
+/* Piano roll popup fills its resized box with a flex column so the canvas area expands. */
+#xfw-pianoroll-popup { display: flex; flex-direction: column; padding: 0; }
+#xfw-pianoroll-popup .xfw-popup-body { display: flex; flex-direction: column; flex: 1; padding: 10px 12px 12px; overflow: hidden; }
 .xfw-popup.xfw-dragging { transition: none !important; }
 /* Glow while being dragged, so the move is unmistakably obvious. */
 .xfw-popup.xfw-dragging {
