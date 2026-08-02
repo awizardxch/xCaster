@@ -1746,6 +1746,30 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         if (!L || L.state !== 'empty') return;
         await ensureProcessedStream();
         if (!loopRecordStream) return;
+
+        const ctx = ensureAudioContext();
+        const secPerBeat = 60 / (settings.loopBpm || 120);
+        const secPerBar  = secPerBeat * 4;
+        const anyPlaying = _loops.some(l => l.state === 'playing' || l.state === 'overdubbing');
+
+        if (!anyPlaying) {
+            // Count-in: snap to the next bar boundary and fire 4 clicks in the bar
+            // before it so the musician knows exactly when recording will start.
+            const now = ctx.currentTime;
+            let nextBar = Math.ceil(now / secPerBar) * secPerBar;
+            if (nextBar - now < 0.05) nextBar += secPerBar;
+            const countStart = nextBar - secPerBar;
+            for (let i = 0; i < 4; i++) {
+                _metronomeClick(Math.max(now + 0.02, countStart + i * secPerBeat), i === 0);
+            }
+            const msUntilBar = Math.max(0, (nextBar - ctx.currentTime) * 1000);
+            L.state = 'armed-record';
+            _loopStatus(layer, `⏳ Count-in… (1 bar)`);
+            _updateLoopUI(layer);
+            L.armTimer = setTimeout(() => { L.armTimer = null; _beginRecording(layer); }, msUntilBar);
+            return;
+        }
+
         const delayMs = _quantizeDelayMs(_resolveQuantizeDiv(layer));
         if (delayMs <= 0) { _beginRecording(layer); return; }
         L.state = 'armed-record';
@@ -3835,6 +3859,7 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                     <button id="xfw-loop-play-all" class="xfw-btn" style="flex:1;">▶ Play All</button>
                     <button id="xfw-loop-stop-all" class="xfw-btn" style="flex:1;">■ Stop All</button>
                     <button id="xfw-loop-clear-all" class="xfw-btn" style="flex:1;">✕ Clear All</button>
+                    <button id="xfw-loop-show-pianoroll" class="xfw-btn" style="flex:0 0 auto;padding:6px 10px;" title="Show the Piano Roll — see every MIDI note you played and recorded">🎹</button>
                 </div>
                 <div class="xfw-buttons" style="gap:6px;flex-wrap:wrap;margin-bottom:6px;">
                     <button id="xfw-learn-loop-record" class="xfw-btn" style="flex:1;">🎙 Learn Record</button>
@@ -4584,6 +4609,12 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         if (loopStopAllBtn) loopStopAllBtn.addEventListener('click', () => loopStopAllPlaying());
         const loopClearAllBtn = document.getElementById('xfw-loop-clear-all');
         if (loopClearAllBtn) loopClearAllBtn.addEventListener('click', () => loopClearAll());
+        const loopShowPianoRollBtn = document.getElementById('xfw-loop-show-pianoroll');
+        if (loopShowPianoRollBtn) loopShowPianoRollBtn.addEventListener('click', () => {
+            settings.pianoRollPopupOpen = !settings.pianoRollPopupOpen;
+            saveSettings(settings);
+            if (settings.pianoRollPopupOpen) showPianoRollPopup(); else hidePianoRollPopup();
+        });
 
         // Per-track level fader (like the RC-505's 5 physical track faders).
         document.querySelectorAll('[data-track-vol]').forEach(input => {
