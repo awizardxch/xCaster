@@ -91,6 +91,10 @@
         loopPopupPos: null,     // {x, y} or null = default position
         padsPopupOpen: true,    // whether the Pads window should auto-show with the Sounds tab
         loopPopupOpen: true,    // whether the Looper window should auto-show with the Sounds tab
+        pianoRollPopupPos: null,     // {x, y} or null = default position
+        pianoRollPopupOpen: false,   // Piano Roll starts hidden — opt-in via its own show button
+        pianoRollRowH: 14,           // px per note row — "expand"/zoom control, taller = easier to read
+        pianoRollTrack: 'live',      // 'live' (rolling view of whatever's being played) | 0-4 (a loop track's recorded notes)
         // FX / Autotune
         autotuneEnabled: false,
         pitchShiftSemitones: 0, // -12 to +12
@@ -115,6 +119,7 @@
         loopBars: [16, 16, 16, 16, 16],          // per-track auto-loop length in bars; null/0 = Manual
         loopTrackGainDb: [0, 0, 0, 0, 0],        // per-track level (like the RC-505's 5 track faders)
         loopQuantize: ['auto', 'auto', 'auto', 'auto', 'auto'], // per-track record/overdub start snap: 'off' | 'auto' (=1/4) | 4|8|16|32 (snap to 1/N of a bar)
+        metronomeEnabled: false, // click track — monitor-only, wired directly to monitorDest so it's NEVER recorded/broadcast
     };
 
     function loadSettings() {
@@ -173,6 +178,7 @@
     let monitorDest = null;
     let monitorAudioEl = null;
     let mixBus = null;
+    let metronomeGain = null; // monitor-only click bus — never connects to sbBus/loopRecordBus/mixBus
     let hpf = null, eqLow = null, eqMid = null, eqHigh = null;
     let comp = null, limiter = null, makeup = null;
     let processedDest = null;
@@ -914,7 +920,104 @@ registerProcessor('xcaster-pitch',XCasterPitch);
     // Warms the cache for a kit's real samples in the background so the first
     // pad hit isn't laggy waiting on a network round-trip.
     function _prefetchRealSamples(padList) {
-        for (const p of padList) { if (p.sample) _getRealSampleBuffer(p.sample).catch(() => {}); }
+        for (const p of padList) {
+            if (p.sample) _getRealSampleBuffer(p.sample).catch(() => {});
+            if (p.sfzInstrument && p.sfzNote != null) _getSfzSampleBuffer(p.sfzInstrument, p.sfzNote).catch(() => {});
+        }
+    }
+
+    // ── Real multisampled instruments (FreePats, CC0/CC-BY) ───────────────
+    // Piano/Guitar pads used to be 100% procedurally synthesized (see
+    // _synthesizeBuiltin's 'piano'/'guitar' cases below) — these tables let
+    // them use REAL recorded instrument samples instead, sourced from the
+    // FreePats project's plain FLAC sample files (no code execution: this is
+    // just fetch()+decodeAudioData() on ordinary audio files, exactly like
+    // the drum-machine real samples above — NOT the WebAudioFont/SpessaSynth
+    // approach, which packages sample data as executable JS and was
+    // deliberately avoided as an unnecessary remote-code-execution risk).
+    // Each `regions` entry is copied directly from that instrument's own
+    // FreePats .sfz file (a plain-text sample map — lokey/hikey = the MIDI
+    // note range this region covers, pitch = the MIDI note the sample was
+    // actually recorded at). Notes that don't have their own recorded sample
+    // reuse the nearest region's file, pitch-shifted via playbackRate — the
+    // same technique a hardware sampler uses to cover a full keyboard from a
+    // handful of recorded notes. Builtin procedural synthesis remains the
+    // automatic fallback if a fetch/decode ever fails (offline mid-show etc).
+    const _SFZ_INSTRUMENTS = {
+        // FM Piano 2 (Roberto/FreePats, CC0) — freepats/fm-piano2
+        piano: {
+            base: 'https://raw.githubusercontent.com/freepats/fm-piano2/main/samples/', ext: 'flac',
+            regions: [
+                { lokey: 26, hikey: 32, pitch: 30, sample: 'F#1v80' },
+                { lokey: 33, hikey: 38, pitch: 36, sample: 'C2v80' },
+                { lokey: 39, hikey: 44, pitch: 42, sample: 'F#2v80' },
+                { lokey: 45, hikey: 50, pitch: 48, sample: 'C3v80' },
+                { lokey: 51, hikey: 56, pitch: 54, sample: 'F#3v80' },
+                { lokey: 57, hikey: 62, pitch: 60, sample: 'C4v80' },
+                { lokey: 63, hikey: 68, pitch: 66, sample: 'F#4v80' },
+                { lokey: 69, hikey: 74, pitch: 72, sample: 'C5v80' },
+                { lokey: 75, hikey: 80, pitch: 78, sample: 'F#5v80' },
+                { lokey: 81, hikey: 86, pitch: 84, sample: 'C6v80' },
+                { lokey: 87, hikey: 92, pitch: 90, sample: 'F#6v80' },
+                { lokey: 93, hikey: 103, pitch: 96, sample: 'C7v80' },
+            ],
+        },
+        // Spanish classical guitar (Roberto/FreePats, CC0) — freepats/spanish-classical-guitar
+        // Near-fully chromatic (almost every note has its OWN recorded sample),
+        // so pitch-shift is minimal/inaudible — highest realism of the two.
+        guitar: {
+            base: 'https://raw.githubusercontent.com/freepats/spanish-classical-guitar/main/samples/', ext: 'flac',
+            regions: [
+                { lokey: 29, hikey: 31, pitch: 31, sample: 'G1' }, { lokey: 32, hikey: 32, pitch: 32, sample: 'G#1' },
+                { lokey: 33, hikey: 33, pitch: 33, sample: 'A1' }, { lokey: 34, hikey: 34, pitch: 34, sample: 'A#1' },
+                { lokey: 35, hikey: 35, pitch: 35, sample: 'B1' }, { lokey: 36, hikey: 36, pitch: 36, sample: 'C2' },
+                { lokey: 37, hikey: 37, pitch: 37, sample: 'C#2' }, { lokey: 38, hikey: 38, pitch: 38, sample: 'D2' },
+                { lokey: 39, hikey: 39, pitch: 39, sample: 'D#2' }, { lokey: 40, hikey: 40, pitch: 40, sample: 'E2' },
+                { lokey: 41, hikey: 41, pitch: 41, sample: 'F2' }, { lokey: 42, hikey: 43, pitch: 43, sample: 'G2' },
+                { lokey: 44, hikey: 45, pitch: 45, sample: 'A2' }, { lokey: 46, hikey: 47, pitch: 47, sample: 'B2' },
+                { lokey: 48, hikey: 48, pitch: 48, sample: 'C3' }, { lokey: 49, hikey: 50, pitch: 50, sample: 'D3' },
+                { lokey: 51, hikey: 52, pitch: 52, sample: 'E3' }, { lokey: 53, hikey: 53, pitch: 53, sample: 'F3' },
+                { lokey: 54, hikey: 54, pitch: 54, sample: 'F#3' }, { lokey: 55, hikey: 55, pitch: 55, sample: 'G3' },
+                { lokey: 56, hikey: 56, pitch: 56, sample: 'G#3' }, { lokey: 57, hikey: 57, pitch: 57, sample: 'A3' },
+                { lokey: 58, hikey: 58, pitch: 58, sample: 'A#3' }, { lokey: 59, hikey: 59, pitch: 59, sample: 'B3' },
+                { lokey: 60, hikey: 60, pitch: 60, sample: 'C4' }, { lokey: 61, hikey: 61, pitch: 61, sample: 'C#4' },
+                { lokey: 62, hikey: 62, pitch: 62, sample: 'D4' }, { lokey: 63, hikey: 63, pitch: 63, sample: 'D#4' },
+                { lokey: 64, hikey: 64, pitch: 64, sample: 'E4' }, { lokey: 65, hikey: 65, pitch: 65, sample: 'F4' },
+                { lokey: 66, hikey: 66, pitch: 66, sample: 'F#4' }, { lokey: 67, hikey: 67, pitch: 67, sample: 'G4' },
+                { lokey: 68, hikey: 69, pitch: 69, sample: 'A4' }, { lokey: 70, hikey: 70, pitch: 70, sample: 'A#4' },
+                { lokey: 71, hikey: 71, pitch: 71, sample: 'B4' }, { lokey: 72, hikey: 72, pitch: 72, sample: 'C5' },
+                { lokey: 73, hikey: 73, pitch: 73, sample: 'C#5' }, { lokey: 74, hikey: 74, pitch: 74, sample: 'D5' },
+                { lokey: 75, hikey: 75, pitch: 75, sample: 'D#5' }, { lokey: 76, hikey: 76, pitch: 76, sample: 'E5' },
+                { lokey: 77, hikey: 77, pitch: 77, sample: 'F5' }, { lokey: 78, hikey: 78, pitch: 78, sample: 'F#5' },
+                { lokey: 79, hikey: 79, pitch: 79, sample: 'G5' }, { lokey: 80, hikey: 80, pitch: 80, sample: 'G#5' },
+                { lokey: 81, hikey: 81, pitch: 81, sample: 'A5' }, { lokey: 82, hikey: 82, pitch: 82, sample: 'A#5' },
+                { lokey: 83, hikey: 83, pitch: 83, sample: 'B5' }, { lokey: 84, hikey: 88, pitch: 84, sample: 'C6' },
+            ],
+        },
+    };
+    function _sfzRegionFor(instrument, note) {
+        const inst = _SFZ_INSTRUMENTS[instrument];
+        if (!inst) return null;
+        return inst.regions.find(r => note >= r.lokey && note <= r.hikey) || null;
+    }
+    async function _getSfzSampleBuffer(instrument, note) {
+        const region = _sfzRegionFor(instrument, note);
+        if (!region) return null;
+        const inst = _SFZ_INSTRUMENTS[instrument];
+        const url = `${inst.base}${region.sample}.${inst.ext}`;
+        if (_realSampleCache.has(url)) return { buffer: _realSampleCache.get(url), pitch: region.pitch };
+        const ctx = ensureAudioContext();
+        try {
+            const res = await fetch(url);
+            if (!res.ok) return null;
+            const buf = await res.arrayBuffer();
+            const ab = await ctx.decodeAudioData(buf);
+            _realSampleCache.set(url, ab);
+            return { buffer: ab, pitch: region.pitch };
+        } catch (e) {
+            console.warn('[XCaster] FreePats sample fetch failed, using procedural fallback:', url, e);
+            return null;
+        }
     }
 
     const TR808_BASE = 'https://smpldsnds.github.io/drum-machines/tr-808/';
@@ -965,8 +1068,8 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             ['thump:620:440:0.3:0.28','Lofi Cowbell', RZ1_BASE+'cowbell'],['noise1:lowpass:3600::0.2:0.15','Shaker'],
             ['noise1:lowpass:3200::1.3:1.1','Crash', RZ1_BASE+'crash'],['roll:lowpass:2400::0.8:0.08','Snare Roll'],['thump:80:22:1.2:1.0','Sub Drop'],
         ].map(([s, n, u]) => ({ builtin: s, name: n, sample: u })),
-        piano: Array.from({ length: 16 }, (_, i) => { const m = 60 + i; return { builtin: `piano:${m}`, name: _midiToName(m) }; }),
-        guitar: Array.from({ length: 16 }, (_, i) => { const m = 40 + i; return { builtin: `guitar:${m}`, name: _midiToName(m) }; }),
+        piano: Array.from({ length: 16 }, (_, i) => { const m = 60 + i; return { builtin: `piano:${m}`, name: _midiToName(m), sfzInstrument: 'piano', sfzNote: m }; }),
+        guitar: Array.from({ length: 16 }, (_, i) => { const m = 40 + i; return { builtin: `guitar:${m}`, name: _midiToName(m), sfzInstrument: 'guitar', sfzNote: m }; }),
         sfx: [
             ['clap','Clap', SFX_BASE+'foley/hand_claps_close'],
             ['cheer','Cheer', SFX_BASE+'crowds/team_cheer'],
@@ -997,11 +1100,15 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         for (let i = 0; i < 16; i++) {
             stopPad(i);
             _padBufferCache.delete(i);
+            _padSamplePitch.delete(i);
+            _padSamplePitch.delete(i);
             const item = kit[i];
             settings.sbPads[i] = {
                 name: item.name, midiNote: 36 + i, volume: 0.8,
                 color: PAD_COLORS[i], loop: false, builtin: item.builtin,
                 sample: item.sample || null,
+                sfzInstrument: item.sfzInstrument || null,
+                sfzNote: item.sfzNote != null ? item.sfzNote : null,
             };
         }
         saveSettings(settings);
@@ -1028,10 +1135,17 @@ registerProcessor('xcaster-pitch',XCasterPitch);
 
     const _padBufferCache = new Map(); // padIndex → AudioBuffer
     const _padSources     = new Map(); // padIndex → AudioBufferSourceNode
+    const _padSamplePitch = new Map(); // padIndex → recorded MIDI pitch of a real-instrument sample (sfzInstrument pads only)
 
     async function loadPadBuffer(index) {
         if (_padBufferCache.has(index)) return _padBufferCache.get(index);
         const pad = settings.sbPads[index];
+        if (pad?.sfzInstrument && pad?.sfzNote != null) {
+            const res = await _getSfzSampleBuffer(pad.sfzInstrument, pad.sfzNote);
+            if (res) { _padBufferCache.set(index, res.buffer); _padSamplePitch.set(index, res.pitch); return res.buffer; }
+            // Network/decode failed (e.g. offline mid-show) — fall through to
+            // the procedural builtin sound below so the pad still makes noise.
+        }
         if (pad?.sample) {
             const ab = await _getRealSampleBuffer(pad.sample);
             if (ab) { _padBufferCache.set(index, ab); return ab; }
@@ -1064,9 +1178,14 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         const ctx = ensureAudioContext();
         const src = ctx.createBufferSource();
         src.buffer = ab;
+        const pad = settings.sbPads[index];
+        const pitch = _padSamplePitch.get(index);
+        // Real-instrument pads (piano/guitar) recorded a nearby note rather
+        // than the pad's own note — pitch-shift to land exactly on pitch.
+        if (pitch != null && pad?.sfzNote != null) src.playbackRate.value = Math.pow(2, (pad.sfzNote - pitch) / 12);
         const vol = ctx.createGain();
-        vol.gain.value = settings.sbPads[index]?.volume ?? 0.8;
-        src.loop = !!(settings.sbPads[index]?.loop);
+        vol.gain.value = pad?.volume ?? 0.8;
+        src.loop = !!(pad?.loop);
         src.connect(vol); vol.connect(sbSourceBus);
         src.start();
         src.onended = () => { if (_padSources.get(index)===src) _padSources.delete(index); _paintPadState(index,false); };
@@ -1111,7 +1230,16 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         const ctx = ensureAudioContext();
         const src = ctx.createBufferSource();
         src.buffer = ab;
-        src.playbackRate.value = Math.pow(2, semitones / 12);
+        const pad = settings.sbPads[index];
+        const pitch = _padSamplePitch.get(index);
+        if (pitch != null && pad?.sfzNote != null) {
+            // Real-instrument pad: compute the shift straight from the actual
+            // recorded pitch to the actual target note, not from the pad's own
+            // (possibly already-shifted) baked note.
+            src.playbackRate.value = Math.pow(2, (pad.sfzNote + semitones - pitch) / 12);
+        } else {
+            src.playbackRate.value = Math.pow(2, semitones / 12);
+        }
         const vol = ctx.createGain();
         vol.gain.value = settings.sbPads[index]?.volume ?? 0.8;
         src.connect(vol); vol.connect(sbSourceBus);
@@ -1203,6 +1331,37 @@ registerProcessor('xcaster-pitch',XCasterPitch);
 
     function synthAllNotesOff() { for(let i=0;i<128;i++) synthNoteOff(i); }
 
+    // ── MIDI note capture (Piano Roll view) ─────────────────────────────────
+    // Tracks every note actually played (after the channel filter, so it only
+    // reflects real activity) so the Piano Roll popup has something to draw:
+    // a rolling "live" buffer for the always-on view, plus each loop track's
+    // own note list captured only while that track is recording/overdubbing
+    // (relative to that track's own recording start, so it lines up with the
+    // recorded audio's bar 1 beat 1).
+    const _activeNoteOnTimes = new Map(); // note -> { t: ctx.currentTime, vel }
+    const _liveMidiEvents = [];           // { note, on, off, vel } in ctx.currentTime seconds
+    const _LIVE_MIDI_KEEP_SEC = 60;       // don't let this grow unbounded
+
+    function _midiCaptureNoteOn(note, vel) {
+        _activeNoteOnTimes.set(note, { t: ensureAudioContext().currentTime, vel });
+    }
+    function _midiCaptureNoteOff(note) {
+        const on = _activeNoteOnTimes.get(note);
+        if (!on) return;
+        _activeNoteOnTimes.delete(note);
+        const off = ensureAudioContext().currentTime;
+        _liveMidiEvents.push({ note, on: on.t, off, vel: on.vel });
+        const cutoff = off - _LIVE_MIDI_KEEP_SEC;
+        while (_liveMidiEvents.length && _liveMidiEvents[0].off < cutoff) _liveMidiEvents.shift();
+        // Feed whichever track(s) are currently capturing, relative to their own start.
+        for (let i = 0; i < _LOOP_LAYERS; i++) {
+            const L = _loops[i];
+            if (!L || (L.state !== 'recording' && L.state !== 'overdubbing') || L.recordStartCtxTime == null) continue;
+            if (on.t < L.recordStartCtxTime) continue;
+            L.midiEvents.push({ note, on: on.t - L.recordStartCtxTime, off: off - L.recordStartCtxTime, vel: on.vel });
+        }
+    }
+
     // ── MIDI ──────────────────────────────────────────────────────────────────
     let _midiAccess = null;
 
@@ -1274,10 +1433,12 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                 if (melodic) playPadPitched(melodic.index, note - melodic.baked);
             }
             synthNoteOn(note, val);
+            _midiCaptureNoteOn(note, val);
             _reportMidiActivity(note, pi);
         } else if (type===0x80 || (type===0x90&&val===0)) {
             // Note Off
             synthNoteOff(note);
+            _midiCaptureNoteOff(note);
             const pi=settings.sbPads.findIndex(p=>p&&p.midiNote===note&&p.loop);
             if (pi>=0) stopPad(pi);
         } else if (type===0xb0) {
@@ -1376,6 +1537,7 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         state: 'empty', // 'empty' | 'armed-record' | 'recording' | 'playing' | 'armed-overdub' | 'overdubbing' | 'stopped'
         autoStopTimer: null, armTimer: null,
         recDeadline: null, recDurationMs: null, // known auto-stop end time, for the progress ring
+        midiEvents: [], recordStartCtxTime: null, playStartCtxTime: null, // MIDI note capture for the Piano Roll view
     }));
 
     // Record/overdub progress ring: while a track has a KNOWN end time (auto-loop
@@ -1445,6 +1607,94 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         if (L?.armTimer) { clearTimeout(L.armTimer); L.armTimer = null; }
     }
 
+    // ── Metronome (click track) ──────────────────────────────────────────────
+    // Plays a click on the SAME idealized BPM grid that quantize/auto-snap uses
+    // (anchored to ctx.currentTime=0, not to when the metronome was turned on),
+    // so it's also a direct audible reference for "where auto-snap will land".
+    // Uses a standard lookahead scheduler (setInterval polls slightly ahead of
+    // real time and schedules exact-timed oscillator clicks) instead of naive
+    // setTimeout-per-beat, which would drift. metronomeGain connects ONLY to
+    // monitorDest (see buildGraph) — it is structurally impossible for it to
+    // reach loopRecordBus/sbSourceBus/processedDest, so it can never be baked
+    // into a loop recording or sent to the X broadcast, regardless of state.
+    const _METRO_SCHEDULE_AHEAD_SEC = 0.1;
+    const _METRO_POLL_MS = 25;
+    let _metroTimer = null;
+    let _metroNextNoteTime = 0;
+    let _metroNextBeatIndex = 0;
+
+    function _metronomeClick(time, accent) {
+        if (!metronomeGain) return;
+        const ctx = ensureAudioContext();
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'square';
+        osc.frequency.value = accent ? 1600 : 1000;
+        gain.gain.setValueAtTime(0, time);
+        gain.gain.linearRampToValueAtTime(accent ? 0.5 : 0.32, time + 0.002);
+        gain.gain.exponentialRampToValueAtTime(0.0001, time + 0.04);
+        osc.connect(gain); gain.connect(metronomeGain);
+        osc.start(time); osc.stop(time + 0.05);
+    }
+
+    function _metronomeScheduleTick() {
+        const ctx = ensureAudioContext();
+        const secPerBeat = 60 / (settings.loopBpm || 120);
+        while (_metroNextNoteTime < ctx.currentTime + _METRO_SCHEDULE_AHEAD_SEC) {
+            _metronomeClick(_metroNextNoteTime, _metroNextBeatIndex % 4 === 0);
+            _metroNextBeatIndex++;
+            _metroNextNoteTime += secPerBeat;
+        }
+    }
+
+    function _startMetronome() {
+        if (_metroTimer || !metronomeGain) return;
+        const ctx = ensureAudioContext();
+        const secPerBeat = 60 / (settings.loopBpm || 120);
+        // Snap the FIRST click onto the same grid quantize/auto-snap uses, so
+        // turning the metronome on mid-take doesn't feel offset from the beat.
+        _metroNextNoteTime = Math.ceil(ctx.currentTime / secPerBeat) * secPerBeat;
+        _metroNextBeatIndex = Math.round(_metroNextNoteTime / secPerBeat);
+        _metronomeScheduleTick();
+        _metroTimer = setInterval(_metronomeScheduleTick, _METRO_POLL_MS);
+    }
+
+    function _stopMetronome() {
+        if (_metroTimer) { clearInterval(_metroTimer); _metroTimer = null; }
+    }
+
+    function _setMetronomeEnabled(on) {
+        settings.metronomeEnabled = on;
+        saveSettings(settings);
+        if (on) { ensureProcessedStream().then(_startMetronome).catch(() => {}); }
+        else { _stopMetronome(); }
+        const btn = document.getElementById('xfw-metronome-toggle');
+        if (btn) btn.classList.toggle('xfw-metronome-on', on);
+    }
+
+    // Locks a decoded recording onto an EXACT duration (in samples) — needed
+    // because MediaRecorder's real start()/stop() calls always have a few ms
+    // of latency/jitter, so a "4 bar" auto-loop recording never comes back at
+    // *exactly* 4 bars. Loop playback loops on the buffer's own real length,
+    // but quantize timing is anchored to an idealized BPM grid — if those two
+    // don't match exactly, every subsequent quantized record/overdub start
+    // drifts a little further from the loop's actual downbeat each pass, which
+    // is what "autosnap doesn't seem to snap" turns into after a few takes.
+    // Truncating/padding to the ideal length keeps the loop's real period
+    // perfectly locked to the grid so future snaps always land on-beat.
+    function _lockBufferDuration(buf, targetSec) {
+        const ctx = ensureAudioContext();
+        const targetLen = Math.max(1, Math.round(targetSec * buf.sampleRate));
+        if (targetLen === buf.length) return buf;
+        const out = ctx.createBuffer(buf.numberOfChannels, targetLen, buf.sampleRate);
+        for (let ch = 0; ch < buf.numberOfChannels; ch++) {
+            const dst = out.getChannelData(ch);
+            const src = buf.getChannelData(ch);
+            dst.set(src.subarray(0, Math.min(targetLen, src.length)));
+        }
+        return out;
+    }
+
     async function loopStartRecord(layer) {
         const L = _loops[layer];
         if (!L || L.state !== 'empty') return;
@@ -1462,6 +1712,7 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         const L = _loops[layer];
         if (!L) return;
         L.chunks = [];
+        L.midiEvents = []; // fresh recording — clear any notes captured on a previous take
         try { L.rec = new MediaRecorder(loopRecordStream, { mimeType: 'audio/webm;codecs=opus' }); }
         catch { L.rec = new MediaRecorder(loopRecordStream); }
         L.rec.ondataavailable = e => { if (e.data.size > 0) L.chunks.push(e.data); };
@@ -1470,6 +1721,16 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             const blob = new Blob(L.chunks, { type: L.rec.mimeType });
             try {
                 L.buf = await ensureAudioContext().decodeAudioData(await blob.arrayBuffer());
+                // Auto-loop mode has a known ideal length (bars × bar duration) —
+                // lock the buffer to it so this loop's real playback period stays
+                // exactly on the tempo grid (see _lockBufferDuration above).
+                if (settings.loopBars[layer]) {
+                    const secPerBar = (60 / (settings.loopBpm || 120)) * 4;
+                    L.buf = _lockBufferDuration(L.buf, settings.loopBars[layer] * secPerBar);
+                }
+                // Clip captured notes to the final (locked) buffer length so the Piano
+                // Roll never shows a note hanging past the end of its own loop.
+                L.midiEvents = L.midiEvents.filter(ev => ev.on < L.buf.duration).map(ev => ({ ...ev, off: Math.min(ev.off, L.buf.duration) }));
                 L.state = 'stopped';
                 _loopStatus(layer, `Loop ready ⟳ ${L.buf.duration.toFixed(2)}s`);
                 // Auto-loop: if this track has a bar-length selected (not Manual),
@@ -1479,6 +1740,7 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             _updateLoopUI(layer);
         };
         L.rec.start();
+        L.recordStartCtxTime = ensureAudioContext().currentTime;
         L.state = 'recording';
         _loopStatus(layer, '● Recording…');
         _updateLoopUI(layer);
@@ -1558,16 +1820,28 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             try {
                 const newBuf = await ensureAudioContext().decodeAudioData(await blob.arrayBuffer());
                 L.buf = _mixAudioBuffers(baseBuf, newBuf);
+                // Keep the loop's length exactly what it was before this overdub
+                // pass (rather than whatever MediaRecorder's real stop latency
+                // produced) — same drift-prevention reasoning as the initial
+                // recording lock above, and it applies in Manual mode too since
+                // overdub is always meant to be exactly one loop-length pass.
+                L.buf = _lockBufferDuration(L.buf, baseBuf.duration);
             } catch (e) { console.warn('[XCaster] overdub decode failed', layer, e); }
+            // Clip to the final length (notes from THIS pass only — earlier passes
+            // were already clipped when they were recorded/overdubbed).
+            L.midiEvents = L.midiEvents.filter(ev => ev.on < L.buf.duration).map(ev => ({ ...ev, off: Math.min(ev.off, L.buf.duration) }));
             L.state = 'stopped';
             _loopStatus(layer, `Loop ready ⟳ ${L.buf.duration.toFixed(2)}s`);
             loopPlay(layer); // resume, phase-aligned from the top of the merged loop
             _updateLoopUI(layer);
         };
         // Restart playback right now from the top so what you hear (and what
-        // gets captured) is phase-aligned with the new overdub pass.
+        // gets captured) is phase-aligned with the new overdub pass. New notes
+        // are appended to the SAME L.midiEvents list (not cleared) so this pass's
+        // notes overlay the base recording's, matching the additive audio mix.
         _restartLoopSource(layer);
         L.rec.start();
+        L.recordStartCtxTime = ensureAudioContext().currentTime;
         L.state = 'overdubbing';
         _loopStatus(layer, `◑ Overdubbing ⟳ ${baseBuf.duration.toFixed(2)}s`);
         _updateLoopUI(layer);
@@ -1595,6 +1869,7 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         L.src = ctx.createBufferSource();
         L.src.buffer = L.buf; L.src.loop = true;
         L.src.connect(L.gainNode); L.src.start();
+        L.playStartCtxTime = ctx.currentTime; // Piano Roll playhead: (now - this) % buf.duration
     }
 
     function loopPlay(layer) {
@@ -1630,12 +1905,17 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         loopStop(layer);
         L.buf = null; L.state = 'empty';
         L.recDeadline = null; L.recDurationMs = null;
+        L.midiEvents = []; L.recordStartCtxTime = null; L.playStartCtxTime = null;
         _loopStatus(layer, 'No loop recorded');
         _updateLoopUI(layer);
     }
 
     function loopStopAllPlaying() { for (let i = 0; i < _LOOP_LAYERS; i++) loopStop(i); }
     function loopClearAll() { for (let i = 0; i < _LOOP_LAYERS; i++) loopClear(i); }
+    // Mirrors Stop All — (re)starts every track that currently has a recorded
+    // loop sitting stopped, so a full multi-track arrangement can be brought
+    // back in with one tap instead of hitting Play on each track individually.
+    function loopPlayAllStopped() { for (let i = 0; i < _LOOP_LAYERS; i++) { if (_loops[i]?.state === 'stopped') loopPlay(i); } }
 
     // Four explicit transport buttons per track (replaces the old single
     // multi-function pad, which was confusing since the SAME button meant
@@ -1709,6 +1989,136 @@ registerProcessor('xcaster-pitch',XCasterPitch);
     }
     function _setDisabled(selector, dis) { const e = document.querySelector(selector); if (e) e.disabled = dis; }
 
+    // ── Piano Roll (Ableton-style clip view) ────────────────────────────────
+    // Draws the notes captured above onto a canvas: a mini piano-key strip on
+    // the left, a note grid on the right with bar/beat lines at the shared
+    // loopBpm, and colored blocks for each note (x = time, y = pitch row,
+    // width = held duration). Two data sources: 'live' (a rolling window of
+    // whatever's currently being played, auto-scrolling) or a specific loop
+    // track's captured notes (static once the track isn't actively
+    // recording/overdubbing/playing, but still redrawn continuously via rAF
+    // since it's cheap and keeps the playhead moving during playback).
+    const PIANO_ROLL_KEY_W = 34;
+    const PIANO_ROLL_PX_PER_SEC = 90;
+    const PIANO_ROLL_LIVE_WINDOW_SEC = 8;
+
+    function _pianoRollData() {
+        const sel = settings.pianoRollTrack;
+        if (sel === 'live') {
+            const ctx = ensureAudioContext();
+            const now = ctx.currentTime;
+            const startT = now - PIANO_ROLL_LIVE_WINDOW_SEC;
+            const events = _liveMidiEvents
+                .filter(e => e.off > startT)
+                .map(e => ({ note: e.note, on: Math.max(0, e.on - startT), off: Math.min(PIANO_ROLL_LIVE_WINDOW_SEC, e.off - startT), vel: e.vel }));
+            // Notes still physically held draw as growing bars up to "now".
+            _activeNoteOnTimes.forEach((v, note) => {
+                events.push({ note, on: Math.max(0, v.t - startT), off: PIANO_ROLL_LIVE_WINDOW_SEC, vel: v.vel });
+            });
+            return { events, durationSec: PIANO_ROLL_LIVE_WINDOW_SEC, playheadSec: PIANO_ROLL_LIVE_WINDOW_SEC, live: true };
+        }
+        const layer = +sel;
+        const L = _loops[layer];
+        if (!L || !L.buf) return { events: [], durationSec: 4, playheadSec: null, live: false };
+        let playheadSec = null;
+        if ((L.state === 'playing' || L.state === 'overdubbing') && L.playStartCtxTime != null) {
+            const ctx = ensureAudioContext();
+            const elapsed = ctx.currentTime - L.playStartCtxTime;
+            playheadSec = ((elapsed % L.buf.duration) + L.buf.duration) % L.buf.duration;
+        }
+        return { events: L.midiEvents || [], durationSec: L.buf.duration, playheadSec, live: false };
+    }
+
+    function _drawPianoRoll() {
+        const canvas = document.getElementById('xfw-pianoroll-canvas');
+        if (!canvas) return;
+        const { events, durationSec, playheadSec, live } = _pianoRollData();
+        const rowH = Math.max(6, Math.min(28, settings.pianoRollRowH || 14));
+        let lo = 60, hi = 71; // default: one octave around middle C when there's no data yet
+        if (events.length) {
+            lo = Math.min(...events.map(e => e.note));
+            hi = Math.max(...events.map(e => e.note));
+        }
+        lo = Math.max(0, lo - 3); hi = Math.min(127, hi + 3);
+        if (hi - lo < 11) { const pad = Math.ceil((11 - (hi - lo)) / 2); lo = Math.max(0, lo - pad); hi = Math.min(127, hi + pad); }
+        const numRows = hi - lo + 1;
+        const width = PIANO_ROLL_KEY_W + Math.max(200, Math.ceil(durationSec * PIANO_ROLL_PX_PER_SEC)) + 20;
+        const height = numRows * rowH;
+        if (canvas.width !== width) canvas.width = width;
+        if (canvas.height !== height) canvas.height = height;
+        const g = canvas.getContext('2d');
+        g.clearRect(0, 0, width, height);
+
+        const isBlack = n => [1, 3, 6, 8, 10].includes(((n % 12) + 12) % 12);
+        // Row backgrounds + C-note dividers, so the grid reads like a keyboard.
+        for (let row = 0; row < numRows; row++) {
+            const note = hi - row;
+            g.fillStyle = isBlack(note) ? 'rgba(255,255,255,0.05)' : 'rgba(255,255,255,0.015)';
+            g.fillRect(PIANO_ROLL_KEY_W, row * rowH, width - PIANO_ROLL_KEY_W, rowH);
+            if (note % 12 === 0) {
+                g.strokeStyle = 'rgba(255,255,255,0.14)';
+                g.beginPath(); g.moveTo(PIANO_ROLL_KEY_W, row * rowH); g.lineTo(width, row * rowH); g.stroke();
+            }
+        }
+        // Mini piano-key strip on the left.
+        for (let row = 0; row < numRows; row++) {
+            const note = hi - row;
+            g.fillStyle = isBlack(note) ? '#14161b' : '#e7e7ec';
+            g.fillRect(0, row * rowH, PIANO_ROLL_KEY_W - 2, rowH - 1);
+            if (note % 12 === 0 && rowH >= 9) {
+                g.fillStyle = '#1d9bf0';
+                g.font = '9px sans-serif';
+                g.fillText(_midiToName(note), 2, row * rowH + rowH - 3);
+            }
+        }
+        // Bar/beat grid lines at the shared loop tempo.
+        const bpm = settings.loopBpm || 120;
+        const secPerBeat = 60 / bpm;
+        let beat = 0;
+        for (let t = 0; t <= durationSec + 0.001; t += secPerBeat, beat++) {
+            const x = PIANO_ROLL_KEY_W + t * PIANO_ROLL_PX_PER_SEC;
+            const isBar = beat % 4 === 0;
+            g.strokeStyle = isBar ? 'rgba(255,255,255,0.3)' : 'rgba(255,255,255,0.1)';
+            g.lineWidth = isBar ? 1.5 : 1;
+            g.beginPath(); g.moveTo(x, 0); g.lineTo(x, height); g.stroke();
+            if (isBar) {
+                g.fillStyle = 'rgba(255,255,255,0.55)';
+                g.font = '9px sans-serif';
+                g.fillText(String(Math.floor(beat / 4) + 1), x + 2, 9);
+            }
+        }
+        // Note blocks.
+        events.forEach(ev => {
+            if (ev.note < lo || ev.note > hi) return;
+            const row = hi - ev.note;
+            const x = PIANO_ROLL_KEY_W + ev.on * PIANO_ROLL_PX_PER_SEC;
+            const w = Math.max(3, (ev.off - ev.on) * PIANO_ROLL_PX_PER_SEC);
+            const alpha = 0.5 + 0.5 * ((ev.vel || 100) / 127);
+            g.fillStyle = `rgba(29,155,240,${alpha.toFixed(2)})`;
+            g.fillRect(x, row * rowH + 1, w, rowH - 2);
+        });
+        // Playhead.
+        if (playheadSec != null) {
+            const x = PIANO_ROLL_KEY_W + playheadSec * PIANO_ROLL_PX_PER_SEC;
+            g.strokeStyle = '#ef4444'; g.lineWidth = 2;
+            g.beginPath(); g.moveTo(x, 0); g.lineTo(x, height); g.stroke();
+        }
+        // Live view keeps the newest content in view.
+        const wrap = document.getElementById('xfw-pianoroll-scroll');
+        if (wrap && live) wrap.scrollLeft = wrap.scrollWidth;
+    }
+
+    let _pianoRollRAF = null;
+    function _ensurePianoRollRAF() {
+        if (_pianoRollRAF) return;
+        const tick = () => {
+            const popup = document.getElementById('xfw-pianoroll-popup');
+            if (!popup || popup.style.display === 'none') { _pianoRollRAF = null; return; }
+            _drawPianoRoll();
+            _pianoRollRAF = requestAnimationFrame(tick);
+        };
+        _pianoRollRAF = requestAnimationFrame(tick);
+    }
 
     function applySinkToAudioContext(ctx) {
         if (!ctx) return;
@@ -1898,6 +2308,15 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         auxMonitorGain.connect(monitorDest);
         aux2MonitorGain.connect(monitorDest);
         xcastMonitorGain.connect(monitorDest);
+
+        // Metronome click — wired STRAIGHT to monitorDest (headset/monitor-only
+        // bus), never to sbBus/loopRecordBus/mixBus, so it's always audible to
+        // the caster but can never leak into loop recordings or the X broadcast.
+        if (metronomeGain) { try { metronomeGain.disconnect(); } catch {} }
+        metronomeGain = ctx.createGain();
+        metronomeGain.gain.value = 1;
+        metronomeGain.connect(monitorDest);
+        if (settings.metronomeEnabled) _startMetronome();
 
         // Soundboard bus — pads, synth voices, and looper all connect here.
         if (sbBus)  { try { sbBus.disconnect();  } catch {} }
@@ -3175,6 +3594,12 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                     <div class="xfw-section">
                         <div class="xfw-slider-row" data-slider="loopGainDb" data-min="-40" data-max="12" data-step="0.5" data-suffix=" dB" data-label="Master level"></div>
                     </div>
+                    <div class="xfw-section">
+                        <label class="xfw-label">Piano Roll <span style="font-weight:400;font-size:11px;color:var(--xfw-muted)">(Ableton-style view of the MIDI notes you play or record)</span></label>
+                        <div class="xfw-buttons">
+                            <button id="xfw-show-pianoroll-popup" class="xfw-btn xfw-primary">⧉ Show Piano Roll</button>
+                        </div>
+                    </div>
                 </div>
 
             </div>
@@ -3357,9 +3782,11 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                         <input id="xfw-loop-bpm" type="number" min="40" max="240" step="1" class="xfw-modal-input" style="width:52px;text-align:center;" />
                         <span style="font-size:11px;color:var(--xfw-muted);">BPM</span>
                         <button id="xfw-loop-tap-tempo" class="xfw-btn" style="flex:0 0 auto;padding:6px 10px;">TAP</button>
+                        <button id="xfw-metronome-toggle" class="xfw-btn xfw-metronome-btn" style="flex:0 0 auto;padding:6px 10px;" title="Click track for timing — heard on your monitor output only, never recorded into a loop">🔔</button>
                     </div>
                 </div>
                 <div class="xfw-buttons" style="gap:6px;flex-wrap:wrap;margin-bottom:6px;">
+                    <button id="xfw-loop-play-all" class="xfw-btn" style="flex:1;">▶ Play All</button>
                     <button id="xfw-loop-stop-all" class="xfw-btn" style="flex:1;">■ Stop All</button>
                     <button id="xfw-loop-clear-all" class="xfw-btn" style="flex:1;">✕ Clear All</button>
                 </div>
@@ -3386,6 +3813,34 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                     <input type="range" class="xfw-loop-track-vol" data-track-vol="${n}" min="-40" max="12" step="0.5" title="Track ${n+1} level" />
                     <div data-loop-status="${n}" class="xfw-spk-status">No loop recorded</div>
                 </div>`).join('')}
+            </div>
+        </div>
+
+        <!-- PIANO ROLL POPUP — Ableton-style clip view of MIDI notes played,
+             either a live rolling window or a specific loop track's recording -->
+        <div id="xfw-pianoroll-popup" class="xfw-popup" style="display:none;width:420px;">
+            <div class="xfw-popup-header">
+                <span>🎹 Piano Roll</span>
+            </div>
+            <div class="xfw-popup-body">
+                <div class="xfw-row xfw-row-select">
+                    <div>Source</div>
+                    <select id="xfw-pianoroll-source" class="xfw-select xfw-select-sm">
+                        <option value="live">Live (now playing)</option>
+                        <option value="0">Track 1</option>
+                        <option value="1">Track 2</option>
+                        <option value="2">Track 3</option>
+                        <option value="3">Track 4</option>
+                        <option value="4">Track 5</option>
+                    </select>
+                </div>
+                <div class="xfw-row">
+                    <div>Expand keys<span class="xfw-help">Taller rows = easier to read pitches, like zooming in Ableton's piano roll.</span></div>
+                    <input id="xfw-pianoroll-zoom" type="range" min="6" max="28" step="1" style="flex:1;" />
+                </div>
+                <div id="xfw-pianoroll-scroll" style="overflow:auto;max-height:260px;border:1px solid var(--xfw-border);border-radius:8px;margin-top:6px;">
+                    <canvas id="xfw-pianoroll-canvas" width="420" height="154" style="display:block;"></canvas>
+                </div>
             </div>
         </div>`;
         document.documentElement.appendChild(root);
@@ -3685,20 +4140,25 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             });
         });
 
-        // Pads / Looper popups — movable windows shown while the Sounds tab is active.
+        // Pads / Looper / Piano Roll popups — movable windows shown while the Sounds tab is active.
         const padsPopup = document.getElementById('xfw-pads-popup');
         const loopPopup = document.getElementById('xfw-loop-popup');
+        const pianoRollPopup = document.getElementById('xfw-pianoroll-popup');
         function showPadsPopup() { if (padsPopup) { padsPopup.style.display = 'block'; applyPadsPopupPos(); } }
         function hidePadsPopup() { if (padsPopup) padsPopup.style.display = 'none'; }
         function showLoopPopup() { if (loopPopup) { loopPopup.style.display = 'block'; applyLoopPopupPos(); } }
         function hideLoopPopup() { if (loopPopup) loopPopup.style.display = 'none'; }
+        function showPianoRollPopup() { if (pianoRollPopup) { pianoRollPopup.style.display = 'block'; applyPianoRollPopupPos(); _ensurePianoRollRAF(); } }
+        function hidePianoRollPopup() { if (pianoRollPopup) pianoRollPopup.style.display = 'none'; }
         function syncSoundsPopups(soundsActive) {
             if (soundsActive && panel.classList.contains('xfw-open')) {
                 if (settings.padsPopupOpen) showPadsPopup(); else hidePadsPopup();
                 if (settings.loopPopupOpen) showLoopPopup(); else hideLoopPopup();
+                if (settings.pianoRollPopupOpen) showPianoRollPopup(); else hidePianoRollPopup();
             } else {
                 hidePadsPopup();
                 hideLoopPopup();
+                hidePianoRollPopup();
             }
         }
         window.__xcSyncSoundsPopups = () => {
@@ -3712,6 +4172,10 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         const showLoopBtn = document.getElementById('xfw-show-loop-popup');
         if (showLoopBtn) showLoopBtn.addEventListener('click', () => {
             settings.loopPopupOpen = true; saveSettings(settings); showLoopPopup();
+        });
+        const showPianoRollBtn = document.getElementById('xfw-show-pianoroll-popup');
+        if (showPianoRollBtn) showPianoRollBtn.addEventListener('click', () => {
+            settings.pianoRollPopupOpen = true; saveSettings(settings); showPianoRollPopup();
         });
         // Note: no manual close (✕) button on these popup headers — the windows
         // already auto-hide when you switch away from the Sounds tab (via
@@ -3731,6 +4195,32 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                 apply: applyLoopPopupPos,
                 target: loopPopup,
             });
+        }
+        if (pianoRollPopup) {
+            installDrag(pianoRollPopup.querySelector('.xfw-popup-header'), {
+                getPos: () => settings.pianoRollPopupPos,
+                setPos: (p) => { settings.pianoRollPopupPos = p; saveSettings(settings); applyPianoRollPopupPos(); },
+                apply: applyPianoRollPopupPos,
+                target: pianoRollPopup,
+            });
+            const srcSel = document.getElementById('xfw-pianoroll-source');
+            if (srcSel) {
+                srcSel.value = String(settings.pianoRollTrack);
+                srcSel.addEventListener('change', () => {
+                    settings.pianoRollTrack = srcSel.value === 'live' ? 'live' : +srcSel.value;
+                    saveSettings(settings);
+                    _drawPianoRoll();
+                });
+            }
+            const zoomSlider = document.getElementById('xfw-pianoroll-zoom');
+            if (zoomSlider) {
+                zoomSlider.value = String(settings.pianoRollRowH);
+                zoomSlider.addEventListener('input', () => {
+                    settings.pianoRollRowH = +zoomSlider.value;
+                    saveSettings(settings);
+                    _drawPianoRoll();
+                });
+            }
         }
 
         // toggles
@@ -3854,8 +4344,11 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             const buf = await file.arrayBuffer();
             await _padDB.put(`pad-${index}`, buf, file.name);
             _padBufferCache.delete(index); // clear cached decode
+            _padSamplePitch.delete(index);
             settings.sbPads[index].name = file.name.replace(/\.[^.]+$/, '').slice(0, 20);
             settings.sbPads[index].builtin = null; // custom sample replaces any built-in kit sound
+            settings.sbPads[index].sample = null;
+            settings.sbPads[index].sfzInstrument = null;
             saveSettings(settings);
             const btn = document.querySelector(`[data-pad="${index}"]`);
             if (btn) { btn.querySelector('.xfw-pad-name').textContent = settings.sbPads[index].name; btn.title = settings.sbPads[index].name; btn.classList.add('xfw-pad-loaded'); }
@@ -3966,9 +4459,13 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                 if (_peIndex<0) return;
                 await _padDB.del(`pad-${_peIndex}`);
                 _padBufferCache.delete(_peIndex);
+                _padSamplePitch.delete(_peIndex);
                 stopPad(_peIndex);
                 settings.sbPads[_peIndex].name = `Pad ${_peIndex+1}`;
                 settings.sbPads[_peIndex].builtin = null;
+                settings.sbPads[_peIndex].sample = null;
+                settings.sbPads[_peIndex].sfzInstrument = null;
+                settings.sbPads[_peIndex].sfzNote = null;
                 saveSettings(settings);
                 const btn=document.querySelector(`[data-pad="${_peIndex}"]`);
                 if (btn) { btn.querySelector('.xfw-pad-name').textContent=settings.sbPads[_peIndex].name; btn.classList.remove('xfw-pad-loaded'); }
@@ -4034,7 +4531,9 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         });
         for (let i = 0; i < _LOOP_LAYERS; i++) _updateLoopUI(i);
 
-        // Master Stop All / Clear All — like the RC-505's global stop + all-erase.
+        // Master Play All / Stop All / Clear All — like the RC-505's global play + stop + all-erase.
+        const loopPlayAllBtn = document.getElementById('xfw-loop-play-all');
+        if (loopPlayAllBtn) loopPlayAllBtn.addEventListener('click', () => loopPlayAllStopped());
         const loopStopAllBtn = document.getElementById('xfw-loop-stop-all');
         if (loopStopAllBtn) loopStopAllBtn.addEventListener('click', () => loopStopAllPlaying());
         const loopClearAllBtn = document.getElementById('xfw-loop-clear-all');
@@ -4083,6 +4582,13 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                     if (bpmEl) bpmEl.value = bpm;
                 }
             });
+        }
+
+        // Metronome (click track) — monitor-only, never recorded/broadcast.
+        const metroBtn = document.getElementById('xfw-metronome-toggle');
+        if (metroBtn) {
+            metroBtn.classList.toggle('xfw-metronome-on', !!settings.metronomeEnabled);
+            metroBtn.addEventListener('click', () => _setMetronomeEnabled(!settings.metronomeEnabled));
         }
 
         // Bar-length dial (circular selector) per layer: click cycles
@@ -4306,11 +4812,13 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                 settings.panelPos = null;
                 settings.padsPopupPos = null;
                 settings.loopPopupPos = null;
+                settings.pianoRollPopupPos = null;
                 saveSettings(settings);
                 applyFabPos();
                 applyPanelPos();
                 applyPadsPopupPos();
                 applyLoopPopupPos();
+                applyPianoRollPopupPos();
             });
         }
 
@@ -4455,6 +4963,9 @@ registerProcessor('xcaster-pitch',XCasterPitch);
     }
     function applyLoopPopupPos() {
         _applyFloatingPopupPos('xfw-loop-popup', settings.loopPopupPos, 300, 90);
+    }
+    function applyPianoRollPopupPos() {
+        _applyFloatingPopupPos('xfw-pianoroll-popup', settings.pianoRollPopupPos, 24, 420);
     }
 
     function installDrag(handle, opts) {

@@ -70,7 +70,7 @@ html.xfw-skin-on #react-root {
     position: fixed;
     right: 16px;
     bottom: 76px;
-    width: min(552px, calc(100vw - 32px));
+    width: min(660px, calc(100vw - 32px));
     max-height: calc(100vh - 33px);
     overflow-y: auto;
     background: var(--xfw-bg);
@@ -163,7 +163,7 @@ html.xfw-skin-on #react-root {
 }
 
 .xfw-tabs {
-    display: flex; gap: 4px; margin: 6px 0 10px;
+    display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0 10px;
     border-bottom: 1px solid var(--xfw-border);
 }
 .xfw-tab {
@@ -263,6 +263,11 @@ html.xfw-skin-on #react-root {
 .xfw-btn.xfw-primary:hover { color: #fff; }
 .xfw-btn.xfw-btn-rec { background: #dc2626; color: #fff; border-color: #dc2626; }
 .xfw-btn.xfw-btn-rec:hover { background: #b91c1c; }
+/* Metronome toggle — plays a monitor-only click, never gets recorded. */
+.xfw-metronome-btn.xfw-metronome-on {
+    background: var(--xfw-accent); color: #fff; border-color: var(--xfw-accent);
+    box-shadow: 0 0 8px 1px rgba(29, 155, 240, 0.55);
+}
 
 /* ── Loop Station (RC-505 Mk2-style) tracks ─────────────────────── */
 .xfw-loop-track { padding: 8px 0; border-top: 1px dashed var(--xfw-border); }
@@ -348,8 +353,15 @@ html.xfw-skin-on #react-root {
 .xfw-sub-pane.xfw-active { display: block; }
 
 /* ── 4×4 Pad grid ────────────────────────────────── */
+/* Pads fill the grid in index order (0-15) row-major top-to-bottom in the
+   DOM, but we want them read bottom-to-top (pad 1/kick at bottom-left, like
+   an MPC/Launchpad) without touching pad-index → MIDI-note mapping anywhere
+   in JS. Flipping the whole grid vertically then flipping each pad back
+   individually re-orders the ROWS (bottom-to-top) while leaving each row's
+   left-to-right order and every pad's own content right-side-up. */
 .xfw-pad-grid {
     display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 8px;
+    transform: scaleY(-1);
 }
 .xfw-pad {
     position: relative; aspect-ratio: 1; border-radius: 8px;
@@ -358,6 +370,7 @@ html.xfw-skin-on #react-root {
     display: flex; align-items: flex-end; justify-content: center;
     padding-bottom: 4px; overflow: hidden; transition: opacity 100ms, border-color 100ms;
     color: #fff; font-size: 10px; text-align: center;
+    transform: scaleY(-1);
 }
 .xfw-pad:hover { opacity: 0.9; }
 .xfw-pad.xfw-pad-loaded { opacity: 1; }
