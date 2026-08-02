@@ -1670,7 +1670,20 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             // alone if the note isn't mapped to a pad). synthNoteOn() already no-ops
             // when settings.synthEnabled is off, so this is safe either way.
             if (pi>=0) {
-                playPad(pi);
+                const p = settings.sbPads[pi];
+                // Melodic kits (WAF/SFZ): play the actual MIDI note received so the
+                // full keyboard is chromatic — pad layout stays as a visual guide only.
+                if (p?.wafUrl) {
+                    _playWAFNote(p.wafUrl, note);
+                    _paintPadState(pi, true);
+                    setTimeout(() => { if (!_padSources.has(pi)) _paintPadState(pi, false); }, 200);
+                } else if (p?.sfzInstrument && _SFZ_INSTRUMENTS[p.sfzInstrument]) {
+                    _playSfzNote(p.sfzInstrument, note);
+                    _paintPadState(pi, true);
+                    setTimeout(() => { if (!_padSources.has(pi)) _paintPadState(pi, false); }, 200);
+                } else {
+                    playPad(pi); // drums/sample kits — use the assigned hit
+                }
             } else {
                 // No pad is mapped to this exact note. For real-sample melodic
                 // kits (piano/guitar) fetch the exact SFZ region for this note
@@ -5111,6 +5124,9 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             panel.querySelectorAll('.xfw-kit-group').forEach(g => g.style.display = 'none');
             const grp = panel.querySelector(`#xfw-kit-group-${cat}`);
             if (grp) grp.style.display = grp.classList.contains('xfw-buttons') ? 'flex' : 'block';
+            // Auto-load the current selection when switching to a select-based tab
+            const sel = grp?.querySelector('.xfw-kit-select');
+            if (sel) loadKit(sel.value);
         }
         panel.querySelectorAll('.xfw-kit-tab').forEach(tab => {
             tab.addEventListener('click', () => _switchKitTab(tab.getAttribute('data-cat')));
