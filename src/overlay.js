@@ -994,6 +994,32 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                 { lokey: 83, hikey: 83, pitch: 83, sample: 'B5' }, { lokey: 84, hikey: 88, pitch: 84, sample: 'C6' },
             ],
         },
+        // Electric Guitar FSBS Bridge Clean (Andrea Biasior/FreePats, CC0) — freepats/e-guitar-FSBS-clean
+        // Fender Stratocaster bridge pickup clean tone, chromatic from C2 to C#6.
+        'guitar-clean': {
+            base: 'https://raw.githubusercontent.com/freepats/e-guitar-FSBS-clean/main/samples/', ext: 'flac',
+            regions: [
+                { lokey: 35, hikey: 38,  pitch: 36, sample: 'C2_s1_01' },
+                { lokey: 39, hikey: 40,  pitch: 40, sample: 'E2_s1_01' },
+                { lokey: 41, hikey: 42,  pitch: 41, sample: 'F2_s1_01' },
+                { lokey: 43, hikey: 46,  pitch: 45, sample: 'A2_s2_01' },
+                { lokey: 47, hikey: 49,  pitch: 48, sample: 'C3_s2_01' },
+                { lokey: 50, hikey: 51,  pitch: 50, sample: 'D3_s3_01' },
+                { lokey: 52, hikey: 53,  pitch: 52, sample: 'E3_s3_01' },
+                { lokey: 54, hikey: 56,  pitch: 55, sample: 'G3_s4_01' },
+                { lokey: 57, hikey: 59,  pitch: 59, sample: 'B3_s5_01' },
+                { lokey: 60, hikey: 62,  pitch: 61, sample: 'C#4_s5_01' },
+                { lokey: 63, hikey: 65,  pitch: 64, sample: 'E4_s6_01' },
+                { lokey: 66, hikey: 69,  pitch: 67, sample: 'G4_s6_01' },
+                { lokey: 70, hikey: 71,  pitch: 71, sample: 'B4_s6_01' },
+                { lokey: 72, hikey: 72,  pitch: 72, sample: 'C5_s6_01' },
+                { lokey: 73, hikey: 75,  pitch: 74, sample: 'D5_s6_01' },
+                { lokey: 76, hikey: 78,  pitch: 77, sample: 'F5_s6_01' },
+                { lokey: 79, hikey: 81,  pitch: 80, sample: 'G#5_s6_01' },
+                { lokey: 82, hikey: 83,  pitch: 82, sample: 'A#5_s6_01' },
+                { lokey: 84, hikey: 127, pitch: 85, sample: 'C#6_s6_01' },
+            ],
+        },
     };
     function _sfzRegionFor(instrument, note) {
         const inst = _SFZ_INSTRUMENTS[instrument];
@@ -1128,6 +1154,33 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             ['pop','Pop', SFX_BASE+'cartoon/pop'],
         ].map(([s, n, u]) => ({ builtin: `sfx:${s}`, name: n, sample: u || null })),
         synthkeys: Array.from({ length: 16 }, (_, i) => { const m = 60 + i; return { builtin: `synthkeys:${m}`, name: _midiToName(m) }; }),
+        // Guitar - Electric Clean (Andrea Biasior / FreePats, CC0) — freepats/e-guitar-FSBS-clean
+        // Fender Stratocaster bridge pickup, recorded chromatically C2–C#6.
+        'guitar-clean': Array.from({ length: 16 }, (_, i) => { const m = 40 + i; return { builtin: `guitar:${m}`, name: _midiToName(m), sfzInstrument: 'guitar-clean', sfzNote: m }; }),
+        // Acoustic drum kit (Gavin Mulford / FreePats, CC BY 4.0) — freepats/muldjordkit
+        // Real acoustic kit recorded with multiple round-robins and velocity layers.
+        // We use one representative mid-velocity sample per voice for pad triggering.
+        muldjordkit: (() => {
+            const BASE = 'https://raw.githubusercontent.com/freepats/muldjordkit/main/samples/';
+            return [
+                { builtin: 'kick',      name: 'Kick',       sample: BASE+'KdrumL/13-KdrumL.flac' },
+                { builtin: 'kick2',     name: 'Kick 2',     sample: BASE+'KdrumR/13-KdrumR.flac' },
+                { builtin: 'snare',     name: 'Snare 1',    sample: BASE+'Snare1/30-Snare.flac' },
+                { builtin: 'rim',       name: 'Snare 2',    sample: BASE+'Snare2/30-Snare.flac' },
+                { builtin: 'hihat_closed', name: 'HH Closed', sample: BASE+'HihatClosed/14-HihatClosed.flac' },
+                { builtin: 'hihat_open',   name: 'HH Open',   sample: BASE+'HihatOpen/12-HihatOpen.flac' },
+                { builtin: 'hihat_pedal',  name: 'Ride',      sample: BASE+'RideL/5-RideL.flac' },
+                { builtin: 'clap',         name: 'Ride Bell', sample: BASE+'RideLBell/2-RideLBell.flac' },
+                { builtin: 'crash',        name: 'Crash L',   sample: BASE+'CrashL/5-CrashL.flac' },
+                { builtin: 'ride',         name: 'Crash R',   sample: BASE+'CrashR/5-CrashR.flac' },
+                { builtin: 'cowbell',      name: 'China',     sample: BASE+'China/6-China.flac' },
+                { builtin: 'tomlo',        name: 'Tom 1',     sample: BASE+'Tom1/5-Tom1.flac' },
+                { builtin: 'tommid',       name: 'Tom 2',     sample: BASE+'Tom2/5-Tom2.flac' },
+                { builtin: 'tomhi',        name: 'Tom 3',     sample: BASE+'Tom3/6-Tom3.flac' },
+                { builtin: 'shaker',       name: 'Tom 4',     sample: BASE+'Tom4/10-Tom4.flac' },
+                { builtin: 'stick',        name: 'Brush Snr', sample: BASE+'SnareRest1/6-SnareRest.flac' },
+            ];
+        })(),
     };
 
 
@@ -3574,14 +3627,28 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                     </div>
                     <div class="xfw-section">
                         <label class="xfw-label">Default kits <span style="font-weight:400;font-size:11px;color:var(--xfw-muted)">(fills all 16 pads — like the sounds on X mobile)</span></label>
-                        <div class="xfw-buttons" style="gap:6px;flex-wrap:wrap;">
-                            <button class="xfw-btn xfw-kit-btn" data-kit="drums">🥁 Drum kit</button>
-                            <button class="xfw-btn xfw-kit-btn" data-kit="808">🔊 808 Kit</button>
-                            <button class="xfw-btn xfw-kit-btn" data-kit="lofi">📻 Lo-Fi Kit</button>
-                            <button class="xfw-btn xfw-kit-btn" data-kit="piano">🎹 Piano</button>
-                            <button class="xfw-btn xfw-kit-btn" data-kit="guitar">🎸 Guitar</button>
-                            <button class="xfw-btn xfw-kit-btn" data-kit="sfx">🎉 Sound FX</button>
-                            <button class="xfw-btn xfw-kit-btn" data-kit="synthkeys">🎛 Synth keys</button>
+                        <div style="display:flex;flex-direction:column;gap:5px;">
+                            <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap;">
+                                <span style="font-size:10px;color:var(--xfw-muted);min-width:44px;">Drums</span>
+                                <button class="xfw-btn xfw-kit-btn" data-kit="drums" style="flex:1;">LM-2</button>
+                                <button class="xfw-btn xfw-kit-btn" data-kit="808" style="flex:1;">TR-808</button>
+                                <button class="xfw-btn xfw-kit-btn" data-kit="lofi" style="flex:1;">Lo-Fi</button>
+                                <button class="xfw-btn xfw-kit-btn" data-kit="muldjordkit" style="flex:1;">Acoustic</button>
+                            </div>
+                            <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap;">
+                                <span style="font-size:10px;color:var(--xfw-muted);min-width:44px;">Keys</span>
+                                <button class="xfw-btn xfw-kit-btn" data-kit="piano" style="flex:1;">Piano</button>
+                                <button class="xfw-btn xfw-kit-btn" data-kit="synthkeys" style="flex:1;">Synth</button>
+                            </div>
+                            <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap;">
+                                <span style="font-size:10px;color:var(--xfw-muted);min-width:44px;">Guitar</span>
+                                <button class="xfw-btn xfw-kit-btn" data-kit="guitar" style="flex:1;">Classical</button>
+                                <button class="xfw-btn xfw-kit-btn" data-kit="guitar-clean" style="flex:1;">Electric</button>
+                            </div>
+                            <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap;">
+                                <span style="font-size:10px;color:var(--xfw-muted);min-width:44px;">FX</span>
+                                <button class="xfw-btn xfw-kit-btn" data-kit="sfx" style="flex:1;">🎉 Sound FX</button>
+                            </div>
                         </div>
                     </div>
                     <div class="xfw-section">
