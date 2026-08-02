@@ -927,6 +927,7 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         for (const p of padList) {
             if (p.sample) _getRealSampleBuffer(p.sample).catch(() => {});
             if (p.sfzInstrument && p.sfzNote != null) _getSfzSampleBuffer(p.sfzInstrument, p.sfzNote).catch(() => {});
+            if (p.wafUrl && p.wafNote != null) _getWAFBuffer(p.wafUrl, p.wafNote).catch(() => {});
         }
     }
 
@@ -1092,6 +1093,82 @@ registerProcessor('xcaster-pitch',XCasterPitch);
     const TR808_BASE = 'https://smpldsnds.github.io/drum-machines/tr-808/';
     const LM2_BASE    = 'https://smpldsnds.github.io/drum-machines/lm-2/';
     const RZ1_BASE    = 'https://smpldsnds.github.io/drum-machines/casio-rz1/';
+
+    // ── WebAudioFont GM instruments (surikov/webaudiofontdata) ───────────────
+    // ~1 400 instruments across all 128 GM programs (5-10 soundfont variants
+    // each), served as JS files that embed base64-encoded OGG zone samples.
+    // We fetch as plain text and extract the audio data with regex — no eval(),
+    // no script injection. Decoded AudioBuffers are cached so each instrument
+    // is downloaded only once per session.
+    const _WAF_BASE = 'https://surikov.github.io/webaudiofontdata/sound/';
+    const _wafZoneCache = new Map(); // url → [{lokey,hikey,pitch,buffer}]
+    // Build WAF file URL: MIDI program × 10, zero-padded to 4 digits.
+    const _wafUrl = prog => `${_WAF_BASE}${String(prog * 10).padStart(4,'0')}_FluidR3_GM_sf2_file.js`;
+
+    async function _fetchWAFZones(url) {
+        if (_wafZoneCache.has(url)) return _wafZoneCache.get(url);
+        // Prevent duplicate concurrent fetches by storing the in-flight promise.
+        const loadKey = url + ':loading';
+        if (_wafZoneCache.has(loadKey)) return _wafZoneCache.get(loadKey);
+        const prom = (async () => {
+            try {
+                const res = await fetch(url);
+                if (!res.ok) return null;
+                const text = await res.text();
+                const ctx = ensureAudioContext();
+                const zones = [];
+                // Each WAF zone looks like: {keyRangeLow:N, keyRangeHigh:N,
+                // originalPitch:N, ..., file:"data:audio/ogg;base64,<data>"}
+                // originalPitch is in centitones (6000 = MIDI 60).
+                const fileRe = /"file"\s*:\s*"data:audio[^;]*;base64,([^"]+)"/g;
+                let m;
+                while ((m = fileRe.exec(text)) !== null) {
+                    const before = text.slice(Math.max(0, m.index - 400), m.index);
+                    const lo    = +(/keyRangeLow\s*:\s*(\d+)/.exec(before)?.[1]    ?? 0);
+                    const hi    = +(/keyRangeHigh\s*:\s*(\d+)/.exec(before)?.[1]   ?? 127);
+                    const raw   = +(/originalPitch\s*:\s*(\d+)/.exec(before)?.[1]  ?? 6000);
+                    const pitch = Math.round(raw / 100);
+                    try {
+                        const bin = atob(m[1]);
+                        const buf = new ArrayBuffer(bin.length);
+                        const view = new Uint8Array(buf);
+                        for (let i = 0; i < bin.length; i++) view[i] = bin.charCodeAt(i);
+                        const ab = await ctx.decodeAudioData(buf);
+                        zones.push({ lokey: lo, hikey: hi, pitch, buffer: ab });
+                    } catch {}
+                }
+                if (zones.length) { _wafZoneCache.set(url, zones); _wafZoneCache.delete(loadKey); return zones; }
+            } catch {}
+            _wafZoneCache.delete(loadKey);
+            return null;
+        })();
+        _wafZoneCache.set(loadKey, prom);
+        return prom;
+    }
+
+    async function _getWAFBuffer(url, note) {
+        const zones = await _fetchWAFZones(url);
+        if (!zones) return null;
+        const zone = zones.find(z => note >= z.lokey && note <= z.hikey);
+        if (!zone) return null;
+        return { buffer: zone.buffer, pitch: zone.pitch };
+    }
+
+    async function _playWAFNote(url, note) {
+        if (!sbBus) { try { await ensureProcessedStream(); } catch {} }
+        const res = await _getWAFBuffer(url, note);
+        if (!res || !sbSourceBus) return;
+        const ctx = ensureAudioContext();
+        const src = ctx.createBufferSource();
+        src.buffer = res.buffer;
+        src.playbackRate.value = Math.pow(2, (note - res.pitch) / 12);
+        const vol = ctx.createGain();
+        vol.gain.value = settings.sbPads.reduce((v, p) => p?.wafNote != null ? (p.volume ?? 0.8) : v, 0.8);
+        src.connect(vol); vol.connect(sbSourceBus);
+        src.start();
+    }
+
+
     // Google's public "Sound Library" CDN (used by Actions on Google) — real
     // recorded royalty-free effects, served with Access-Control-Allow-Origin: *
     // so they can be fetched directly from the page. Used for the handful of
@@ -1158,10 +1235,76 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             ['pop','Pop', SFX_BASE+'cartoon/pop'],
         ].map(([s, n, u]) => ({ builtin: `sfx:${s}`, name: n, sample: u || null })),
         synthkeys: Array.from({ length: 16 }, (_, i) => { const m = 60 + i; return { builtin: `synthkeys:${m}`, name: _midiToName(m) }; }),
-        // Guitar - Electric Clean (Andrea Biasior / FreePats, CC0) — freepats/e-guitar-FSBS-clean
-        // Fender Stratocaster bridge pickup, recorded chromatically C2–C#6.
+        // Guitar - Electric Clean (FreePats, CC0)
         'guitar-clean': Array.from({ length: 16 }, (_, i) => { const m = 40 + i; return { builtin: `guitar:${m}`, name: _midiToName(m), sfzInstrument: 'guitar-clean', sfzNote: m }; }),
-        // Acoustic drum kit (Gavin Mulford / FreePats, CC BY 4.0) — freepats/muldjordkit
+        // ── WebAudioFont GM kits — fetched lazily, no eval, FluidR3 soundfont ──
+        // Helper: 16 pads for a GM MIDI program starting at startNote.
+        ...(function() {
+            const waf = (prog, start, label, low) => Array.from({ length: 16 }, (_, i) => {
+                const m = start + i;
+                return { builtin: `piano:${m}`, name: _midiToName(m), wafUrl: _wafUrl(prog), wafNote: m };
+            });
+            return {
+                // Keys
+                'piano-bright':   waf(1,  60),
+                'epiano1':        waf(4,  60),
+                'epiano2':        waf(5,  60),
+                'harpsichord':    waf(6,  48),
+                'organ-rock':     waf(18, 48),
+                'organ-church':   waf(19, 48),
+                'organ-drawbar':  waf(16, 48),
+                'accordion':      waf(21, 48),
+                // Guitar family
+                'guitar-nylon':   waf(24, 40),
+                'guitar-steel':   waf(25, 40),
+                'guitar-jazz':    waf(26, 40),
+                'guitar-overdrive': waf(29, 40),
+                'guitar-distortion': waf(30, 40),
+                // Bass
+                'bass-acoustic':  waf(32, 28),
+                'bass-electric':  waf(33, 28),
+                'bass-fretless':  waf(35, 28),
+                'bass-slap':      waf(36, 28),
+                'bass-synth1':    waf(38, 28),
+                'bass-synth2':    waf(39, 28),
+                // Strings
+                'violin':         waf(40, 55),
+                'viola':          waf(41, 48),
+                'cello':          waf(42, 36),
+                'harp':           waf(46, 41),
+                'strings':        waf(48, 48),
+                'strings-synth':  waf(50, 48),
+                // Brass
+                'trumpet':        waf(56, 52),
+                'trombone':       waf(57, 40),
+                'french-horn':    waf(60, 40),
+                'brass-section':  waf(61, 48),
+                'synth-brass':    waf(62, 48),
+                // Winds/Reed
+                'sax-soprano':    waf(64, 54),
+                'sax-alto':       waf(65, 46),
+                'sax-tenor':      waf(66, 44),
+                'flute':          waf(73, 60),
+                'clarinet':       waf(71, 50),
+                'oboe':           waf(68, 58),
+                // World/Ethnic
+                'banjo':          waf(105, 48),
+                'sitar':          waf(104, 48),
+                'koto':           waf(107, 55),
+                'kalimba':        waf(108, 57),
+                'fiddle':         waf(110, 55),
+                'shanai':         waf(111, 48),
+                // Synth Pads & Leads
+                'pad-new-age':    waf(88, 48),
+                'pad-warm':       waf(89, 48),
+                'pad-choir':      waf(91, 48),
+                'pad-metallic':   waf(93, 48),
+                'synth-lead-sq':  waf(80, 48),
+                'synth-lead-saw': waf(81, 48),
+                'synth-lead-chiff': waf(83, 48),
+            };
+        })(),
+        // Acoustic drum kit (FreePats muldjordkit, CC BY 4.0)
         // Real acoustic kit recorded with multiple round-robins and velocity layers.
         // We use one representative mid-velocity sample per voice for pad triggering.
         muldjordkit: (() => {
@@ -1204,12 +1347,16 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                 sample: item.sample || null,
                 sfzInstrument: item.sfzInstrument || null,
                 sfzNote: item.sfzNote != null ? item.sfzNote : null,
+                wafUrl: item.wafUrl || null,
+                wafNote: item.wafNote != null ? item.wafNote : null,
             };
         }
         saveSettings(settings);
         _refreshPadGridUI();
         _prefetchRealSamples(settings.sbPads); // warm 16-pad real-sample cache
-        if (kit[0]?.sfzInstrument) _prefetchSfzAllRegions(kit[0].sfzInstrument); // warm full keyboard range
+        const fp = settings.sbPads[0];
+        if (fp?.sfzInstrument) _prefetchSfzAllRegions(fp.sfzInstrument);
+        else if (fp?.wafUrl) _fetchWAFZones(fp.wafUrl).catch(() => {});
     }
 
     // ── IndexedDB pad storage (audio files persist across sessions) ──────────
@@ -1236,6 +1383,10 @@ registerProcessor('xcaster-pitch',XCasterPitch);
     async function loadPadBuffer(index) {
         if (_padBufferCache.has(index)) return _padBufferCache.get(index);
         const pad = settings.sbPads[index];
+        if (pad?.wafUrl && pad?.wafNote != null) {
+            const res = await _getWAFBuffer(pad.wafUrl, pad.wafNote);
+            if (res) { _padBufferCache.set(index, res.buffer); _padSamplePitch.set(index, res.pitch); return res.buffer; }
+        }
         if (pad?.sfzInstrument && pad?.sfzNote != null) {
             const res = await _getSfzSampleBuffer(pad.sfzInstrument, pad.sfzNote);
             if (res) { _padBufferCache.set(index, res.buffer); _padSamplePitch.set(index, res.pitch); return res.buffer; }
@@ -1528,8 +1679,11 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                 // For procedural kits (synthkeys, custom) fall back to the old
                 // nearest-pad pitch-shift path.
                 const sfzKit = settings.sbPads[0]?.sfzInstrument;
+                const wafKit = settings.sbPads[0]?.wafUrl;
                 if (sfzKit && _SFZ_INSTRUMENTS[sfzKit]) {
                     _playSfzNote(sfzKit, note);
+                } else if (wafKit) {
+                    _playWAFNote(wafKit, note);
                 } else {
                     const melodic = _melodicPadForNote(note);
                     if (melodic) playPadPitched(melodic.index, note - melodic.baked);
@@ -1729,15 +1883,19 @@ registerProcessor('xcaster-pitch',XCasterPitch);
     function _metronomeClick(time, accent) {
         if (!metronomeGain) return;
         const ctx = ensureAudioContext();
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.type = 'square';
-        osc.frequency.value = accent ? 1600 : 1000;
-        gain.gain.setValueAtTime(0, time);
-        gain.gain.linearRampToValueAtTime(accent ? 0.5 : 0.32, time + 0.002);
-        gain.gain.exponentialRampToValueAtTime(0.0001, time + 0.04);
-        osc.connect(gain); gain.connect(metronomeGain);
-        osc.start(time); osc.stop(time + 0.05);
+        // Wood-block feel: two harmonically-related sines with fast decay.
+        const freqs = accent ? [1200, 1800] : [800, 1200];
+        const vols  = accent ? [0.55, 0.22] : [0.36, 0.14];
+        freqs.forEach((f, h) => {
+            const osc = ctx.createOscillator();
+            const gain = ctx.createGain();
+            osc.type = 'sine'; osc.frequency.value = f;
+            gain.gain.setValueAtTime(0, time);
+            gain.gain.linearRampToValueAtTime(vols[h], time + 0.001);
+            gain.gain.exponentialRampToValueAtTime(0.0001, time + 0.06);
+            osc.connect(gain); gain.connect(metronomeGain);
+            osc.start(time); osc.stop(time + 0.07);
+        });
     }
 
     function _metronomeScheduleTick() {
@@ -1821,8 +1979,15 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             }
             const msUntilBar = Math.max(0, (nextBar - ctx.currentTime) * 1000);
             L.state = 'armed-record';
-            _loopStatus(layer, `⏳ Count-in… (1 bar)`);
+            _loopStatus(layer, `⏳ 1`);
             _updateLoopUI(layer);
+            // Show beat number in the status label so the performer sees the count.
+            const beatMs = secPerBeat * 1000;
+            const countStartMs = Math.max(0, (countStart - ctx.currentTime) * 1000);
+            for (let b = 2; b <= 4; b++) {
+                const delay = countStartMs + (b - 1) * beatMs;
+                setTimeout(() => { if (L.state === 'armed-record') _loopStatus(layer, b < 4 ? `⏳ ${b}` : `⏳ 4 ►`); }, delay);
+            }
             L.armTimer = setTimeout(() => { L.armTimer = null; _beginRecording(layer); }, msUntilBar);
             return;
         }
@@ -3637,21 +3802,106 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                             <button class="xfw-btn xfw-kit-tab" data-cat="drums">🥁 Drums</button>
                             <button class="xfw-btn xfw-kit-tab" data-cat="keys">🎹 Keys</button>
                             <button class="xfw-btn xfw-kit-tab" data-cat="guitar">🎸 Guitar</button>
+                            <button class="xfw-btn xfw-kit-tab" data-cat="bass">🎵 Bass</button>
+                            <button class="xfw-btn xfw-kit-tab" data-cat="strings">🎻 Strings</button>
+                            <button class="xfw-btn xfw-kit-tab" data-cat="brass">🎺 Brass</button>
+                            <button class="xfw-btn xfw-kit-tab" data-cat="winds">🎷 Winds</button>
+                            <button class="xfw-btn xfw-kit-tab" data-cat="world">🌍 World</button>
+                            <button class="xfw-btn xfw-kit-tab" data-cat="pads">🌊 Pads</button>
                             <button class="xfw-btn xfw-kit-tab" data-cat="fx">🎉 FX</button>
                         </div>
+                        <!-- Drum tab: buttons for each kit variant -->
                         <div id="xfw-kit-group-drums" class="xfw-kit-group xfw-buttons" style="gap:6px;flex-wrap:wrap;display:none;">
                             <button class="xfw-btn xfw-kit-btn" data-kit="drums" style="flex:1;">LM-2</button>
                             <button class="xfw-btn xfw-kit-btn" data-kit="808" style="flex:1;">TR-808</button>
                             <button class="xfw-btn xfw-kit-btn" data-kit="lofi" style="flex:1;">Lo-Fi</button>
                             <button class="xfw-btn xfw-kit-btn" data-kit="muldjordkit" style="flex:1;">Acoustic</button>
                         </div>
-                        <div id="xfw-kit-group-keys" class="xfw-kit-group xfw-buttons" style="gap:6px;flex-wrap:wrap;display:none;">
-                            <button class="xfw-btn xfw-kit-btn" data-kit="piano" style="flex:1;">Piano</button>
-                            <button class="xfw-btn xfw-kit-btn" data-kit="synthkeys" style="flex:1;">Synth Keys</button>
+                        <!-- All other tabs: select dropdown that loads on change -->
+                        <div id="xfw-kit-group-keys" class="xfw-kit-group" style="display:none;">
+                            <select class="xfw-select xfw-kit-select" style="width:100%;">
+                                <option value="piano">Piano — FM Electric (FreePats)</option>
+                                <option value="piano-bright">Bright Acoustic Piano</option>
+                                <option value="epiano1">Electric Piano 1 (Rhodes style)</option>
+                                <option value="epiano2">Electric Piano 2 (DX style)</option>
+                                <option value="harpsichord">Harpsichord</option>
+                                <option value="organ-drawbar">Drawbar Organ</option>
+                                <option value="organ-rock">Rock Organ</option>
+                                <option value="organ-church">Church Organ</option>
+                                <option value="accordion">Accordion</option>
+                                <option value="synthkeys">Synth Keys (procedural)</option>
+                            </select>
                         </div>
-                        <div id="xfw-kit-group-guitar" class="xfw-kit-group xfw-buttons" style="gap:6px;flex-wrap:wrap;display:none;">
-                            <button class="xfw-btn xfw-kit-btn" data-kit="guitar" style="flex:1;">Classical</button>
-                            <button class="xfw-btn xfw-kit-btn" data-kit="guitar-clean" style="flex:1;">Electric Clean</button>
+                        <div id="xfw-kit-group-guitar" class="xfw-kit-group" style="display:none;">
+                            <select class="xfw-select xfw-kit-select" style="width:100%;">
+                                <option value="guitar">Classical / Nylon (FreePats)</option>
+                                <option value="guitar-clean">Electric Clean (FreePats)</option>
+                                <option value="guitar-nylon">Nylon Guitar (WAF)</option>
+                                <option value="guitar-steel">Steel Acoustic Guitar</option>
+                                <option value="guitar-jazz">Jazz Guitar</option>
+                                <option value="guitar-overdrive">Overdriven Guitar</option>
+                                <option value="guitar-distortion">Distortion Guitar</option>
+                            </select>
+                        </div>
+                        <div id="xfw-kit-group-bass" class="xfw-kit-group" style="display:none;">
+                            <select class="xfw-select xfw-kit-select" style="width:100%;">
+                                <option value="bass-acoustic">Acoustic Bass</option>
+                                <option value="bass-electric">Electric Bass (finger)</option>
+                                <option value="bass-fretless">Fretless Bass</option>
+                                <option value="bass-slap">Slap Bass</option>
+                                <option value="bass-synth1">Synth Bass 1</option>
+                                <option value="bass-synth2">Synth Bass 2</option>
+                            </select>
+                        </div>
+                        <div id="xfw-kit-group-strings" class="xfw-kit-group" style="display:none;">
+                            <select class="xfw-select xfw-kit-select" style="width:100%;">
+                                <option value="violin">Violin</option>
+                                <option value="viola">Viola</option>
+                                <option value="cello">Cello</option>
+                                <option value="harp">Orchestral Harp</option>
+                                <option value="strings">String Ensemble 1</option>
+                                <option value="strings-synth">Synth Strings</option>
+                            </select>
+                        </div>
+                        <div id="xfw-kit-group-brass" class="xfw-kit-group" style="display:none;">
+                            <select class="xfw-select xfw-kit-select" style="width:100%;">
+                                <option value="trumpet">Trumpet</option>
+                                <option value="trombone">Trombone</option>
+                                <option value="french-horn">French Horn</option>
+                                <option value="brass-section">Brass Section</option>
+                                <option value="synth-brass">Synth Brass</option>
+                            </select>
+                        </div>
+                        <div id="xfw-kit-group-winds" class="xfw-kit-group" style="display:none;">
+                            <select class="xfw-select xfw-kit-select" style="width:100%;">
+                                <option value="sax-alto">Alto Saxophone</option>
+                                <option value="sax-tenor">Tenor Saxophone</option>
+                                <option value="sax-soprano">Soprano Saxophone</option>
+                                <option value="flute">Flute</option>
+                                <option value="clarinet">Clarinet</option>
+                                <option value="oboe">Oboe</option>
+                            </select>
+                        </div>
+                        <div id="xfw-kit-group-world" class="xfw-kit-group" style="display:none;">
+                            <select class="xfw-select xfw-kit-select" style="width:100%;">
+                                <option value="banjo">Banjo</option>
+                                <option value="sitar">Sitar</option>
+                                <option value="koto">Koto</option>
+                                <option value="kalimba">Kalimba</option>
+                                <option value="fiddle">Fiddle</option>
+                                <option value="shanai">Shanai</option>
+                            </select>
+                        </div>
+                        <div id="xfw-kit-group-pads" class="xfw-kit-group" style="display:none;">
+                            <select class="xfw-select xfw-kit-select" style="width:100%;">
+                                <option value="pad-warm">Pad — Warm</option>
+                                <option value="pad-new-age">Pad — New Age</option>
+                                <option value="pad-choir">Pad — Choir</option>
+                                <option value="pad-metallic">Pad — Metallic</option>
+                                <option value="synth-lead-sq">Synth Lead — Square</option>
+                                <option value="synth-lead-saw">Synth Lead — Sawtooth</option>
+                                <option value="synth-lead-chiff">Synth Lead — Chiff</option>
+                            </select>
                         </div>
                         <div id="xfw-kit-group-fx" class="xfw-kit-group xfw-buttons" style="gap:6px;flex-wrap:wrap;display:none;">
                             <button class="xfw-btn xfw-kit-btn" data-kit="sfx" style="flex:1;">Sound FX</button>
@@ -4490,9 +4740,10 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             _padBufferCache.delete(index); // clear cached decode
             _padSamplePitch.delete(index);
             settings.sbPads[index].name = file.name.replace(/\.[^.]+$/, '').slice(0, 20);
-            settings.sbPads[index].builtin = null; // custom sample replaces any built-in kit sound
+            settings.sbPads[index].builtin = null;
             settings.sbPads[index].sample = null;
             settings.sbPads[index].sfzInstrument = null;
+            settings.sbPads[index].wafUrl = null; settings.sbPads[index].wafNote = null;
             saveSettings(settings);
             const btn = document.querySelector(`[data-pad="${index}"]`);
             if (btn) { btn.querySelector('.xfw-pad-name').textContent = settings.sbPads[index].name; btn.title = settings.sbPads[index].name; btn.classList.add('xfw-pad-loaded'); }
@@ -4610,6 +4861,8 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                 settings.sbPads[_peIndex].sample = null;
                 settings.sbPads[_peIndex].sfzInstrument = null;
                 settings.sbPads[_peIndex].sfzNote = null;
+                settings.sbPads[_peIndex].wafUrl = null;
+                settings.sbPads[_peIndex].wafNote = null;
                 saveSettings(settings);
                 const btn=document.querySelector(`[data-pad="${_peIndex}"]`);
                 if (btn) { btn.querySelector('.xfw-pad-name').textContent=settings.sbPads[_peIndex].name; btn.classList.remove('xfw-pad-loaded'); }
@@ -4857,10 +5110,14 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             panel.querySelectorAll('.xfw-kit-tab').forEach(t => t.classList.toggle('xfw-kit-tab-active', t.getAttribute('data-cat') === cat));
             panel.querySelectorAll('.xfw-kit-group').forEach(g => g.style.display = 'none');
             const grp = panel.querySelector(`#xfw-kit-group-${cat}`);
-            if (grp) grp.style.display = 'flex';
+            if (grp) grp.style.display = grp.classList.contains('xfw-buttons') ? 'flex' : 'block';
         }
         panel.querySelectorAll('.xfw-kit-tab').forEach(tab => {
             tab.addEventListener('click', () => _switchKitTab(tab.getAttribute('data-cat')));
+        });
+        // Select-based tabs auto-load on change
+        panel.querySelectorAll('.xfw-kit-select').forEach(sel => {
+            sel.addEventListener('change', () => loadKit(sel.value));
         });
         _switchKitTab('drums'); // open on Drums tab by default
 
