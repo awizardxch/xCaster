@@ -93,7 +93,7 @@
         loopPopupOpen: true,    // whether the Looper window should auto-show with the Sounds tab
         pianoRollPopupPos: null,     // {x, y} or null = default position
         pianoRollPopupOpen: false,   // Piano Roll starts hidden — opt-in via its own show button
-        pianoRollRowH: 14,           // px per note row — "expand"/zoom control, taller = easier to read
+        pianoRollRowH: 18,           // px per note row — "expand"/zoom control, taller = easier to read
         pianoRollTrack: 'live',      // 'live' (rolling view of whatever's being played) | 0-4 (a loop track's recorded notes)
         // FX / Autotune
         autotuneEnabled: false,
@@ -900,21 +900,25 @@ registerProcessor('xcaster-pitch',XCasterPitch);
     // real-sample pad also keeps its original procedural `builtin` sound as
     // an automatic offline/network-failure fallback — nothing breaks if the
     // stream has no internet access mid-show.
-    const _realSampleCache = new Map(); // baseUrl(no ext) → AudioBuffer
-    async function _getRealSampleBuffer(baseUrlNoExt) {
-        if (_realSampleCache.has(baseUrlNoExt)) return _realSampleCache.get(baseUrlNoExt);
+    const _realSampleCache = new Map(); // url → AudioBuffer
+    async function _getRealSampleBuffer(urlOrBase) {
+        if (_realSampleCache.has(urlOrBase)) return _realSampleCache.get(urlOrBase);
         const ctx = ensureAudioContext();
-        for (const ext of ['ogg', 'm4a']) {
+        // If the URL already ends in a known audio extension, fetch it directly.
+        // Otherwise try .ogg then .m4a (the smpldsnds.github.io CDN pattern).
+        const hasExt = /\.(ogg|m4a|flac|mp3|wav)$/i.test(urlOrBase);
+        const candidates = hasExt ? [urlOrBase] : [`${urlOrBase}.ogg`, `${urlOrBase}.m4a`];
+        for (const url of candidates) {
             try {
-                const res = await fetch(`${baseUrlNoExt}.${ext}`);
+                const res = await fetch(url);
                 if (!res.ok) continue;
                 const buf = await res.arrayBuffer();
                 const ab = await ctx.decodeAudioData(buf);
-                _realSampleCache.set(baseUrlNoExt, ab);
+                _realSampleCache.set(urlOrBase, ab);
                 return ab;
-            } catch { /* try next format / fail silently, caller falls back */ }
+            } catch { /* try next / fail silently */ }
         }
-        console.warn('[XCaster] real sample fetch failed, using procedural fallback:', baseUrlNoExt);
+        console.warn('[XCaster] real sample fetch failed, using procedural fallback:', urlOrBase);
         return null;
     }
     // Warms the cache for a kit's real samples in the background so the first
@@ -2156,7 +2160,7 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         const canvas = document.getElementById('xfw-pianoroll-canvas');
         if (!canvas) return;
         const { events, durationSec, playheadSec, live } = _pianoRollData();
-        const rowH = Math.max(6, Math.min(28, settings.pianoRollRowH || 14));
+        const rowH = Math.max(6, Math.min(40, settings.pianoRollRowH || 14));
         let lo = 60, hi = 71; // default: one octave around middle C when there's no data yet
         if (events.length) {
             lo = Math.min(...events.map(e => e.note));
@@ -2165,7 +2169,9 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         lo = Math.max(0, lo - 3); hi = Math.min(127, hi + 3);
         if (hi - lo < 11) { const pad = Math.ceil((11 - (hi - lo)) / 2); lo = Math.max(0, lo - pad); hi = Math.min(127, hi + pad); }
         const numRows = hi - lo + 1;
-        const width = PIANO_ROLL_KEY_W + Math.max(200, Math.ceil(durationSec * PIANO_ROLL_PX_PER_SEC)) + 20;
+        const scroll = document.getElementById('xfw-pianoroll-scroll');
+        const minW = scroll ? Math.max(200, scroll.clientWidth - 4) : 600;
+        const width = PIANO_ROLL_KEY_W + Math.max(minW, Math.ceil(durationSec * PIANO_ROLL_PX_PER_SEC)) + 20;
         const height = numRows * rowH;
         if (canvas.width !== width) canvas.width = width;
         if (canvas.height !== height) canvas.height = height;
@@ -3627,28 +3633,28 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                     </div>
                     <div class="xfw-section">
                         <label class="xfw-label">Default kits <span style="font-weight:400;font-size:11px;color:var(--xfw-muted)">(fills all 16 pads — like the sounds on X mobile)</span></label>
-                        <div style="display:flex;flex-direction:column;gap:5px;">
-                            <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap;">
-                                <span style="font-size:10px;color:var(--xfw-muted);min-width:44px;">Drums</span>
-                                <button class="xfw-btn xfw-kit-btn" data-kit="drums" style="flex:1;">LM-2</button>
-                                <button class="xfw-btn xfw-kit-btn" data-kit="808" style="flex:1;">TR-808</button>
-                                <button class="xfw-btn xfw-kit-btn" data-kit="lofi" style="flex:1;">Lo-Fi</button>
-                                <button class="xfw-btn xfw-kit-btn" data-kit="muldjordkit" style="flex:1;">Acoustic</button>
-                            </div>
-                            <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap;">
-                                <span style="font-size:10px;color:var(--xfw-muted);min-width:44px;">Keys</span>
-                                <button class="xfw-btn xfw-kit-btn" data-kit="piano" style="flex:1;">Piano</button>
-                                <button class="xfw-btn xfw-kit-btn" data-kit="synthkeys" style="flex:1;">Synth</button>
-                            </div>
-                            <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap;">
-                                <span style="font-size:10px;color:var(--xfw-muted);min-width:44px;">Guitar</span>
-                                <button class="xfw-btn xfw-kit-btn" data-kit="guitar" style="flex:1;">Classical</button>
-                                <button class="xfw-btn xfw-kit-btn" data-kit="guitar-clean" style="flex:1;">Electric</button>
-                            </div>
-                            <div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap;">
-                                <span style="font-size:10px;color:var(--xfw-muted);min-width:44px;">FX</span>
-                                <button class="xfw-btn xfw-kit-btn" data-kit="sfx" style="flex:1;">🎉 Sound FX</button>
-                            </div>
+                        <div id="xfw-kit-tabs" style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:8px;">
+                            <button class="xfw-btn xfw-kit-tab" data-cat="drums">🥁 Drums</button>
+                            <button class="xfw-btn xfw-kit-tab" data-cat="keys">🎹 Keys</button>
+                            <button class="xfw-btn xfw-kit-tab" data-cat="guitar">🎸 Guitar</button>
+                            <button class="xfw-btn xfw-kit-tab" data-cat="fx">🎉 FX</button>
+                        </div>
+                        <div id="xfw-kit-group-drums" class="xfw-kit-group xfw-buttons" style="gap:6px;flex-wrap:wrap;display:none;">
+                            <button class="xfw-btn xfw-kit-btn" data-kit="drums" style="flex:1;">LM-2</button>
+                            <button class="xfw-btn xfw-kit-btn" data-kit="808" style="flex:1;">TR-808</button>
+                            <button class="xfw-btn xfw-kit-btn" data-kit="lofi" style="flex:1;">Lo-Fi</button>
+                            <button class="xfw-btn xfw-kit-btn" data-kit="muldjordkit" style="flex:1;">Acoustic</button>
+                        </div>
+                        <div id="xfw-kit-group-keys" class="xfw-kit-group xfw-buttons" style="gap:6px;flex-wrap:wrap;display:none;">
+                            <button class="xfw-btn xfw-kit-btn" data-kit="piano" style="flex:1;">Piano</button>
+                            <button class="xfw-btn xfw-kit-btn" data-kit="synthkeys" style="flex:1;">Synth Keys</button>
+                        </div>
+                        <div id="xfw-kit-group-guitar" class="xfw-kit-group xfw-buttons" style="gap:6px;flex-wrap:wrap;display:none;">
+                            <button class="xfw-btn xfw-kit-btn" data-kit="guitar" style="flex:1;">Classical</button>
+                            <button class="xfw-btn xfw-kit-btn" data-kit="guitar-clean" style="flex:1;">Electric Clean</button>
+                        </div>
+                        <div id="xfw-kit-group-fx" class="xfw-kit-group xfw-buttons" style="gap:6px;flex-wrap:wrap;display:none;">
+                            <button class="xfw-btn xfw-kit-btn" data-kit="sfx" style="flex:1;">Sound FX</button>
                         </div>
                     </div>
                     <div class="xfw-section">
@@ -3956,7 +3962,7 @@ registerProcessor('xcaster-pitch',XCasterPitch);
 
         <!-- PIANO ROLL POPUP — Ableton-style clip view of MIDI notes played,
              either a live rolling window or a specific loop track's recording -->
-        <div id="xfw-pianoroll-popup" class="xfw-popup" style="display:none;width:420px;">
+        <div id="xfw-pianoroll-popup" class="xfw-popup" style="display:none;width:640px;">
             <div class="xfw-popup-header">
                 <span>🎹 Piano Roll</span>
             </div>
@@ -3974,10 +3980,10 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                 </div>
                 <div class="xfw-row">
                     <div>Expand keys<span class="xfw-help">Taller rows = easier to read pitches, like zooming in Ableton's piano roll.</span></div>
-                    <input id="xfw-pianoroll-zoom" type="range" min="6" max="28" step="1" style="flex:1;" />
+                    <input id="xfw-pianoroll-zoom" type="range" min="6" max="40" step="1" style="flex:1;" />
                 </div>
-                <div id="xfw-pianoroll-scroll" style="overflow:auto;max-height:260px;border:1px solid var(--xfw-border);border-radius:8px;margin-top:6px;">
-                    <canvas id="xfw-pianoroll-canvas" width="420" height="154" style="display:block;"></canvas>
+                <div id="xfw-pianoroll-scroll" style="overflow:auto;max-height:480px;min-height:200px;border:1px solid var(--xfw-border);border-radius:8px;margin-top:6px;resize:vertical;">
+                    <canvas id="xfw-pianoroll-canvas" width="600" height="200" style="display:block;"></canvas>
                 </div>
             </div>
         </div>`;
@@ -4846,6 +4852,18 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         _wireUnlearnTransport('xfw-unlearn-loop-play', 'midiPlayMap');
         _paintTransportStatus();
 
+        // Kit category tabs — show/hide the relevant kit buttons group
+        function _switchKitTab(cat) {
+            panel.querySelectorAll('.xfw-kit-tab').forEach(t => t.classList.toggle('xfw-kit-tab-active', t.getAttribute('data-cat') === cat));
+            panel.querySelectorAll('.xfw-kit-group').forEach(g => g.style.display = 'none');
+            const grp = panel.querySelector(`#xfw-kit-group-${cat}`);
+            if (grp) grp.style.display = 'flex';
+        }
+        panel.querySelectorAll('.xfw-kit-tab').forEach(tab => {
+            tab.addEventListener('click', () => _switchKitTab(tab.getAttribute('data-cat')));
+        });
+        _switchKitTab('drums'); // open on Drums tab by default
+
         // Default kit buttons (Drums / Piano / Guitar / SFX / Synth keys)
         panel.querySelectorAll('.xfw-kit-btn').forEach(btn => {
             btn.addEventListener('click', () => loadKit(btn.getAttribute('data-kit')));
@@ -5109,7 +5127,7 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         _applyFloatingPopupPos('xfw-loop-popup', settings.loopPopupPos, 300, 90);
     }
     function applyPianoRollPopupPos() {
-        _applyFloatingPopupPos('xfw-pianoroll-popup', settings.pianoRollPopupPos, 24, 420);
+        _applyFloatingPopupPos('xfw-pianoroll-popup', settings.pianoRollPopupPos, 24, 640);
     }
 
     function installDrag(handle, opts) {
