@@ -883,6 +883,95 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         }
     }
 
+    // ---------- decoded-audio budget ---------------------------------------
+    // _realSampleCache / _wafZoneCache / _padBufferCache hold DECODED
+    // AudioBuffers — float32 PCM, so a 1 MB compressed sample lands as ~10-20 MB
+    // resident. They were plain Maps with no eviction anywhere: the only
+    // .delete() calls were for in-flight load keys and failed URLs. Browsing the
+    // GM instrument catalog therefore grew the renderer without bound, and
+    // nothing short of reloading the tab gave the memory back.
+    //
+    // Track every decoded buffer against a byte budget, evict least-recently-used
+    // past the cap, and drop the lot once the Sounds rig has gone idle.
+    //
+    // Eviction is safe while audio is playing: an AudioBufferSourceNode holds its
+    // own reference to the AudioBuffer, so a note already sounding runs to
+    // completion. The cost of evicting is a re-fetch on next use, not a glitch.
+    const AUDIO_CACHE_MAX_BYTES = 200 * 1024 * 1024;
+    const AUDIO_CACHE_IDLE_MS   = 5 * 60 * 1000;
+    const _audioCache = new Map();   // key → { bytes, used, drop }
+    let _audioCacheBytes = 0;
+    let _soundsLastUsed = Date.now();
+
+    function _bufBytes(b) {
+        try { return b && b.length ? b.length * (b.numberOfChannels || 1) * 4 : 0; }
+        catch { return 0; }
+    }
+    const _mb = n => Math.round(n / 1048576) + 'MB';
+
+    function _trackDecoded(key, bytes, drop) {
+        if (!bytes) return;
+        const prev = _audioCache.get(key);
+        if (prev) _audioCacheBytes -= prev.bytes;
+        _audioCache.set(key, { bytes, used: Date.now(), drop });
+        _audioCacheBytes += bytes;
+        _soundsLastUsed = Date.now();
+        _enforceAudioBudget();
+    }
+
+    function _touchDecoded(key) {
+        const e = _audioCache.get(key);
+        if (e) e.used = Date.now();
+        _soundsLastUsed = Date.now();
+    }
+
+    function _dropDecoded(key) {
+        const e = _audioCache.get(key);
+        if (!e) return;
+        _audioCache.delete(key);
+        _audioCacheBytes -= e.bytes;
+        try { e.drop(); } catch { /* ignore */ }
+        // _padBufferCache holds REFERENCES to these same AudioBuffers, so
+        // dropping the source cache while a pad still points at one frees
+        // nothing — the buffer stays reachable and the budget is fiction.
+        // Pads reload lazily through loadPadBuffer(), so clearing is cheap.
+        _purgePadBuffers();
+    }
+
+    function _purgePadBuffers() {
+        try {
+            if (typeof _padBufferCache !== 'undefined') _padBufferCache.clear();
+            if (typeof _padSamplePitch !== 'undefined') _padSamplePitch.clear();
+        } catch { /* not built yet */ }
+    }
+
+    function _enforceAudioBudget() {
+        if (_audioCacheBytes <= AUDIO_CACHE_MAX_BYTES) return;
+        const oldestFirst = [..._audioCache.entries()].sort((a, b) => a[1].used - b[1].used);
+        let freed = 0;
+        for (const [key] of oldestFirst) {
+            if (_audioCacheBytes <= AUDIO_CACHE_MAX_BYTES) break;
+            freed += _audioCache.get(key)?.bytes || 0;
+            _dropDecoded(key);
+        }
+        if (freed) console.info('[XCaster] decoded-audio budget: freed', _mb(freed) + ',', _mb(_audioCacheBytes), 'still cached');
+    }
+
+    function _freeAllDecoded(reason) {
+        if (!_audioCache.size) return;
+        const was = _audioCacheBytes;
+        for (const key of [..._audioCache.keys()]) _dropDecoded(key);
+        console.info('[XCaster] released', _mb(was), 'of decoded audio —', reason);
+    }
+
+    // Called from the health watchdog. Frees everything once the Sounds rig has
+    // been untouched long enough that holding a GM catalog in RAM is pure cost.
+    function sweepIdleAudioCache() {
+        if (!_audioCache.size) return;
+        if (Date.now() - _soundsLastUsed < AUDIO_CACHE_IDLE_MS) return;
+        _freeAllDecoded('Sounds idle for ' + Math.round(AUDIO_CACHE_IDLE_MS / 60000) + ' min');
+    }
+
     const _builtinBufferCache = new Map(); // builtin key → Promise<AudioBuffer>
     function _getBuiltinBuffer(key) {
         if (_builtinBufferCache.has(key)) return _builtinBufferCache.get(key);
@@ -902,7 +991,7 @@ registerProcessor('xcaster-pitch',XCasterPitch);
     // stream has no internet access mid-show.
     const _realSampleCache = new Map(); // url → AudioBuffer
     async function _getRealSampleBuffer(urlOrBase) {
-        if (_realSampleCache.has(urlOrBase)) return _realSampleCache.get(urlOrBase);
+        if (_realSampleCache.has(urlOrBase)) { _touchDecoded('real:' + urlOrBase); return _realSampleCache.get(urlOrBase); }
         const ctx = ensureAudioContext();
         // If the URL already ends in a known audio extension, fetch it directly.
         // Otherwise try .ogg then .m4a (the smpldsnds.github.io CDN pattern).
@@ -915,6 +1004,7 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                 const buf = await res.arrayBuffer();
                 const ab = await ctx.decodeAudioData(buf);
                 _realSampleCache.set(urlOrBase, ab);
+                _trackDecoded('real:' + urlOrBase, _bufBytes(ab), () => _realSampleCache.delete(urlOrBase));
                 return ab;
             } catch { /* try next / fail silently */ }
         }
@@ -1047,7 +1137,7 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         if (!region) return null;
         const inst = _SFZ_INSTRUMENTS[instrument];
         const url = `${inst.base}${region.sample}.${inst.ext}`;
-        if (_realSampleCache.has(url)) return { buffer: _realSampleCache.get(url), pitch: region.pitch };
+        if (_realSampleCache.has(url)) { _touchDecoded('real:' + url); return { buffer: _realSampleCache.get(url), pitch: region.pitch }; }
         const ctx = ensureAudioContext();
         try {
             const res = await fetch(url);
@@ -1055,6 +1145,7 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             const buf = await res.arrayBuffer();
             const ab = await ctx.decodeAudioData(buf);
             _realSampleCache.set(url, ab);
+            _trackDecoded('real:' + url, _bufBytes(ab), () => _realSampleCache.delete(url));
             return { buffer: ab, pitch: region.pitch };
         } catch (e) {
             console.warn('[XCaster] FreePats sample fetch failed, using procedural fallback:', url, e);
@@ -1106,7 +1197,7 @@ registerProcessor('xcaster-pitch',XCasterPitch);
     const _wafUrl = prog => `${_WAF_BASE}${String(prog * 10).padStart(4,'0')}_FluidR3_GM_sf2_file.js`;
 
     async function _fetchWAFZones(url) {
-        if (_wafZoneCache.has(url)) return _wafZoneCache.get(url);
+        if (_wafZoneCache.has(url)) { _touchDecoded('waf:' + url); return _wafZoneCache.get(url); }
         const loadKey = url + ':loading';
         if (_wafZoneCache.has(loadKey)) return _wafZoneCache.get(loadKey);
         const prom = (async () => {
@@ -1138,6 +1229,11 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                 }
                 if (zones.length) {
                     _wafZoneCache.set(url, zones); _wafZoneCache.delete(loadKey);
+                    // A GM instrument is many multisampled zones — the single
+                    // biggest contributor to the old unbounded growth.
+                    let bytes = 0;
+                    for (const z of zones) bytes += _bufBytes(z.buffer);
+                    _trackDecoded('waf:' + url, bytes, () => _wafZoneCache.delete(url));
                     return zones;
                 }
                 console.warn('[XCaster] WAF no zones decoded from', url);
@@ -2495,6 +2591,8 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             // audio glitch-free when the renderer is briefly throttled (window
             // minimized/occluded). The added ~20ms latency is invisible for X.
             audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'playback' });
+            // Now there is an audio graph worth keeping scheduled when occluded.
+            setTimeout(maybeStartWorkerKeepalive, 0);
             // Auto-resume whenever Chromium suspends the context (focus loss,
             // device switch, OS audio session change, etc.)
             audioCtx.addEventListener('statechange', () => {
@@ -5628,6 +5726,12 @@ registerProcessor('xcaster-pitch',XCasterPitch);
     // ---------- background skin -------------------------------------------
     function installBackground() {
         if (document.getElementById('xfw-bg')) return;
+        // Only decode video when the skin is actually on. This used to run
+        // unconditionally at boot with applySkin() merely setting display:none
+        // afterwards, so every tab in the app — the overlay is injected into
+        // ALL of them — kept an autoplay/loop <video> alive and decoding, and
+        // tryPlay() below re-kicked it on every visibilitychange and focus.
+        if (!settings.bgEnabled) return;
         const tint = document.createElement('div');
         tint.id = 'xfw-bg-tint';
         const vid = document.createElement('video');
@@ -5644,16 +5748,36 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         document.documentElement.insertBefore(vid, document.documentElement.firstChild);
         // Browsers may pause the muted autoplay if the page hasn't been interacted
         // with yet; try to kick it.
-        const tryPlay = () => { vid.play?.().catch(() => {}); };
-        tryPlay();
-        document.addEventListener('visibilitychange', tryPlay);
-        window.addEventListener('focus', tryPlay);
+        // Only decode while this tab is actually on screen. The overlay is
+        // injected into every tab, so the previous unconditional tryPlay() —
+        // which fired on visibilitychange even when the page had just become
+        // HIDDEN — kept a video decoding in every background tab at once.
+        const syncPlayback = () => {
+            if (document.hidden) { try { vid.pause(); } catch { /* ignore */ } return; }
+            vid.play?.().catch(() => {});
+        };
+        syncPlayback();
+        document.addEventListener('visibilitychange', syncPlayback);
+        window.addEventListener('focus', syncPlayback);
+    }
+
+    // Tear the background video down rather than hiding it — display:none keeps
+    // the element, its decoder and its buffered data resident.
+    function removeBackground() {
+        const vid = document.getElementById('xfw-bg');
+        if (vid) {
+            try { vid.pause(); vid.removeAttribute('src'); vid.load(); } catch { /* ignore */ }
+            vid.remove();
+        }
+        document.getElementById('xfw-bg-tint')?.remove();
     }
 
     function applySkin() {
         const html = document.documentElement;
         const on = !!settings.bgEnabled;
         html.classList.toggle('xfw-skin-on', on);
+        if (on) installBackground();
+        else removeBackground();
         const vid = document.getElementById('xfw-bg');
         const tint = document.getElementById('xfw-bg-tint');
         if (vid) vid.style.display = on ? '' : 'none';
@@ -5829,6 +5953,7 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                 if (t && t.readyState === 'ended') rebuildAux2();
             }
             healActiveAudioSendersIfNeeded().catch(() => {});
+            sweepIdleAudioCache();
         }, 4000);
     }
 
@@ -5839,6 +5964,16 @@ registerProcessor('xcaster-pitch',XCasterPitch);
     // resumes any suspended AudioContexts and forces the main thread to
     // remain scheduled regularly. This eliminates audio choppiness when
     // other apps cover the XCaster window.
+    let _keepaliveStarted = false;
+    // Only worth running where an AudioContext exists. Called from install()
+    // (a no-op on a tab with no graph) and again from ensureAudioContext().
+    function maybeStartWorkerKeepalive() {
+        if (_keepaliveStarted) return;
+        if (!audioCtx && !xOutputCtx && !xBroadcastCtx) return;
+        _keepaliveStarted = true;
+        startWorkerKeepalive();
+    }
+
     function startWorkerKeepalive() {
         try {
             const src = `let id = setInterval(() => postMessage(0), 250);`;
@@ -5863,7 +5998,12 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         applyPanelPos();
         wire();
         startHealthWatchdog();
-        startWorkerKeepalive();
+        // startWorkerKeepalive() is NOT called here any more. It exists to keep
+        // the audio thread scheduled when the window is occluded, so it is worth
+        // a Worker plus a 250ms ping only on a tab that actually has an audio
+        // graph. The overlay is injected into every tab, so starting it at boot
+        // meant a worker per tab doing nothing. ensureAudioContext() starts it.
+        maybeStartWorkerKeepalive();
     }
     install();
 })();
