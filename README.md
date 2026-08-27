@@ -9,13 +9,13 @@ It ships its own Chromium (via Electron), disables WebRTC AGC at the engine leve
 ## Download
 
 **Windows (x64)**
-[XCaster v1.2.0 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.2.0/XCaster-win32-x64.zip)
+[XCaster v1.4.0 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.0/XCaster-win32-x64.zip)
 
 **macOS (Apple Silicon / arm64)**
-[XCaster v1.2.0 — XCaster-darwin-arm64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.2.0/XCaster-darwin-arm64.zip)
+[XCaster v1.4.0 — XCaster-darwin-arm64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.0/XCaster-darwin-arm64.zip)
 
 **macOS (Intel / x64)**
-[XCaster v1.2.0 — XCaster-darwin-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.2.0/XCaster-darwin-x64.zip)
+[XCaster v1.4.0 — XCaster-darwin-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.0/XCaster-darwin-x64.zip)
 
 Extract the zip and run `XCaster.exe` (Windows) or `XCaster.app` (macOS) — no installer required.
 
@@ -23,11 +23,33 @@ Extract the zip and run `XCaster.exe` (Windows) or `XCaster.app` (macOS) — no 
 
 ---
 
-## What's new in v1.3.0 (beta)
+## What's new in v1.4.0
 
-> This is a **beta** build — the `Download` links above still point to the stable v1.2.0 release. Grab the v1.3.0 beta build from the [Releases page](https://github.com/awizardxch/xCaster/releases) (marked **Pre-release**), or build it yourself from source (see **Run from source** / **Build standalone exe** below).
+This is the first **stable** build of the Soundboard + MIDI instrument + Loop Station line — it ships everything from the v1.3.0 beta series plus a full General MIDI instrument catalog and two mixer mute fixes.
 
-This is a major release that adds a full **Soundboard + MIDI instrument + Loop Station** rig to the mixer, on top of X Spaces reliability fixes.
+### Mixer mute fixes
+- **"Mute mic" no longer silences everything.** The panel toggle zeroed the mic channel gain but also disabled the WebRTC sender track — and that track carries the whole mix (Mic + Aux 1 + Aux 2 + xCaster + Sounds), so muting the mic cut the entire broadcast. It is now a channel mute only; Aux, xCaster and Sounds keep sending.
+- **X's own mic button inside a Space now works.** XCaster hands X a clone of the processed mix and swaps in fresh clones on device changes, so the track object X held drifted away from the one actually being sent — X's mute button flipped `enabled` on a stale clone and had no effect on the audio. That toggle is now intercepted and translated into a real broadcast mute: nothing reaches the Space, while your headset monitor and the broadcast-out device (virtual cable) keep running.
+- The Mic pane shows a live **X Space mic: live / MUTED** status line so you can tell which of the two mutes is engaged.
+
+### General MIDI instrument catalog
+- Full GM instrument catalog via **WebAudioFont**, loaded through a safe parser (no `eval`), with **10 instrument tabs** and a per-tab instrument selector — clicking a kit tab auto-loads its instrument
+- **Full chromatic keyboard** for melodic WebAudioFont/SFZ kits, and direct SFZ region lookup replacing the old 16-pad nearest-neighbour stretch, so sampled instruments play correctly across the whole keyboard instead of one octave
+- Grouped kit selector (Drums / Keys / Guitar / FX) with real sampled **Acoustic** (FreePats muldjordkit, CC-BY) and **Electric Guitar Clean** (FreePats FSBS, CC0) kits
+
+### Loop Station & piano roll
+- Proper DAW-style **1-2-3-4 count-in** on first record, skipped automatically when quantize is off
+- **Piano roll** opens from the Loop Station — resizable on both axes, with a quantize button
+- Metronome click track, and the pad grid now reads bottom-to-top like a hardware controller
+- Wider panel with wrapping tabs
+
+---
+
+## What's new in v1.3.0
+
+Released as a beta series (`v1.3.0-beta.1` … `.3`); these features first shipped in a stable build as part of v1.4.0 above.
+
+This release adds a full **Soundboard + MIDI instrument + Loop Station** rig to the mixer, on top of X Spaces reliability fixes.
 
 ### MIDI instrument integration
 - Full Web MIDI support — pick your input device and channel in the new **Sounds → MIDI** pane, with a live raw-message monitor so you can confirm hardware is being seen even before anything is mapped

@@ -349,10 +349,10 @@ function createWindow() {
                         dialog.showMessageBox(mainWindow, {
                             type: 'info',
                             title: 'About XCaster',
-                            message: 'XCaster v1.4.0-beta.1',
+                            message: 'XCaster v1.4.0',
                             detail:
                                 'Standalone Windows shell for x.com with WebRTC AGC, noise suppression, and echo cancellation disabled.\n\n' +
-                                'v1.4.0-beta.1 — Mixer mute fixes: the panel Mute mic toggle now silences only the mic channel instead of the whole outgoing mix, and the native X mic button inside a Space now actually mutes what the Space receives.\n\n' +
+                                'v1.4.0 — Mixer mute fixes: the panel Mute mic toggle now silences only the mic channel instead of the whole outgoing mix, and the native X mic button inside a Space now actually mutes what the Space receives. Also adds the full General MIDI instrument catalog via WebAudioFont with 10 instrument tabs, a DAW-style 1-2-3-4 count-in, a resizable piano roll with quantize, grouped kit selection with real FreePats acoustic and electric guitar samples, and full chromatic keyboard coverage for melodic kits.\n\n' +
                                 'v1.3.0 — Added a full Soundboard + MIDI instrument + Loop Station rig: 16-pad soundboard with 7 built-in kits (Drums/808/Lo-Fi/Piano/Guitar/Synth keys/Sound FX), MIDI keyboard support with a synth layer and pad/transport learn mode, real-time mic pitch shift/autotune, a redesigned 5-track Loop Station with quantized recording, and fixes for background-tab slowdowns and X tab crash recovery.\n\n' +
                                 'v1.0.1 — Full multi-channel DSP mixer (Mic + Aux 1 + Aux 2 + xCaster), dual output routing (X Spaces injection + monitor/cue), reapply audio graph for clean channel selection, virtual cable auto-installer, compressor, limiter, EQ, background skin, and live meters.\n\n' +
                                 'Built for X Spaces streamers who need clean, professional audio.',
