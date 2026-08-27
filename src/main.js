@@ -121,6 +121,9 @@ function cleanupRuntimeGuards() {
         } catch {}
     }
     powerSaveBlockerIds.clear();
+
+    // Never leave renderer/audio-service priorities raised after we exit.
+    restoreAllProcessPriorities();
 }
 
 function raiseMainProcessPriorityWindows() {
@@ -129,6 +132,69 @@ function raiseMainProcessPriorityWindows() {
         const highPriority = os.constants?.priority?.PRIORITY_HIGH ?? -14;
         os.setPriority(process.pid, highPriority);
     } catch {}
+}
+
+// ---------- OS process priority for live Spaces --------------------------
+// raiseMainProcessPriorityWindows() above raises only process.pid - the MAIN
+// process. But the X tab's WebRTC decode and the Web Audio graph run in a
+// RENDERER process, and Chromium mixes and outputs audio in a separate Audio
+// Service utility process. Both are distinct OS PIDs and neither was ever
+// raised, so when Windows deprioritizes XCaster as a background app - most
+// sharply when another app is loading the CPU - those are precisely the
+// processes that lose their scheduling slice. That is why Space audio could
+// still stutter or drop with the whole window in the background, behaviour that
+// goes back to v0.5 and is untouched by the tab-switch throttle fix in v1.4.3,
+// which only governs Chromium's own per-view throttling.
+//
+// Raise them only while a Space is actually live, and restore them afterwards
+// so an idle XCaster stays a well-behaved background app.
+const _raisedPids = new Map(); // pid -> priority observed before we raised it
+
+function _trySetPriority(pid, priority) {
+    try { os.setPriority(pid, priority); return true; } catch { return false; }
+}
+
+function raiseProcessPriority(pid) {
+    if (!pid || _raisedPids.has(pid)) return;
+    let previous = null;
+    try { previous = os.getPriority(pid); } catch { /* not readable */ }
+    // ABOVE_NORMAL rather than HIGH: enough to win a scheduling slice against
+    // background work without letting a renderer starve the rest of the system.
+    const aboveNormal = os.constants?.priority?.PRIORITY_ABOVE_NORMAL ?? -7;
+    if (_trySetPriority(pid, aboveNormal)) _raisedPids.set(pid, previous);
+}
+
+function restoreProcessPriority(pid) {
+    if (!_raisedPids.has(pid)) return;
+    const previous = _raisedPids.get(pid);
+    const normal = os.constants?.priority?.PRIORITY_NORMAL ?? 0;
+    _trySetPriority(pid, previous == null ? normal : previous);
+    _raisedPids.delete(pid);
+}
+
+function restoreAllProcessPriorities() {
+    for (const pid of [..._raisedPids.keys()]) restoreProcessPriority(pid);
+}
+
+// Chromium's audio mixing/output lives in its own utility process.
+function audioServicePids() {
+    const pids = [];
+    try {
+        for (const m of app.getAppMetrics()) {
+            const name = String(m.name || m.serviceName || '').toLowerCase();
+            if (name.includes('audio')) pids.push(m.pid);
+        }
+    } catch { /* ignore */ }
+    return pids;
+}
+
+// Raise the renderers hosting live Spaces plus the audio service; drop anything
+// we raised that is no longer carrying audio.
+function applyLiveAudioPriority(livePids) {
+    const wanted = new Set(livePids.filter(Boolean));
+    if (wanted.size) for (const pid of audioServicePids()) wanted.add(pid);
+    for (const pid of wanted) raiseProcessPriority(pid);
+    for (const pid of [..._raisedPids.keys()]) if (!wanted.has(pid)) restoreProcessPriority(pid);
 }
 
 function enforceNoThrottleOnWebContents(contents) {
@@ -166,22 +232,30 @@ async function viewHasLiveAudio(view) {
     } catch { return false; }
 }
 
-function enforceNoThrottleOnAllViews() {
+async function enforceNoThrottleOnAllViews() {
     if (mainWindow?.webContents) enforceNoThrottleOnWebContents(mainWindow.webContents);
     const visible = mainWindow ? new Set(mainWindow.getBrowserViews()) : new Set();
+    const livePids = [];
     for (const [, view] of xViews) {
-        if (!view?.webContents) continue;
+        if (!view?.webContents || view.webContents.isDestroyed()) continue;
+        // Ask every view, visible or not: a VISIBLE tab still needs its renderer
+        // raised when the whole window is in the background, which is the case
+        // Chromium's own throttling switches do not cover.
+        const live = await viewHasLiveAudio(view);
+        if (live) {
+            try { livePids.push(view.webContents.getOSProcessId()); } catch { /* ignore */ }
+        }
         if (visible.has(view)) {
             enforceNoThrottleOnWebContents(view.webContents);
+        } else if (live) {
+            // Hidden but carrying a live Space — throttling would cut its audio.
+            keepTimersAliveOnWebContents(view.webContents);
         } else {
-            // Hidden X tab. Deprioritize it like any background page UNLESS it is
-            // carrying a live Space, in which case throttling would cut its audio.
-            viewHasLiveAudio(view).then(live => {
-                if (live) keepTimersAliveOnWebContents(view.webContents);
-                else allowThrottleOnWebContents(view.webContents);
-            }).catch(() => {});
+            // Hidden and idle — deprioritize it like any background page.
+            allowThrottleOnWebContents(view.webContents);
         }
     }
+    applyLiveAudioPriority(livePids);
 }
 
 function createWindow() {
@@ -250,7 +324,7 @@ function createWindow() {
     // Re-assert no-throttling whenever the window is minimized, hidden, or
     // restored — Chromium can re-enable throttling on these transitions.
     const reassertNoThrottle = () => {
-        enforceNoThrottleOnAllViews();
+        enforceNoThrottleOnAllViews().catch(() => {});
     };
     mainWindow.on('minimize', reassertNoThrottle);
     mainWindow.on('restore', reassertNoThrottle);
