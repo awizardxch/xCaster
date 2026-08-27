@@ -466,7 +466,10 @@ function createWindow() {
                 { role: 'resetZoom' },
                 { type: 'separator' },
                 { role: 'togglefullscreen' },
-                { label: 'DevTools', accelerator: 'Ctrl+Shift+I', click: () => mainWindow.webContents.toggleDevTools() },
+                { label: 'DevTools (shell)', accelerator: 'Ctrl+Shift+I', click: () => mainWindow.webContents.toggleDevTools() },
+                // The X tab is a separate renderer; this is where the overlay's
+                // [XCaster] diagnostics appear. Detached so the tab cannot cover it.
+                { label: 'DevTools (X tab / audio log)', accelerator: 'F12', click: () => openVisibleXViewDevTools() },
             ],
         },
         {
@@ -740,8 +743,35 @@ ipcMain.handle('xfw:cangoforward-xview', (_e, tabId) => {
 });
 
 ipcMain.handle('xfw:devtools-xview', (_e, tabId) => {
-    xViews.get(tabId)?.webContents.toggleDevTools();
+    openXViewDevTools(xViews.get(tabId));
 });
+
+// A BrowserView always paints ABOVE the window's own contents, including docked
+// DevTools — so toggleDevTools() here opened a console that was completely
+// hidden behind the X tab, with no way to read it. Always detach into its own
+// window instead.
+function openXViewDevTools(view) {
+    const wc = view?.webContents;
+    if (!wc || wc.isDestroyed()) return false;
+    try {
+        if (wc.isDevToolsOpened()) { wc.closeDevTools(); return true; }
+        wc.openDevTools({ mode: 'detach' });
+        return true;
+    } catch { return false; }
+}
+
+// Open the console for whichever X tabs are currently on screen. Nothing in the
+// UI ever called xfw:devtools-xview, so the overlay's console — where every
+// XCaster diagnostic is logged — was unreachable: Ctrl+Shift+I opens DevTools
+// for the SHELL window, which is a different renderer entirely.
+function openVisibleXViewDevTools() {
+    if (!mainWindow) return;
+    const visible = new Set(mainWindow.getBrowserViews());
+    let opened = 0;
+    for (const [, view] of xViews) if (visible.has(view) && openXViewDevTools(view)) opened++;
+    // No X tab on screen — fall back to the shell's own console.
+    if (!opened) mainWindow.webContents.toggleDevTools();
+}
 
 ipcMain.handle('xfw:toggle-mixer-xview', async (_e, tabId) => {
     try {
