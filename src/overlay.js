@@ -3538,6 +3538,86 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         });
     }
 
+    // ---------- incoming (Space playback) watchdog --------------------------
+    // The capture side has recovery everywhere: rebuildMic/Aux/Aux2 on ended
+    // tracks, healActiveAudioSendersIfNeeded() for stale senders, watchStream()
+    // for device handoff. The playback side had none of it — the only check was
+    // "resume xOutputCtx if suspended". So if the output context's render thread
+    // died (a USB interface re-enumerating mid-Space is the usual cause) or a
+    // remote element stalled, incoming Space audio went silent and STAYED silent
+    // until you left and rejoined. This restores the symmetry.
+    //
+    // We cannot rebuild xOutputCtx to recover: createMediaElementSource may be
+    // called only ONCE per element, so a fresh context would permanently orphan
+    // every element already routed through the old one (see routeXElement). The
+    // recovery is therefore resume + a FORCED setSinkId re-apply, which is what
+    // un-wedges a stalled sink, plus re-playing elements that paused while still
+    // holding a live track.
+    let _xOutLastTime = -1;        // xOutputCtx.currentTime at the previous probe
+    let _xOutLastAdvance = 0;      // wall clock when that value last changed
+    let _xOutLastRecovery = 0;     // wall clock of the last recovery attempt
+    const XOUT_STALL_MS = 6000;            // clock frozen this long => render thread dead
+    const XOUT_RECOVERY_COOLDOWN_MS = 15000;
+
+    function _hasLiveAudio(el) {
+        const so = el && el.srcObject;
+        if (!so || typeof so.getAudioTracks !== 'function') return false;
+        try {
+            return so.getAudioTracks().some(t => t.readyState === 'live' && !t.muted);
+        } catch { return false; }
+    }
+
+    async function recoverXOutput(reason) {
+        const now = Date.now();
+        if (now - _xOutLastRecovery < XOUT_RECOVERY_COOLDOWN_MS) return;
+        _xOutLastRecovery = now;
+        console.warn('[XCaster] incoming-audio watchdog firing:', reason);
+        try {
+            if (xOutputCtx && xOutputCtx.state !== 'closed') {
+                await xOutputCtx.resume().catch(() => {});
+                // Re-issue setSinkId even though the device id is unchanged —
+                // that is what recovers a wedged output endpoint. ensureXOutputCtx
+                // skips the call when id === xOutputCtxSink, so clear it first.
+                xOutputCtxSink = null;
+            }
+            await ensureXOutputCtx();
+        } catch (err) {
+            console.warn('[XCaster] output context recovery failed', err);
+        }
+        // Restart any routed element that paused while still holding live audio.
+        for (const el of document.querySelectorAll('audio, video')) {
+            if (!xRoutedElements.has(el) || !el.paused || !_hasLiveAudio(el)) continue;
+            try {
+                await el.play();
+                console.info('[XCaster] restarted stalled media element', el.tagName);
+            } catch (err) {
+                console.warn('[XCaster] could not restart stalled element', err);
+            }
+        }
+        _xOutLastTime = -1;              // re-baseline the probe after recovery
+        _xOutLastAdvance = Date.now();
+    }
+
+    // Liveness probe. A frozen AudioContext clock is a direct signal that the
+    // render thread stopped — unlike silence detection it cannot false-positive
+    // on a quiet Space where nobody happens to be talking.
+    function probeXOutputLiveness() {
+        if (!xOutputCtx || xOutputCtx.state === 'closed') return;
+        const now = Date.now();
+        // 'interrupted' is a real state the old suspended-only check never
+        // handled, and from the listener's side it looks exactly like a freeze.
+        if (xOutputCtx.state !== 'running') {
+            recoverXOutput('output context state=' + xOutputCtx.state);
+            return;
+        }
+        const t = xOutputCtx.currentTime;
+        if (t !== _xOutLastTime) { _xOutLastTime = t; _xOutLastAdvance = now; return; }
+        if (_xOutLastAdvance && now - _xOutLastAdvance >= XOUT_STALL_MS) {
+            recoverXOutput('output clock frozen at ' + t.toFixed(3) + 's for '
+                + Math.round((now - _xOutLastAdvance) / 1000) + 's');
+        }
+    }
+
     let sinkScanInterval = 0;
     function startSinkScan() {
         if (sinkScanInterval) return;
@@ -3546,6 +3626,8 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             await ensureXOutputCtx();
             applySinkToAllContexts();
             document.querySelectorAll('audio, video').forEach(registerMedia);
+            // Watchdog for the incoming Space audio (see recoverXOutput above).
+            probeXOutputLiveness();
             // Fallback sync for X's in-Space mic button. bridgeXMuteTrack()
             // normally catches the toggle the moment X flips it; this covers a
             // sender whose track we never handed out (so was never bridged).
