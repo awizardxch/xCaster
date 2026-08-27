@@ -9,17 +9,38 @@ It ships its own Chromium (via Electron), disables WebRTC AGC at the engine leve
 ## Download
 
 **Windows (x64)**
-[XCaster v1.4.2 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.2/XCaster-win32-x64.zip)
+[XCaster v1.4.3 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.3/XCaster-win32-x64.zip)
 
 **macOS (Apple Silicon / arm64)**
-[XCaster v1.4.2 — XCaster-darwin-arm64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.2/XCaster-darwin-arm64.zip)
+[XCaster v1.4.3 — XCaster-darwin-arm64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.3/XCaster-darwin-arm64.zip)
 
 **macOS (Intel / x64)**
-[XCaster v1.4.2 — XCaster-darwin-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.2/XCaster-darwin-x64.zip)
+[XCaster v1.4.3 — XCaster-darwin-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.3/XCaster-darwin-x64.zip)
 
 Extract the zip and run `XCaster.exe` (Windows) or `XCaster.app` (macOS) — no installer required.
 
 > **macOS note:** First launch requires right-click → Open to bypass Gatekeeper (app is not notarized).
+
+---
+
+## What's new in v1.4.3
+
+### Space audio survives switching tabs
+- Fixed Space audio cutting out the moment you switched to another tab in the built-in browser, staying dead until you left and rejoined.
+- Cause: hiding an X tab detached it from the window and then deliberately re-enabled Chromium background throttling on it. That is right for an idle tab — it is what stops background tabs burning CPU forever — but it made no exception for a tab carrying a **live Space**, and throttled timers stall the WebRTC pipeline.
+- A hidden Space now keeps unthrottled timers while still doing no rendering work, so it keeps streaming without costing you the CPU saving. Idle hidden tabs are throttled exactly as before, and the policy re-checks itself every couple of seconds, so a tab that leaves a Space goes back to being throttled.
+
+### Meters work without "Reapply audio graph"
+- Fixed the mixer meters sitting at zero when you first opened the gear, until you clicked **Reapply audio graph**.
+- Two causes: opening the panel never built the audio graph, and the meters bound to their analysers only once — so a panel opened before the graph existed stayed dead, and a later rebuild left them reading replaced analysers. Meters now attach to the graph whenever it appears or is rebuilt.
+
+### Roughly half the memory
+- Decoded instrument samples were cached without any limit. They are stored as raw PCM, so a 1 MB compressed sample costs 10–20 MB in memory, and every instrument you opened in the GM catalog stayed resident until you reloaded the tab.
+- There is now a memory budget with least-recently-used eviction, plus a full release once the Sounds rig has been idle a few minutes. Sounds already playing are unaffected; the only cost is a brief reload the next time you use an instrument that was dropped.
+- The background video was also being decoded by **every** tab at once, even with the skin turned off. Only the tab you are looking at decodes it now, and with the skin off it is not created at all. A per-tab background worker now starts only where there is actually audio to protect.
+
+### Stalled incoming audio is detected
+- If incoming Space audio stops arriving, XCaster now notices instead of leaving you guessing, and the Speakers pane offers a **Recover incoming audio** button that retries the connection without making you leave the Space.
 
 ---
 

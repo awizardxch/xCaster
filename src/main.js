@@ -404,9 +404,10 @@ function createWindow() {
                         dialog.showMessageBox(mainWindow, {
                             type: 'info',
                             title: 'About XCaster',
-                            message: 'XCaster v1.4.3-dev',
+                            message: 'XCaster v1.4.3',
                             detail:
                                 'Standalone Windows shell for x.com with WebRTC AGC, noise suppression, and echo cancellation disabled.\n\n' +
+                                'v1.4.3 — Space audio no longer cuts out when you switch to another tab: a tab in a live Space is no longer background-throttled. Also fixes the mixer meters sitting at zero until you clicked Reapply audio graph, roughly halves memory by bounding decoded instrument samples and stopping every tab from decoding the background video, and adds detection plus a manual recovery button for a stalled incoming connection.\n\n' +
                                 'v1.4.2 — Fixes incoming Space audio freezing until you left and rejoined. The playback path had no recovery of its own, so if the output device stalled (a USB interface re-enumerating mid-Space is the usual cause) nothing noticed. XCaster now watches the output context and restores it in place.\n\n' +
                                 'v1.4.1 — Security: microphone/camera and location access is now restricted to x.com/twitter.com. The built-in browser previously granted them to every site it loaded, so any page you opened - including a malicious link - could capture the mic or your location with no prompt.\n\n' +
                                 'v1.4.0 — Mixer mute fixes: the panel Mute mic toggle now silences only the mic channel instead of the whole outgoing mix, and the native X mic button inside a Space now actually mutes what the Space receives. Also adds the full General MIDI instrument catalog via WebAudioFont with 10 instrument tabs, a DAW-style 1-2-3-4 count-in, a resizable piano roll with quantize, grouped kit selection with real FreePats acoustic and electric guitar samples, and full chromatic keyboard coverage for melodic kits.\n\n' +
