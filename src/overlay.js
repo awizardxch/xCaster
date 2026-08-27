@@ -2844,16 +2844,13 @@ registerProcessor('xcaster-pitch',XCasterPitch);
     }
 
     function applyMixerLive() {
+        // Mic mute is a CHANNEL mute: it zeroes the mic channel gain only.
+        // It must NOT touch the WebRTC sender track — that track carries the
+        // whole mix (mic + aux 1 + aux 2 + xCaster + Sounds), so disabling it
+        // here would silence every channel instead of just the mic.
+        // Muting the whole outgoing feed is X's own in-Space mic button; see
+        // setXBroadcastMuted() / bridgeXMuteTrack().
         if (micGainNode) micGainNode.gain.value = settings.micMuted ? 0 : dbToLin(settings.micGainDb);
-        // Also sync the WebRTC sender track.enabled so X's native UI stays in sync.
-        const micEnabled = !settings.micMuted;
-        for (const pc of __xfwPCs) {
-            try {
-                for (const s of pc.getSenders()) {
-                    if (s.track && s.track.kind === 'audio') s.track.enabled = micEnabled;
-                }
-            } catch { /* ignore */ }
-        }
         if (sbGainNode)    sbGainNode.gain.value    = (settings.sbMuted || settings.sbGainDb <= -40) ? 0 : dbToLin(settings.sbGainDb);
         if (sbSourceBus)   sbSourceBus.gain.value   = settings.sbMuted ? 0 : 1;
         if (sbMixSend)     sbMixSend.gain.value     = settings.sbCue  ? 0 : 1;
@@ -3197,6 +3194,80 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         }
     };
 
+    // ---------- X Space mute bridge ----------------------------------------
+    // X's in-Space mic button mutes by flipping `enabled` on the audio track it
+    // was handed by getUserMedia. We hand X a *clone* of our processed mix, and
+    // swap in fresh clones on every device change / graph rebuild, so the object
+    // X holds drifts away from the one the RTCRtpSender is actually sending —
+    // flipping it did nothing at all.
+    //
+    // Fix: intercept `enabled` on every track we give X (the gUM return value and
+    // each replaceTrack clone) and translate it into a broadcast master mute. The
+    // gate is applied to the sender tracks, so it silences what X receives while
+    // leaving the headset monitor and the broadcast-out device alone.
+    let xBroadcastMuted = false;
+    const _TRACK_ENABLED_DESC =
+        Object.getOwnPropertyDescriptor(MediaStreamTrack.prototype, 'enabled');
+
+    function _setTrackEnabledRaw(track, value) {
+        try {
+            if (_TRACK_ENABLED_DESC && _TRACK_ENABLED_DESC.set) _TRACK_ENABLED_DESC.set.call(track, value);
+            else track.enabled = value;
+        } catch { /* ignore */ }
+    }
+
+    // Wrap `enabled` on a track handed to X so we learn when X mutes/unmutes.
+    // Set the track's initial state with _setTrackEnabledRaw BEFORE bridging it,
+    // otherwise the seed value is read back as a user mute action.
+    function bridgeXMuteTrack(track) {
+        if (!track || track.__xfwMuteBridged) return track;
+        if (!_TRACK_ENABLED_DESC || !_TRACK_ENABLED_DESC.set) return track;
+        track.__xfwMuteBridged = true;
+        try {
+            Object.defineProperty(track, 'enabled', {
+                configurable: true,
+                enumerable: false,
+                get() { return _TRACK_ENABLED_DESC.get.call(this); },
+                set(v) {
+                    _TRACK_ENABLED_DESC.set.call(this, v);
+                    setXBroadcastMuted(!v);
+                },
+            });
+        } catch { /* ignore */ }
+        return track;
+    }
+
+    function setXBroadcastMuted(muted) {
+        muted = !!muted;
+        if (muted === xBroadcastMuted) return;
+        xBroadcastMuted = muted;
+        applyXBroadcastMute();
+        paintXMuteStatus();
+        console.info('[XCaster] X Space mic', muted ? 'MUTED' : 'live');
+    }
+
+    // Mirror the mute onto every outgoing audio sender. Written through the raw
+    // descriptor so bridged tracks don't re-enter setXBroadcastMuted().
+    function applyXBroadcastMute() {
+        const enabled = !xBroadcastMuted;
+        for (const pc of __xfwPCs) {
+            try {
+                for (const s of pc.getSenders()) {
+                    if (s.track && s.track.kind === 'audio') _setTrackEnabledRaw(s.track, enabled);
+                }
+            } catch { /* ignore */ }
+        }
+    }
+
+    function paintXMuteStatus() {
+        const el = document.getElementById('xfw-xmute-status');
+        if (!el) return;
+        el.textContent = xBroadcastMuted
+            ? 'X Space mic: MUTED — nothing is reaching the Space.'
+            : 'X Space mic: live — the full mix is reaching the Space.';
+        el.style.color = xBroadcastMuted ? '#f87171' : 'var(--xfw-muted)';
+    }
+
     // ---------- getUserMedia interception ----------------------------------
     // Save originals BEFORE anything else can capture references.
     const md = navigator.mediaDevices;
@@ -3230,7 +3301,9 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             }
 
             const out = new MediaStream();
-            out.addTrack(audioTrack.clone());
+            const xTrack = audioTrack.clone();
+            _setTrackEnabledRaw(xTrack, !xBroadcastMuted);
+            out.addTrack(bridgeXMuteTrack(xTrack));
             for (const t of videoTracks) out.addTrack(t);
             console.info('[XCaster] gUM returned processed stream');
             return out;
@@ -3264,10 +3337,14 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             try {
                 for (const sender of pc.getSenders()) {
                     if (sender.track && sender.track.kind === 'audio') {
-                        // Preserve the mute state X or the host applied to the current track.
-                        const wasEnabled = sender.track.enabled;
+                        // Preserve the mute state X or the host applied to the current
+                        // track: our own X-Space mute, or a mute X set on this sender.
+                        const muted = xBroadcastMuted || !sender.track.enabled;
                         const t = newTrack.clone();
-                        t.enabled = wasEnabled; // keep existing mute state
+                        // Seed through the raw setter first, then bridge, so seeding
+                        // isn't mistaken for X toggling its mic button.
+                        _setTrackEnabledRaw(t, !muted);
+                        bridgeXMuteTrack(t);
                         // Disable APM so Chrome's AGC doesn't pump the level.
                         t.applyConstraints({ autoGainControl: false, noiseSuppression: false, echoCancellation: false }).catch(() => {});
                         sender.replaceTrack(t);
@@ -3469,20 +3546,16 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             await ensureXOutputCtx();
             applySinkToAllContexts();
             document.querySelectorAll('audio, video').forEach(registerMedia);
-            // Sync XCaster mic-mute panel state with X's native mute button.
-            // X may set sender.track.enabled = false when the user/host mutes;
-            // we detect that here and reflect it in the panel toggle.
+            // Fallback sync for X's in-Space mic button. bridgeXMuteTrack()
+            // normally catches the toggle the moment X flips it; this covers a
+            // sender whose track we never handed out (so was never bridged).
+            // It drives the broadcast mute only — never the mic CHANNEL mute,
+            // which is the user's own mixer setting and must stay independent.
             for (const pc of __xfwPCs) {
                 try {
                     for (const s of pc.getSenders()) {
                         if (s.track && s.track.kind === 'audio') {
-                            const xMuted = !s.track.enabled;
-                            if (xMuted !== settings.micMuted) {
-                                settings.micMuted = xMuted;
-                                saveSettings(settings);
-                                if (micGainNode) micGainNode.gain.value = xMuted ? 0 : dbToLin(settings.micGainDb);
-                                paintToggles();
-                            }
+                            if (!s.track.__xfwMuteBridged) setXBroadcastMuted(!s.track.enabled);
                             break;
                         }
                     }
@@ -3562,7 +3635,7 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         <div id="xfw-panel" role="dialog" aria-label="XCaster audio">
             <div class="xfw-header">
                 <div class="xfw-title">XCaster</div>
-                <div class="xfw-version">v1.3.0</div>
+                <div class="xfw-version">v1.4.0-beta.1</div>
             </div>
 
             <!-- PERSISTENT METERS (always visible) -->
@@ -3599,9 +3672,10 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                 <div class="xfw-section">
                     <label class="xfw-label">Mic channel</label>
                     <div class="xfw-row">
-                        <div>Mute mic<span class="xfw-help">Silence the mic channel without disabling the device.</span></div>
+                        <div>Mute mic<span class="xfw-help">Silence the mic channel only. Aux, xCaster and Sounds keep sending. To mute everything, use X's own mic button in the Space.</span></div>
                         <div class="xfw-toggle" data-key="micMuted"></div>
                     </div>
+                    <div id="xfw-xmute-status" class="xfw-help" style="margin:-2px 0 8px;font-size:11px;color:var(--xfw-muted);">X Space mic: live — the full mix is reaching the Space.</div>
                     <div class="xfw-row">
                         <div>Monitor in headset<span class="xfw-help">Hear yourself. OFF avoids latency/feedback.</span></div>
                         <div class="xfw-toggle" data-key="micMonitor"></div>
@@ -4410,6 +4484,7 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             }
         });
         paintToggles();
+        paintXMuteStatus();
     }
 
     // ── Synth (MIDI keyboard) presets ───────────────────────────────────────
