@@ -3419,7 +3419,12 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             const pc = new RealPC(...args);
             __xfwPCs.add(pc);
             pc.addEventListener('connectionstatechange', () => {
-                if (['closed', 'failed'].includes(pc.connectionState)) __xfwPCs.delete(pc);
+                // Only 'closed' is untrackable. A 'failed' connection was being
+                // dropped here too, which hid the dead Space from the inbound
+                // watchdog and from _updateAudioActiveFlag — so the view got
+                // throttled and de-prioritised at the exact moment it needed
+                // help recovering. 'failed' can still be ICE-restarted; keep it.
+                if (pc.connectionState === 'closed') __xfwPCs.delete(pc);
                 if (pc.connectionState === 'connected') replaceTracksOnActivePCs();
                 // Immediate, so switching tabs right after joining a Space does
                 // not race the 4s health watchdog and get the view throttled.
@@ -3744,12 +3749,22 @@ registerProcessor('xcaster-pitch',XCasterPitch);
     const INBOUND_STALL_MS = 10000;
 
     async function _readInboundAudio() {
-        let total = 0, sawInbound = false, connected = false;
+        let total = 0, sawInbound = false, active = false, broken = null;
         for (const pc of __xfwPCs) {
             let state;
             try { state = pc.connectionState; } catch { continue; }
-            if (state !== 'connected') continue;
-            connected = true;
+            if (state === 'closed') continue;
+            // A connection in 'failed' or 'disconnected' is the whole point of
+            // this probe: that is a Space that has gone dead and will not come
+            // back on its own. The first version skipped every state except
+            // 'connected', so it went silent in exactly that case and reported
+            // "not in a Space" instead of a stall.
+            if (state === 'failed' || state === 'disconnected') {
+                broken = state;
+                continue;
+            }
+            if (state !== 'connected') continue;   // 'new' / 'connecting'
+            active = true;
             let stats;
             try { stats = await pc.getStats(); } catch { continue; }
             stats.forEach(r => {
@@ -3759,7 +3774,7 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                 }
             });
         }
-        return { total, sawInbound, connected };
+        return { total, sawInbound, active, broken };
     }
 
     function setInboundStalled(stalled, detail) {
@@ -3775,7 +3790,7 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         const btn = document.getElementById('xfw-recover-inbound');
         if (el) {
             el.textContent = _inboundStalled
-                ? '⚠ Incoming Space audio has stopped arriving. Try Recover incoming audio; if that does not help, leave and rejoin the Space.'
+                ? '⚠ Incoming Space audio has stopped arriving. Recovery was attempted automatically — if it is still silent, leave and rejoin the Space.'
                 : '';
             el.className = _inboundStalled ? 'xfw-spk-status xfw-spk-warn' : 'xfw-spk-status';
         }
@@ -3783,9 +3798,21 @@ registerProcessor('xcaster-pitch',XCasterPitch);
     }
 
     async function probeInboundAudio() {
-        const { total, sawInbound, connected } = await _readInboundAudio();
+        const { total, sawInbound, active, broken } = await _readInboundAudio();
+
+        // A failed/disconnected connection is a hard stall. Report it at once
+        // rather than waiting out the packet timer — there are no packets to
+        // wait for, and this is the state the user sees as audio frozen until
+        // they leave and rejoin.
+        if (broken) {
+            _inboundLastPackets = -1;
+            _inboundLastAdvance = 0;
+            setInboundStalled(true, 'peer connection is ' + broken);
+            autoRecoverInbound('connection ' + broken);
+            return;
+        }
         // Not in a Space, or no inbound audio yet — nothing to judge.
-        if (!connected || !sawInbound) {
+        if (!active || !sawInbound) {
             _inboundLastPackets = -1;
             _inboundLastAdvance = 0;
             setInboundStalled(false, '');
@@ -3799,9 +3826,29 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             return;
         }
         if (_inboundLastAdvance && now - _inboundLastAdvance >= INBOUND_STALL_MS) {
-            setInboundStalled(true, 'packetsReceived frozen at ' + total + ' for '
-                + Math.round((now - _inboundLastAdvance) / 1000) + 's');
+            const detail = 'packetsReceived frozen at ' + total + ' for '
+                + Math.round((now - _inboundLastAdvance) / 1000) + 's';
+            setInboundStalled(true, detail);
+            autoRecoverInbound(detail);
         }
+    }
+
+    // Automatic recovery. This was deliberately manual-only at first, on the
+    // reasoning that X owns the signalling and forcing renegotiation under it
+    // should be the user's call. That reasoning does not survive the evidence:
+    // the stall is PERMANENT — it does not clear when the app is brought back
+    // to the foreground, and the only cure is leaving and rejoining. Against a
+    // Space that is already dead, an ICE restart cannot make things worse, and
+    // doing nothing guarantees the user has to rejoin. The manual button stays
+    // for a second attempt.
+    let _lastAutoRecover = 0;
+    const AUTO_RECOVER_COOLDOWN_MS = 20000;
+    function autoRecoverInbound(reason) {
+        const now = Date.now();
+        if (now - _lastAutoRecover < AUTO_RECOVER_COOLDOWN_MS) return;
+        _lastAutoRecover = now;
+        console.warn('[XCaster] attempting automatic ICE restart —', reason);
+        recoverInboundAudio().catch(err => console.warn('[XCaster] auto recovery failed', err));
     }
 
     function startInboundScan() {
@@ -5956,7 +6003,12 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         let live = false;
         try {
             for (const pc of __xfwPCs) {
-                if (pc.connectionState === 'connected') { live = true; break; }
+                // 'disconnected' counts as live: it often recovers on its own,
+                // and throttling or de-prioritising the view mid-blip is the
+                // worst possible moment. Only 'failed'/'closed'/'new' do not.
+                if (['connected', 'connecting', 'disconnected'].includes(pc.connectionState)) {
+                    live = true; break;
+                }
             }
         } catch { /* ignore */ }
         try { window.__xfwAudioActive = live; } catch { /* ignore */ }
