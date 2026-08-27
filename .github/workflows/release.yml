@@ -123,6 +123,14 @@ jobs:
         with:
           name: mac-x64-zip
 
+      # actions/checkout materialises the tag as a LIGHTWEIGHT ref, so
+      # `git tag -l --format='%(contents)'` below falls through to the tagged
+      # COMMIT's message instead of the tag annotation - which is why releases
+      # up to v1.4.0 shipped with a commit message as their notes. Force-fetch
+      # the tag so the real annotated tag object is present before we read it.
+      - name: Restore annotated tag object
+        run: git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+
       - name: Extract release notes from tag annotation
         id: notes
         run: |

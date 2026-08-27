@@ -9,17 +9,26 @@ It ships its own Chromium (via Electron), disables WebRTC AGC at the engine leve
 ## Download
 
 **Windows (x64)**
-[XCaster v1.4.0 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.0/XCaster-win32-x64.zip)
+[XCaster v1.4.1 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.1/XCaster-win32-x64.zip)
 
 **macOS (Apple Silicon / arm64)**
-[XCaster v1.4.0 — XCaster-darwin-arm64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.0/XCaster-darwin-arm64.zip)
+[XCaster v1.4.1 — XCaster-darwin-arm64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.1/XCaster-darwin-arm64.zip)
 
 **macOS (Intel / x64)**
-[XCaster v1.4.0 — XCaster-darwin-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.0/XCaster-darwin-x64.zip)
+[XCaster v1.4.1 — XCaster-darwin-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.1/XCaster-darwin-x64.zip)
 
 Extract the zip and run `XCaster.exe` (Windows) or `XCaster.app` (macOS) — no installer required.
 
 > **macOS note:** First launch requires right-click → Open to bypass Gatekeeper (app is not notarized).
+
+---
+
+## What's new in v1.4.1
+
+### Security: mic and location scoped to X
+- The built-in browser granted **microphone/camera** and **geolocation** to *every* site it loaded, not just x.com. Because XCaster ships a general browser (YouTube, TibetSwap, your own bookmarks), any page you opened — including a malicious link — could capture the mic or your location with no prompt.
+- Both are now restricted to **x.com / twitter.com**. Low-risk permissions (notifications, clipboard, pointer lock, Web MIDI) stay available everywhere so the app-wide mixer and hardware MIDI controllers keep working; anything else is denied by default.
+- X Spaces, the xCaster tab-capture channel and MIDI are unaffected. The one visible change: opening the gear on a **non-X** tab can no longer acquire the microphone — that is the hole being closed, and the X tab's mixer (the one feeding your Space) is untouched.
 
 ---
 
