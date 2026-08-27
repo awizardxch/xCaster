@@ -4825,42 +4825,40 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         const aux2Fill = document.getElementById('xfw-meter-aux2');
         const xcastFill = document.getElementById('xfw-meter-xcast');
         const sbFill    = document.getElementById('xfw-meter-sb');
-        const inBuf = inputAnalyser ? new Uint8Array(inputAnalyser.fftSize) : null;
-        const outBuf = outputAnalyser ? new Uint8Array(outputAnalyser.fftSize) : null;
-        const micBuf = micAnalyser ? new Uint8Array(micAnalyser.fftSize) : null;
-        const auxBuf = auxAnalyser ? new Uint8Array(auxAnalyser.fftSize) : null;
-        const aux2Buf = aux2Analyser ? new Uint8Array(aux2Analyser.fftSize) : null;
-        const xcastBuf = xcastAnalyser ? new Uint8Array(xcastAnalyser.fftSize) : null;
-        const sbBuf    = sbAnalyser    ? new Uint8Array(sbAnalyser.fftSize)    : null;
+
+        // Analysers are created by buildGraph() and REPLACED every time it runs,
+        // and they do not exist at all before the graph is first built. This used
+        // to capture one Uint8Array per analyser here, once — so opening the gear
+        // before the graph existed bound every meter to null and left them dead
+        // forever, and a later rebuild left them reading replaced analysers. That
+        // is exactly why levels only appeared after "Reapply audio graph", whose
+        // handler happens to call startMeters() a second time.
+        //
+        // Resolve per frame instead, keyed on the analyser instance, so meters
+        // pick up the graph whenever it appears or is rebuilt.
+        const bufs = new WeakMap();
+        const bufFor = a => {
+            if (!a) return null;
+            let b = bufs.get(a);
+            if (!b || b.length !== a.fftSize) { b = new Uint8Array(a.fftSize); bufs.set(a, b); }
+            return b;
+        };
+        const paint = (analyser, fill) => {
+            const buf = bufFor(analyser);
+            if (analyser && fill && buf) {
+                analyser.getByteTimeDomainData(buf);
+                fill.style.width = peakPct(buf);
+            } else if (fill) { fill.style.width = '0%'; }
+        };
+
         const tick = () => {
-            if (micAnalyser && micFill && micBuf) {
-                micAnalyser.getByteTimeDomainData(micBuf);
-                micFill.style.width = peakPct(micBuf);
-            } else if (micFill) { micFill.style.width = '0%'; }
-            if (auxAnalyser && auxFill && auxBuf) {
-                auxAnalyser.getByteTimeDomainData(auxBuf);
-                auxFill.style.width = peakPct(auxBuf);
-            } else if (auxFill) { auxFill.style.width = '0%'; }
-            if (aux2Analyser && aux2Fill && aux2Buf) {
-                aux2Analyser.getByteTimeDomainData(aux2Buf);
-                aux2Fill.style.width = peakPct(aux2Buf);
-            } else if (aux2Fill) { aux2Fill.style.width = '0%'; }
-            if (xcastAnalyser && xcastFill && xcastBuf) {
-                xcastAnalyser.getByteTimeDomainData(xcastBuf);
-                xcastFill.style.width = peakPct(xcastBuf);
-            } else if (xcastFill) { xcastFill.style.width = '0%'; }
-            if (sbAnalyser && sbFill && sbBuf) {
-                sbAnalyser.getByteTimeDomainData(sbBuf);
-                sbFill.style.width = peakPct(sbBuf);
-            } else if (sbFill) { sbFill.style.width = '0%'; }
-            if (inputAnalyser && inFill && inBuf) {
-                inputAnalyser.getByteTimeDomainData(inBuf);
-                inFill.style.width = peakPct(inBuf);
-            }
-            if (outputAnalyser && outFill && outBuf) {
-                outputAnalyser.getByteTimeDomainData(outBuf);
-                outFill.style.width = peakPct(outBuf);
-            }
+            paint(micAnalyser, micFill);
+            paint(auxAnalyser, auxFill);
+            paint(aux2Analyser, aux2Fill);
+            paint(xcastAnalyser, xcastFill);
+            paint(sbAnalyser, sbFill);
+            paint(inputAnalyser, inFill);
+            paint(outputAnalyser, outFill);
             if (grFill && comp) {
                 const r = comp.reduction || 0;
                 grFill.style.width = Math.min(100, Math.max(0, -r * 5)) + '%';
@@ -4902,6 +4900,23 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                 paintToggles();
                 await populateInputs();
                 await populateOutputs();
+                // Build the graph if nothing has yet. X only calls getUserMedia
+                // when you join a Space, so on a fresh page there are no analysers
+                // and every meter reads zero — which is what made "Reapply audio
+                // graph" look mandatory. Opening the gear is a user gesture, so
+                // it is a valid moment to resume an AudioContext and acquire the
+                // mic. Guarded on the graph being absent, so this can never
+                // disturb a live Space by rebuilding underneath it.
+                if (!audioCtx || !micAnalyser) {
+                    try {
+                        await ensureProcessedStream();
+                    } catch (err) {
+                        // Non-X tabs are denied mic access since v1.4.1, so this
+                        // is expected there; buildGraph() still runs and the
+                        // meters simply sit at zero rather than breaking.
+                        console.warn('[XCaster] could not build graph on panel open', err);
+                    }
+                }
                 // Start once and keep running; panel visibility must not affect
                 // active Space audio state.
                 startMeters();
