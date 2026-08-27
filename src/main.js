@@ -381,7 +381,7 @@ function createWindow() {
                         dialog.showMessageBox(mainWindow, {
                             type: 'info',
                             title: 'About XCaster',
-                            message: 'XCaster v1.4.2',
+                            message: 'XCaster v1.4.3-dev',
                             detail:
                                 'Standalone Windows shell for x.com with WebRTC AGC, noise suppression, and echo cancellation disabled.\n\n' +
                                 'v1.4.2 — Fixes incoming Space audio freezing until you left and rejoined. The playback path had no recovery of its own, so if the output device stalled (a USB interface re-enumerating mid-Space is the usual cause) nothing noticed. XCaster now watches the output context and restores it in place.\n\n' +
