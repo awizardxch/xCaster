@@ -3421,6 +3421,9 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             pc.addEventListener('connectionstatechange', () => {
                 if (['closed', 'failed'].includes(pc.connectionState)) __xfwPCs.delete(pc);
                 if (pc.connectionState === 'connected') replaceTracksOnActivePCs();
+                // Immediate, so switching tabs right after joining a Space does
+                // not race the 4s health watchdog and get the view throttled.
+                _updateAudioActiveFlag();
             });
             return pc;
         };
@@ -5945,6 +5948,20 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
     });
 
+    // Tell the main process whether this tab is carrying a live Space. main.js
+    // background-throttles any X view that is not the visible one, which stalls
+    // the WebRTC pipeline of a Space you switched away from — it needs to know
+    // which views must stay unthrottled even while hidden.
+    function _updateAudioActiveFlag() {
+        let live = false;
+        try {
+            for (const pc of __xfwPCs) {
+                if (pc.connectionState === 'connected') { live = true; break; }
+            }
+        } catch { /* ignore */ }
+        try { window.__xfwAudioActive = live; } catch { /* ignore */ }
+    }
+
     // Periodic health check catches state drift that event listeners miss
     // (some virtual cable drivers on Windows don't fire 'ended' reliably).
     function startHealthWatchdog() {
@@ -5969,6 +5986,7 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             }
             healActiveAudioSendersIfNeeded().catch(() => {});
             sweepIdleAudioCache();
+            _updateAudioActiveFlag();
         }, 4000);
     }
 

@@ -147,6 +147,25 @@ function allowThrottleOnWebContents(contents) {
     try { contents.setBackgroundThrottling(true); } catch {}
 }
 
+// Third state the policy above lacked. A hidden X tab that is in a live Space
+// must keep unthrottled TIMERS or Chromium stalls its WebRTC pipeline and the
+// Space audio cuts out until you rejoin - but it is not visible, so we
+// deliberately do not force 60fps the way enforceNoThrottleOnWebContents does.
+// Unthrottled timers, no rendering work.
+function keepTimersAliveOnWebContents(contents) {
+    if (!contents || contents.isDestroyed()) return;
+    try { contents.setBackgroundThrottling(false); } catch {}
+}
+
+// The overlay maintains window.__xfwAudioActive in every tab (see
+// _updateAudioActiveFlag in overlay.js). Never throttle a view that says yes.
+async function viewHasLiveAudio(view) {
+    try {
+        if (!view?.webContents || view.webContents.isDestroyed()) return false;
+        return !!(await view.webContents.executeJavaScript('window.__xfwAudioActive === true', true));
+    } catch { return false; }
+}
+
 function enforceNoThrottleOnAllViews() {
     if (mainWindow?.webContents) enforceNoThrottleOnWebContents(mainWindow.webContents);
     const visible = mainWindow ? new Set(mainWindow.getBrowserViews()) : new Set();
@@ -155,8 +174,12 @@ function enforceNoThrottleOnAllViews() {
         if (visible.has(view)) {
             enforceNoThrottleOnWebContents(view.webContents);
         } else {
-            // Hidden X tab — let Chromium deprioritize it like any background page.
-            allowThrottleOnWebContents(view.webContents);
+            // Hidden X tab. Deprioritize it like any background page UNLESS it is
+            // carrying a live Space, in which case throttling would cut its audio.
+            viewHasLiveAudio(view).then(live => {
+                if (live) keepTimersAliveOnWebContents(view.webContents);
+                else allowThrottleOnWebContents(view.webContents);
+            }).catch(() => {});
         }
     }
 }
@@ -594,12 +617,16 @@ ipcMain.handle('xfw:show-xview', (_e, tabId) => {
     enforceNoThrottleOnWebContents(view.webContents);
 });
 
-ipcMain.handle('xfw:hide-xview', (_e, tabId) => {
+ipcMain.handle('xfw:hide-xview', async (_e, tabId) => {
     const view = xViews.get(tabId);
     if (!view || !mainWindow) return;
     mainWindow.removeBrowserView(view);
-    // No longer visible — allow Chromium to throttle it like a normal background tab.
-    allowThrottleOnWebContents(view.webContents);
+    // No longer visible, so throttle it like a normal background tab — UNLESS it
+    // is in a live Space. Switching to another tab used to cut Space audio dead
+    // until you rejoined, because this threw the full background throttle at a
+    // running WebRTC connection.
+    if (await viewHasLiveAudio(view)) keepTimersAliveOnWebContents(view.webContents);
+    else allowThrottleOnWebContents(view.webContents);
 });
 
 ipcMain.handle('xfw:destroy-xview', (_e, tabId) => {
