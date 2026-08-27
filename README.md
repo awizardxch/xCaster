@@ -9,17 +9,27 @@ It ships its own Chromium (via Electron), disables WebRTC AGC at the engine leve
 ## Download
 
 **Windows (x64)**
-[XCaster v1.4.1 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.1/XCaster-win32-x64.zip)
+[XCaster v1.4.2 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.2/XCaster-win32-x64.zip)
 
 **macOS (Apple Silicon / arm64)**
-[XCaster v1.4.1 — XCaster-darwin-arm64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.1/XCaster-darwin-arm64.zip)
+[XCaster v1.4.2 — XCaster-darwin-arm64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.2/XCaster-darwin-arm64.zip)
 
 **macOS (Intel / x64)**
-[XCaster v1.4.1 — XCaster-darwin-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.1/XCaster-darwin-x64.zip)
+[XCaster v1.4.2 — XCaster-darwin-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.2/XCaster-darwin-x64.zip)
 
 Extract the zip and run `XCaster.exe` (Windows) or `XCaster.app` (macOS) — no installer required.
 
 > **macOS note:** First launch requires right-click → Open to bypass Gatekeeper (app is not notarized).
+
+---
+
+## What's new in v1.4.2
+
+### Incoming Space audio no longer freezes
+- Fixed incoming Space audio stopping mid-Space and staying dead until you left and rejoined. Every other channel kept working, which is why it looked like X's problem rather than the mixer's.
+- Cause: the capture side (mic, Aux 1/2, the outgoing sender) has had automatic recovery for a while, but the **playback** side had none — the only check was "resume the output context if it is suspended". If the output device stalled, most often a USB interface re-enumerating mid-Space, the context kept reporting itself as running while no audio flowed, and nothing noticed.
+- XCaster now watches the output context for a stalled render clock or a non-running state, and restores it in place — resuming it, re-applying the output device, and restarting any stalled playback element. Recovery is paced so a genuinely dead device can't thrash your output.
+- If it ever does freeze again, the console now names the condition that fired.
 
 ---
 
