@@ -342,7 +342,7 @@ webview.active {
   pointer-events: auto;
 }
 
-/* ── Settings + extensions dropdowns ─────────────────────────────────────── */
+/* ── Settings dropdown ─────────────────────────────────────── */
 #settings-dropdown, #ext-dropdown {
   position: fixed;
   background: var(--surface);
@@ -582,75 +582,6 @@ webview.active {
 .picker-row .pr-title { font-size: 13px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .picker-row .pr-url   { font-size: 11px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .picker-empty { color: var(--text-dim); font-size: 12px; padding: 14px; text-align: center; }
-
-/* ── Extensions section on home page ────────────────────────────────────── */
-#extensions-section { width: 100%; max-width: 860px; margin-top: 36px; }
-.ext-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 14px 16px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-}
-.ext-row + .ext-row { margin-top: 8px; }
-.ext-icon {
-  width: 36px; height: 36px;
-  border-radius: 8px;
-  background: linear-gradient(135deg, #f6851b, #e2761b);
-  display: flex; align-items: center; justify-content: center;
-  color: #fff; font-weight: 700; font-size: 15px;
-  flex-shrink: 0;
-}
-.ext-info  { flex: 1; min-width: 0; }
-.ext-name  { font-size: 13px; color: var(--text); font-weight: 500; }
-.ext-meta  { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
-.ext-status { font-size: 11px; margin-top: 4px; min-height: 14px; }
-.ext-status.ok    { color: #10b981; }
-.ext-status.err   { color: var(--danger); }
-.ext-status.busy  { color: var(--text-dim); }
-
-.modal-input {
-  width: 100%;
-  background: var(--surface2);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 9px 13px;
-  color: var(--text);
-  font-size: 13px;
-  outline: none;
-  transition: border-color 0.15s;
-}
-.modal-input:focus { border-color: var(--accent); }
-.modal-input::placeholder { color: var(--text-faint); }
-
-.modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
-
-.btn-primary {
-  padding: 8px 18px;
-  background: var(--accent);
-  color: #fff;
-  border: none;
-  border-radius: 8px;
-  cursor: pointer;
-  font-size: 13px;
-  font-weight: 500;
-  transition: background 0.12s;
-}
-.btn-primary:hover { background: var(--accent-h); }
-
-.btn-secondary {
-  padding: 8px 16px;
-  background: transparent;
-  color: var(--text-dim);
-  border: 1px solid var(--border-light);
-  border-radius: 8px;
-  cursor: pointer;
-  font-size: 13px;
-  transition: background 0.12s;
-}
-.btn-secondary:hover { background: var(--surface2); color: var(--text); }
 
 /* ── Scrollbar ─────────────────────────────────────────────────────────────── */
 ::-webkit-scrollbar               { width: 6px; height: 6px; }

@@ -547,8 +547,7 @@ app.whenReady().then(() => {
         callback({ responseHeaders: stripped });
     });
 
-    // Load any extensions placed in <userData>/extensions before opening the window.
-    autoLoadExtensions().finally(() => createWindow());
+    createWindow();
 });
 
 app.on('window-all-closed', () => {
@@ -783,84 +782,6 @@ ipcMain.handle('xfw:toggle-mixer-xview', async (_e, tabId) => {
     } catch { return false; }
 });
 
-// IPC: open a chrome-extension:// page in a real BrowserWindow so it has
-// the correct extension context (necessary for MetaMask popup / home page).
-ipcMain.handle('xfw:open-extension-page', (_e, extUrl) => {
-    try {
-        const parsed = new URL(extUrl);
-        if (parsed.protocol !== 'chrome-extension:') return;
-        const win = new BrowserWindow({
-            width: 400, height: 620,
-            title: 'Extension',
-            webPreferences: { sandbox: false, contextIsolation: true },
-            parent: mainWindow,
-            modal: false,
-            autoHideMenuBar: true,
-        });
-        win.loadURL(extUrl);
-    } catch (err) { console.warn('[XCaster] open-extension-page failed', err); }
-});
-
-// ── Chrome-extension management (MetaMask, etc.) ────────────────────────────
-// Extensions live in <userData>/extensions/<id>/ as unpacked folders. They are
-// auto-loaded into defaultSession on app start so any webview can use them.
-
-function extensionsRoot() {
-    return path.join(app.getPath('userData'), 'extensions');
-}
-
-async function autoLoadExtensions() {
-    const root = extensionsRoot();
-    try { fs.mkdirSync(root, { recursive: true }); } catch { /* ignore */ }
-    let entries = [];
-    try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return; }
-    for (const entry of entries) {
-        if (!entry.isDirectory()) continue;
-        const dir = path.join(root, entry.name);
-        // Walk into nested folders if manifest.json isn't at the top level
-        // (zip layouts vary).
-        const manifestPath = findManifest(dir);
-        if (!manifestPath) continue;
-        try {
-            await session.defaultSession.loadExtension(path.dirname(manifestPath), { allowFileAccess: true });
-            console.log('[XCaster] loaded extension', entry.name);
-        } catch (err) {
-            console.warn('[XCaster] loadExtension failed for', entry.name, err);
-        }
-    }
-}
-
-function findManifest(dir, depth = 0) {
-    if (depth > 3) return null;
-    try {
-        const entries = fs.readdirSync(dir, { withFileTypes: true });
-        for (const e of entries) {
-            if (e.isFile() && e.name === 'manifest.json') return path.join(dir, e.name);
-        }
-        for (const e of entries) {
-            if (e.isDirectory()) {
-                const found = findManifest(path.join(dir, e.name), depth + 1);
-                if (found) return found;
-            }
-        }
-    } catch { /* ignore */ }
-    return null;
-}
-
-function httpsGetJSON(url) {
-    return new Promise((resolve, reject) => {
-        https.get(url, { headers: { 'User-Agent': 'XCaster' } }, res => {
-            if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-                return resolve(httpsGetJSON(res.headers.location));
-            }
-            if (res.statusCode !== 200) { reject(new Error('HTTP ' + res.statusCode)); return; }
-            let data = '';
-            res.on('data', d => data += d);
-            res.on('end', () => { try { resolve(JSON.parse(data)); } catch (e) { reject(e); } });
-        }).on('error', reject);
-    });
-}
-
 function httpsDownload(url, destPath) {
     return new Promise((resolve, reject) => {
         const file = fs.createWriteStream(destPath);
@@ -1011,49 +932,3 @@ async function checkAndInstallVirtualCable() {
         });
     }
 }
-
-// IPC: install MetaMask from its official GitHub release.
-ipcMain.handle('xfw:install-metamask', async () => {
-    const releaseAPI = 'https://api.github.com/repos/MetaMask/metamask-extension/releases/latest';
-    const release = await httpsGetJSON(releaseAPI);
-    const asset = (release.assets || []).find(a => /^metamask-chrome-.*\.zip$/.test(a.name));
-    if (!asset) throw new Error('No metamask-chrome zip found in latest release');
-
-    const root = extensionsRoot();
-    fs.mkdirSync(root, { recursive: true });
-    const target = path.join(root, 'metamask');
-    // Wipe any previous install
-    try { fs.rmSync(target, { recursive: true, force: true }); } catch { /* ignore */ }
-    const zipPath = path.join(root, asset.name);
-    await httpsDownload(asset.browser_download_url, zipPath);
-    await unzip(zipPath, target);
-    try { fs.unlinkSync(zipPath); } catch { /* ignore */ }
-
-    const manifest = findManifest(target);
-    if (!manifest) throw new Error('manifest.json not found after unzip');
-    const ext = await session.defaultSession.loadExtension(path.dirname(manifest), { allowFileAccess: true });
-    return { name: ext.name, version: ext.version };
-});
-
-// IPC: list currently loaded extensions.
-ipcMain.handle('xfw:list-extensions', () => {
-    return session.defaultSession.getAllExtensions().map(e => {
-        const m = e.manifest || {};
-        const popup = (m.action && m.action.default_popup)
-            || (m.browser_action && m.browser_action.default_popup)
-            || m.default_popup
-            || null;
-        const popupUrl = popup ? `chrome-extension://${e.id}/${popup}` : null;
-        // For extensions without a popup (or as a richer alternative), fall back
-        // to the options page or home.html (MetaMask uses this).
-        const homeRel = m.options_ui?.page || m.options_page || 'home.html';
-        const homeUrl = homeRel ? `chrome-extension://${e.id}/${homeRel}` : null;
-        let icon = null;
-        if (m.icons) {
-            const sizes = Object.keys(m.icons).map(Number).sort((a, b) => a - b);
-            const pick = sizes.find(s => s >= 32) ?? sizes[sizes.length - 1];
-            if (pick) icon = `chrome-extension://${e.id}/${m.icons[pick]}`;
-        }
-        return { id: e.id, name: e.name, version: e.version, popupUrl, homeUrl, icon };
-    });
-});

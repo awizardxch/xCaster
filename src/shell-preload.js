@@ -25,13 +25,6 @@ contextBridge.exposeInMainWorld('xcaster', {
     // Open a URL in the system default browser (outside the app).
     openExternal: (url) => ipcRenderer.invoke('xfw:open-external', url),
 
-    // Chrome-extension management
-    installMetaMask: () => ipcRenderer.invoke('xfw:install-metamask'),
-    listExtensions:  () => ipcRenderer.invoke('xfw:list-extensions'),
-
-    // Open a chrome-extension:// page in a new BrowserWindow (correct context).
-    openExtensionPage: (url) => ipcRenderer.invoke('xfw:open-extension-page', url),
-
     // ── BrowserView management for x.com tabs (v0.5.0 audio path) ──────────
     setToolbarHeight:    (h)       => ipcRenderer.invoke('xfw:set-toolbar-height', h),
     createXView:         (id, url) => ipcRenderer.invoke('xfw:create-xview', id, url),
