@@ -3618,6 +3618,121 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         }
     }
 
+    // ---------- incoming WebRTC receive-side watchdog -----------------------
+    // The output-context watchdog above cannot explain a freeze that only clears
+    // when you leave and REJOIN the Space. xOutputCtx is created once and reused
+    // (ensureXOutputCtx only rebuilds a CLOSED context), so the fresh <audio>
+    // elements X creates on rejoin are routed into the SAME context. If that
+    // context were the wedge, rejoining would change nothing — yet rejoining
+    // reliably restores audio. So the stall is UPSTREAM of our output routing,
+    // in the WebRTC receive path, and nothing watched that: watchStream() covers
+    // mic/aux/aux2 only, and there was no getStats/getReceivers monitoring
+    // anywhere in the overlay.
+    //
+    // Detect it from inbound-rtp stats. If packetsReceived stops advancing while
+    // the connection still reports itself connected, incoming audio has stalled.
+    // Opus DTX still emits roughly one packet per 400ms through silence, so a
+    // completely flat counter over INBOUND_STALL_MS means a stall, not a quiet
+    // room — the same reasoning that made the context clock the right signal
+    // for the output side.
+    let _inboundLastPackets = -1;
+    let _inboundLastAdvance = 0;
+    let _inboundStalled = false;
+    let inboundScanInterval = 0;
+    const INBOUND_POLL_MS = 3000;
+    const INBOUND_STALL_MS = 10000;
+
+    async function _readInboundAudio() {
+        let total = 0, sawInbound = false, connected = false;
+        for (const pc of __xfwPCs) {
+            let state;
+            try { state = pc.connectionState; } catch { continue; }
+            if (state !== 'connected') continue;
+            connected = true;
+            let stats;
+            try { stats = await pc.getStats(); } catch { continue; }
+            stats.forEach(r => {
+                if (r.type === 'inbound-rtp' && r.kind === 'audio') {
+                    sawInbound = true;
+                    total += r.packetsReceived || 0;
+                }
+            });
+        }
+        return { total, sawInbound, connected };
+    }
+
+    function setInboundStalled(stalled, detail) {
+        if (stalled === _inboundStalled) return;
+        _inboundStalled = stalled;
+        if (stalled) console.warn('[XCaster] incoming Space audio STALLED —', detail);
+        else console.info('[XCaster] incoming Space audio flowing again');
+        paintInboundStatus();
+    }
+
+    function paintInboundStatus() {
+        const el = document.getElementById('xfw-inbound-status');
+        const btn = document.getElementById('xfw-recover-inbound');
+        if (el) {
+            el.textContent = _inboundStalled
+                ? '⚠ Incoming Space audio has stopped arriving. Try Recover incoming audio; if that does not help, leave and rejoin the Space.'
+                : '';
+            el.className = _inboundStalled ? 'xfw-spk-status xfw-spk-warn' : 'xfw-spk-status';
+        }
+        if (btn) btn.style.display = _inboundStalled ? '' : 'none';
+    }
+
+    async function probeInboundAudio() {
+        const { total, sawInbound, connected } = await _readInboundAudio();
+        // Not in a Space, or no inbound audio yet — nothing to judge.
+        if (!connected || !sawInbound) {
+            _inboundLastPackets = -1;
+            _inboundLastAdvance = 0;
+            setInboundStalled(false, '');
+            return;
+        }
+        const now = Date.now();
+        if (total !== _inboundLastPackets) {
+            _inboundLastPackets = total;
+            _inboundLastAdvance = now;
+            setInboundStalled(false, '');
+            return;
+        }
+        if (_inboundLastAdvance && now - _inboundLastAdvance >= INBOUND_STALL_MS) {
+            setInboundStalled(true, 'packetsReceived frozen at ' + total + ' for '
+                + Math.round((now - _inboundLastAdvance) / 1000) + 's');
+        }
+    }
+
+    function startInboundScan() {
+        if (inboundScanInterval) return;
+        inboundScanInterval = setInterval(() => {
+            probeInboundAudio().catch(() => {});
+        }, INBOUND_POLL_MS);
+    }
+
+    // Manual recovery. restartIce() is the standard remedy for a receive path
+    // that stopped getting packets, but X owns the signalling, so forcing a
+    // renegotiation underneath it is the user's call — this is wired to a
+    // BUTTON, never fired automatically. The fallback if it does not work is
+    // leaving and rejoining, which is what you would be doing anyway.
+    async function recoverInboundAudio() {
+        let tried = 0;
+        for (const pc of __xfwPCs) {
+            try {
+                if (pc.connectionState === 'closed') continue;
+                if (typeof pc.restartIce !== 'function') continue;
+                pc.restartIce();
+                tried++;
+            } catch (err) {
+                console.warn('[XCaster] restartIce failed', err);
+            }
+        }
+        console.info('[XCaster] requested ICE restart on', tried, 'connection(s)');
+        // Give the output side a nudge too, in case both ends stalled together.
+        await recoverXOutput('manual recovery requested from the Speakers pane');
+        return tried;
+    }
+
     let sinkScanInterval = 0;
     function startSinkScan() {
         if (sinkScanInterval) return;
@@ -4287,8 +4402,11 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                 </div>
             </div>
 
+            <div id="xfw-inbound-status" class="xfw-spk-status"></div>
+
             <div class="xfw-buttons">
                 <button id="xfw-rebuild" class="xfw-btn">Reapply audio graph</button>
+                <button id="xfw-recover-inbound" class="xfw-btn" style="display:none;">Recover incoming audio</button>
                 <button id="xfw-reload" class="xfw-btn xfw-primary">Reload page</button>
             </div>
 
@@ -4690,6 +4808,7 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                 // active Space audio state.
                 startMeters();
                 startSinkScan();
+                startInboundScan();
             }
             if (opening) selectPane(paneName);
             syncSoundsPopups(opening && !!panel.querySelector('.xfw-tab[data-pane="sounds"].xfw-active'));
@@ -5426,6 +5545,22 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             startMeters();
         });
         document.getElementById('xfw-reload').addEventListener('click', () => location.reload());
+
+        document.getElementById('xfw-recover-inbound')?.addEventListener('click', async (e) => {
+            const btn = e.currentTarget;
+            const prev = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = 'Recovering…';
+            try {
+                const n = await recoverInboundAudio();
+                btn.textContent = n ? 'ICE restart requested' : 'No active connection';
+            } catch (err) {
+                console.warn('[XCaster] inbound recovery failed', err);
+                btn.textContent = 'Recovery failed';
+            }
+            // Let the next probe decide whether audio actually came back.
+            setTimeout(() => { btn.disabled = false; btn.textContent = prev; }, 4000);
+        });
 
         navigator.mediaDevices.addEventListener?.('devicechange', () => {
             populateInputs(); populateOutputs();
