@@ -478,7 +478,7 @@ function createWindow() {
                         dialog.showMessageBox(mainWindow, {
                             type: 'info',
                             title: 'About XCaster',
-                            message: 'XCaster v1.4.3',
+                            message: 'XCaster v1.4.4-dev',
                             detail:
                                 'Standalone Windows shell for x.com with WebRTC AGC, noise suppression, and echo cancellation disabled.\n\n' +
                                 'v1.4.3 — Space audio no longer cuts out when you switch to another tab: a tab in a live Space is no longer background-throttled. Also fixes the mixer meters sitting at zero until you clicked Reapply audio graph, roughly halves memory by bounding decoded instrument samples and stopping every tab from decoding the background video, and adds detection plus a manual recovery button for a stalled incoming connection.\n\n' +
