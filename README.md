@@ -9,17 +9,31 @@ It ships its own Chromium (via Electron), disables WebRTC AGC at the engine leve
 ## Download
 
 **Windows (x64)**
-[XCaster v1.4.3 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.3/XCaster-win32-x64.zip)
+[XCaster v1.4.4 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.4/XCaster-win32-x64.zip)
 
 **macOS (Apple Silicon / arm64)**
-[XCaster v1.4.3 — XCaster-darwin-arm64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.3/XCaster-darwin-arm64.zip)
+[XCaster v1.4.4 — XCaster-darwin-arm64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.4/XCaster-darwin-arm64.zip)
 
 **macOS (Intel / x64)**
-[XCaster v1.4.3 — XCaster-darwin-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.3/XCaster-darwin-x64.zip)
+[XCaster v1.4.4 — XCaster-darwin-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.4/XCaster-darwin-x64.zip)
 
 Extract the zip and run `XCaster.exe` (Windows) or `XCaster.app` (macOS) — no installer required.
 
 > **macOS note:** First launch requires right-click → Open to bypass Gatekeeper (app is not notarized).
+
+---
+
+## What's new in v1.4.4
+
+### A live Space keeps running while XCaster is in the background
+- Fixed Space audio degrading or dropping while you worked in another application, which is behaviour that goes back as far as v0.5.
+- XCaster already told Chromium not to throttle itself in the background, and v1.4.3 stopped it throttling a Space you had switched tabs away from. Neither covers the **operating system** deciding that a background app deserves less CPU — and the processes it deprioritises are exactly the ones decoding the Space and mixing your audio, each of which runs separately from the app's main process and was never raised.
+- Those processes are now given elevated priority while you are actually in a Space, and put back to normal when you leave, so an idle XCaster stays a well-behaved background app.
+
+### A dead Space connection is detected and retried
+- If the connection carrying a Space dies, XCaster now notices and automatically retries it, instead of leaving you with silent audio until you leave and rejoin.
+- The stall detection added in v1.4.3 had a blind spot: it only examined healthy connections, so a connection that had actually failed was skipped and reported as "not in a Space" — it went quiet in exactly the situation it was built for. A failed connection is now reported immediately and is no longer dropped from tracking, which had also caused the tab to be de-prioritised at the moment it most needed to recover.
+- Recovery is automatic now rather than a button you had to find. The **Recover incoming audio** button remains in the Speakers pane for a second attempt.
 
 ---
 

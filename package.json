@@ -1,6 +1,6 @@
 {
   "name": "xcaster",
-  "version": "1.4.4-dev",
+  "version": "1.4.4",
   "description": "XCaster - standalone Windows shell for x.com with full DSP mixer and WebRTC AGC disabled. Stream X Spaces with clean, professional audio.",
   "main": "src/main.js",
   "private": true,

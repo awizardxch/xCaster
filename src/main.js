@@ -478,9 +478,10 @@ function createWindow() {
                         dialog.showMessageBox(mainWindow, {
                             type: 'info',
                             title: 'About XCaster',
-                            message: 'XCaster v1.4.4-dev',
+                            message: 'XCaster v1.4.4',
                             detail:
                                 'Standalone Windows shell for x.com with WebRTC AGC, noise suppression, and echo cancellation disabled.\n\n' +
+                                'v1.4.4 — Keeps a live Space running when XCaster is in the background: the processes that decode and mix Space audio are now given priority by the operating system while you are in a Space, and released when you leave. Also detects a Space connection that has died and retries it automatically, instead of leaving the audio silent until you rejoin.\n\n' +
                                 'v1.4.3 — Space audio no longer cuts out when you switch to another tab: a tab in a live Space is no longer background-throttled. Also fixes the mixer meters sitting at zero until you clicked Reapply audio graph, roughly halves memory by bounding decoded instrument samples and stopping every tab from decoding the background video, and adds detection plus a manual recovery button for a stalled incoming connection.\n\n' +
                                 'v1.4.2 — Fixes incoming Space audio freezing until you left and rejoined. The playback path had no recovery of its own, so if the output device stalled (a USB interface re-enumerating mid-Space is the usual cause) nothing noticed. XCaster now watches the output context and restores it in place.\n\n' +
                                 'v1.4.1 — Security: microphone/camera and location access is now restricted to x.com/twitter.com. The built-in browser previously granted them to every site it loaded, so any page you opened - including a malicious link - could capture the mic or your location with no prompt.\n\n' +
