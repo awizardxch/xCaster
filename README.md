@@ -9,17 +9,29 @@ It ships its own Chromium (via Electron), disables WebRTC AGC at the engine leve
 ## Download
 
 **Windows (x64)**
-[XCaster v1.4.4 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.4/XCaster-win32-x64.zip)
+[XCaster v1.4.5 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.5/XCaster-win32-x64.zip)
 
 **macOS (Apple Silicon / arm64)**
-[XCaster v1.4.4 — XCaster-darwin-arm64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.4/XCaster-darwin-arm64.zip)
+[XCaster v1.4.5 — XCaster-darwin-arm64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.5/XCaster-darwin-arm64.zip)
 
 **macOS (Intel / x64)**
-[XCaster v1.4.4 — XCaster-darwin-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.4/XCaster-darwin-x64.zip)
+[XCaster v1.4.5 — XCaster-darwin-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.5/XCaster-darwin-x64.zip)
 
 Extract the zip and run `XCaster.exe` (Windows) or `XCaster.app` (macOS) — no installer required.
 
 > **macOS note:** First launch requires right-click → Open to bypass Gatekeeper (app is not notarized).
+
+---
+
+## What's new in v1.4.5
+
+### MetaMask and Chrome-extension support removed
+- The wallet/extension feature had no interface left, but it was still loading extension code into every page you opened, on every launch. It is gone, along with the injected script that was throwing `TransportTimeoutError` errors into the console.
+- If you had MetaMask installed through XCaster, its ~86 MB of extension code under `%APPDATA%/XCaster/extensions` is no longer used and can be deleted.
+
+### The audio log is reachable
+- **F12** now opens the console for the X tab, which is where XCaster writes its audio diagnostics. `Ctrl+Shift+I` opens the app shell's console, a different window that never showed them — so if audio ever misbehaves, F12 is the one you want.
+- It opens in its own detached window, because the X tab always draws over the app and used to hide the console completely.
 
 ---
 
