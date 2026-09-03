@@ -228,7 +228,14 @@ function keepTimersAliveOnWebContents(contents) {
 async function viewHasLiveAudio(view) {
     try {
         if (!view?.webContents || view.webContents.isDestroyed()) return false;
-        return !!(await view.webContents.executeJavaScript('window.__xfwAudioActive === true', true));
+        // NOTE the absent second argument. executeJavaScript(code, userGesture)
+        // treats a truthy second parameter as a synthetic USER GESTURE in the
+        // page. Passing true here fired a fake user interaction into x.com on
+        // every poll — twice a minute per view, and since the poll covers the
+        // visible tab too, straight into a live Space, which X reacted to by
+        // toggling the Space player between minimised and expanded. Reading a
+        // boolean never needs user activation.
+        return !!(await view.webContents.executeJavaScript('window.__xfwAudioActive === true'));
     } catch { return false; }
 }
 
