@@ -62,6 +62,19 @@ app.commandLine.appendSwitch(
         'FreezingOnEnergySaverDesktop',
     ].join(',')
 );
+// Opt-in remote debugging, for attaching a debugger to a running XCaster.
+// OFF unless XCASTER_DEBUG_PORT is set, because an open DevTools port lets any
+// local process drive the browser and read everything in it - that is not
+// something to ship listening by default. Launch with:
+//   $env:XCASTER_DEBUG_PORT=9222; .\XCaster.exe
+const _debugPort = parseInt(process.env.XCASTER_DEBUG_PORT || '', 10);
+if (Number.isInteger(_debugPort) && _debugPort > 0 && _debugPort < 65536) {
+    app.commandLine.appendSwitch('remote-debugging-port', String(_debugPort));
+    // Bind to loopback only.
+    app.commandLine.appendSwitch('remote-debugging-address', '127.0.0.1');
+    console.log('[XCaster] remote debugging enabled on 127.0.0.1:' + _debugPort);
+}
+
 app.commandLine.appendSwitch('try-supported-channel-layouts');
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 
