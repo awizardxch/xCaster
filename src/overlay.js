@@ -2527,17 +2527,36 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         _pianoRollRAF = requestAnimationFrame(tick);
     }
 
+    // Remember the sink each context is already on. This used to call setSinkId
+    // unconditionally, and applySinkToAllContexts() runs it across EVERY
+    // AudioContext the page has made — including x.com's own, because we patch
+    // the AudioContext constructor to track them all. The sink scan fires every
+    // 2s once the mixer has been opened, so X's Space audio context was being
+    // told to re-route its output twice a minute forever.
+    //
+    // setSinkId is not a no-op when the value is unchanged: it tears down and
+    // re-establishes the context's output. Doing that repeatedly to the context
+    // X plays a Space through interrupts playback, and X responds by rebuilding
+    // the Space player — which is the window collapsing and reappearing, and
+    // occasionally dropping out of the Space altogether.
+    const _ctxSink = new WeakMap(); // AudioContext -> sinkId last applied to it
+
     function applySinkToAudioContext(ctx) {
         if (!ctx) return;
         const id = currentSinkId();
+        if (_ctxSink.get(ctx) === id) return; // already routed there
         // Prefer AudioContext.setSinkId (Chromium 110+); fall back silently.
         if (typeof ctx.setSinkId === 'function') {
+            _ctxSink.set(ctx, id);
+            try { window.__xfwLogSink && window.__xfwLogSink('page AudioContext', id); } catch { /* ignore */ }
             try {
                 const arg = id === 'default' ? '' : id;
                 Promise.resolve(ctx.setSinkId(arg)).catch(err => {
+                    _ctxSink.delete(ctx); // let a transient failure be retried
                     console.warn('[XCaster] AudioContext.setSinkId failed', err);
                 });
             } catch (err) {
+                _ctxSink.delete(ctx);
                 console.warn('[XCaster] AudioContext.setSinkId threw', err);
             }
         }
@@ -6131,6 +6150,60 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             console.warn('[XCaster] worker keepalive failed', err);
         }
     }
+
+    // ---------- Space player diagnostics -----------------------------------
+    // Call __xfwDebugSpace() from the X tab console to trace why the Space
+    // player is being torn down and rebuilt. Off by default: it is chatty, and
+    // it only earns its noise while something is actually being investigated.
+    //
+    // It reports the four things that can make X rebuild that component, so a
+    // single capture says which one it is instead of leaving us to guess:
+    //   page visibility / focus, the player element being added or removed,
+    //   media element failures, and every setSinkId we issue.
+    window.__xfwDebugSpace = function () {
+        if (window.__xfwDebugSpaceOn) return 'already tracing';
+        window.__xfwDebugSpaceOn = true;
+        const t0 = Date.now();
+        const at = () => '+' + ((Date.now() - t0) / 1000).toFixed(1) + 's';
+        const log = (...a) => console.log('%c[SPACE]', 'color:#0af;font-weight:bold', at(), ...a);
+
+        log('tracing started — visibility:', document.visibilityState, '| focus:', document.hasFocus());
+
+        for (const ev of ['visibilitychange', 'freeze', 'resume']) {
+            document.addEventListener(ev, () => log('document ' + ev, '->', document.visibilityState));
+        }
+        for (const ev of ['focus', 'blur', 'pagehide', 'pageshow', 'resize']) {
+            window.addEventListener(ev, () => log('window ' + ev,
+                ev === 'resize' ? window.innerWidth + 'x' + window.innerHeight : ''));
+        }
+
+        // Does the Space player element itself get removed and re-created?
+        const isPlayer = n => n && n.nodeType === 1 && typeof n.querySelector === 'function' &&
+            (n.matches?.('[aria-label*="Space" i], [data-testid*="space" i]') ||
+             !!n.querySelector('[aria-label*="Space" i], [data-testid*="space" i]'));
+        new MutationObserver(muts => {
+            for (const m of muts) {
+                for (const n of m.removedNodes) if (isPlayer(n)) log('%cPLAYER REMOVED', 'color:#f55', n.nodeName);
+                for (const n of m.addedNodes)   if (isPlayer(n)) log('%cPLAYER ADDED',   'color:#5f5', n.nodeName);
+            }
+        }).observe(document.documentElement, { childList: true, subtree: true });
+
+        // Media failures on the elements carrying Space audio.
+        for (const ev of ['error', 'stalled', 'emptied', 'abort', 'ended', 'waiting', 'pause']) {
+            document.addEventListener(ev, e => {
+                const el = e.target;
+                if (!el || !(el.tagName === 'AUDIO' || el.tagName === 'VIDEO')) return;
+                log('media ' + ev, el.tagName,
+                    '| err:', el.error && el.error.code,
+                    '| net:', el.networkState, '| ready:', el.readyState,
+                    '| src:', String(el.currentSrc || el.src || '(none)').slice(0, 90));
+            }, true); // capture phase: these do not bubble
+        }
+
+        // Every sink change we issue, so our own audio plumbing is visible too.
+        window.__xfwLogSink = (what, id) => log('setSinkId', what, '->', id);
+        return 'tracing on — reproduce the problem, then copy the [SPACE] lines';
+    };
 
     function install() {
         if (!document.body) { requestAnimationFrame(install); return; }
