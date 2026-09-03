@@ -3494,6 +3494,7 @@ registerProcessor('xcaster-pitch',XCasterPitch);
     // explicitly AWAITED before any audio flows through it.
 
     const knownMedia = new WeakSet();
+    const _routingInFlight = new WeakSet(); // elements mid-route, see routeXElement
     const xRoutedElements = new WeakMap(); // element → { srcNode, gainNode, stream }
 
     // Dedicated context for X playback routing. Uses _NativeAudioContext so
@@ -3534,6 +3535,16 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             await ensureXOutputCtx();
             return;
         }
+        // Claim the element SYNCHRONOUSLY before the first await. registerMedia
+        // is driven from six places (the play() patch, the srcObject setter,
+        // createElement, the Audio constructor, a MutationObserver and the 2s
+        // sink scan), so two calls for the same element could both clear the
+        // guard above while the other was still awaiting ensureXOutputCtx() —
+        // and the second createMediaElementSource then threw InvalidStateError:
+        // "already connected previously to a different MediaElementSourceNode",
+        // leaving that element unrouted and silent on the wrong device.
+        if (_routingInFlight.has(el)) return;
+        _routingInFlight.add(el);
         try {
             const ctx = await ensureXOutputCtx();
             // Guard: createMediaElementSource throws if element was already attached
@@ -3548,6 +3559,8 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             console.info('[XCaster] element routed to output device', el.tagName, el.src ? 'src=' : el.srcObject ? 'srcObject' : '(empty)');
         } catch (err) {
             console.warn('[XCaster] routeXElement failed', err, el);
+        } finally {
+            _routingInFlight.delete(el);
         }
     }
 
@@ -3748,21 +3761,27 @@ registerProcessor('xcaster-pitch',XCasterPitch);
     const INBOUND_POLL_MS = 3000;
     const INBOUND_STALL_MS = 10000;
 
+    // A peer connection that has failed is kept around briefly so recovery can
+    // act on it, but it must not linger: X leaves dead connections behind when
+    // it builds new ones, and a stale corpse in this set used to raise the alarm
+    // forever even while a healthy connection was carrying the Space.
+    const _failedSince = new WeakMap();
+    const FAILED_PRUNE_MS = 60000;
+
     async function _readInboundAudio() {
-        let total = 0, sawInbound = false, active = false, broken = null;
+        let total = 0, sawInbound = false, active = false;
+        const broken = [];
+        const now = Date.now();
         for (const pc of __xfwPCs) {
             let state;
             try { state = pc.connectionState; } catch { continue; }
-            if (state === 'closed') continue;
-            // A connection in 'failed' or 'disconnected' is the whole point of
-            // this probe: that is a Space that has gone dead and will not come
-            // back on its own. The first version skipped every state except
-            // 'connected', so it went silent in exactly that case and reported
-            // "not in a Space" instead of a stall.
+            if (state === 'closed') { __xfwPCs.delete(pc); continue; }
             if (state === 'failed' || state === 'disconnected') {
-                broken = state;
+                if (!_failedSince.has(pc)) _failedSince.set(pc, now);
+                broken.push(pc);
                 continue;
             }
+            _failedSince.delete(pc);
             if (state !== 'connected') continue;   // 'new' / 'connecting'
             active = true;
             let stats;
@@ -3774,7 +3793,20 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                 }
             });
         }
-        return { total, sawInbound, active, broken };
+        return { total, sawInbound, active, broken, now };
+    }
+
+    // Drop dead connections once they have been dead a while, so they cannot
+    // keep the alarm latched. Only safe when something healthy is carrying
+    // audio - otherwise the broken one is still our only route back.
+    function _pruneDeadConnections(broken, now) {
+        for (const pc of broken) {
+            const since = _failedSince.get(pc);
+            if (since && now - since >= FAILED_PRUNE_MS) {
+                __xfwPCs.delete(pc);
+                _failedSince.delete(pc);
+            }
+        }
     }
 
     function setInboundStalled(stalled, detail) {
@@ -3798,39 +3830,46 @@ registerProcessor('xcaster-pitch',XCasterPitch);
     }
 
     async function probeInboundAudio() {
-        const { total, sawInbound, active, broken } = await _readInboundAudio();
+        const { total, sawInbound, active, broken, now } = await _readInboundAudio();
 
-        // A failed/disconnected connection is a hard stall. Report it at once
-        // rather than waiting out the packet timer — there are no packets to
-        // wait for, and this is the state the user sees as audio frozen until
-        // they leave and rejoin.
-        if (broken) {
+        // A healthy connection with audio arriving beats any broken sibling.
+        // X leaves dead connections behind when it makes new ones, so treating
+        // "any connection is failed" as a stall raised a permanent false alarm
+        // - which then fired an ICE restart every 20s at a Space that was
+        // working perfectly, and X answered by collapsing and reopening the
+        // player. Only judge the connections actually carrying audio.
+        if (active && sawInbound) {
+            _pruneDeadConnections(broken, now);
+            if (total !== _inboundLastPackets) {
+                _inboundLastPackets = total;
+                _inboundLastAdvance = now;
+                setInboundStalled(false, '');
+                return;
+            }
+            if (_inboundLastAdvance && now - _inboundLastAdvance >= INBOUND_STALL_MS) {
+                const detail = 'packetsReceived frozen at ' + total + ' for '
+                    + Math.round((now - _inboundLastAdvance) / 1000) + 's';
+                setInboundStalled(true, detail);
+                autoRecoverInbound(detail, broken);
+            }
+            return;
+        }
+
+        // Nothing healthy. Now a broken connection is a real hard stall.
+        if (broken.length) {
             _inboundLastPackets = -1;
             _inboundLastAdvance = 0;
-            setInboundStalled(true, 'peer connection is ' + broken);
-            autoRecoverInbound('connection ' + broken);
+            let state = 'failed';
+            try { state = broken[0].connectionState; } catch { /* ignore */ }
+            setInboundStalled(true, 'peer connection is ' + state + ', no healthy connection carrying audio');
+            autoRecoverInbound('connection ' + state, broken);
             return;
         }
-        // Not in a Space, or no inbound audio yet — nothing to judge.
-        if (!active || !sawInbound) {
-            _inboundLastPackets = -1;
-            _inboundLastAdvance = 0;
-            setInboundStalled(false, '');
-            return;
-        }
-        const now = Date.now();
-        if (total !== _inboundLastPackets) {
-            _inboundLastPackets = total;
-            _inboundLastAdvance = now;
-            setInboundStalled(false, '');
-            return;
-        }
-        if (_inboundLastAdvance && now - _inboundLastAdvance >= INBOUND_STALL_MS) {
-            const detail = 'packetsReceived frozen at ' + total + ' for '
-                + Math.round((now - _inboundLastAdvance) / 1000) + 's';
-            setInboundStalled(true, detail);
-            autoRecoverInbound(detail);
-        }
+
+        // Not in a Space, or no inbound audio yet - nothing to judge.
+        _inboundLastPackets = -1;
+        _inboundLastAdvance = 0;
+        setInboundStalled(false, '');
     }
 
     // Automatic recovery. This was deliberately manual-only at first, on the
@@ -3843,42 +3882,39 @@ registerProcessor('xcaster-pitch',XCasterPitch);
     // for a second attempt.
     let _lastAutoRecover = 0;
     const AUTO_RECOVER_COOLDOWN_MS = 20000;
-    function autoRecoverInbound(reason) {
+    function autoRecoverInbound(reason, broken) {
         const now = Date.now();
         if (now - _lastAutoRecover < AUTO_RECOVER_COOLDOWN_MS) return;
         _lastAutoRecover = now;
         console.warn('[XCaster] attempting automatic ICE restart —', reason);
-        recoverInboundAudio().catch(err => console.warn('[XCaster] auto recovery failed', err));
+        recoverInboundAudio(broken).catch(err => console.warn('[XCaster] auto recovery failed', err));
     }
 
-    function startInboundScan() {
-        if (inboundScanInterval) return;
-        inboundScanInterval = setInterval(() => {
-            probeInboundAudio().catch(() => {});
-        }, INBOUND_POLL_MS);
-    }
-
-    // Manual recovery. restartIce() is the standard remedy for a receive path
-    // that stopped getting packets, but X owns the signalling, so forcing a
-    // renegotiation underneath it is the user's call — this is wired to a
-    // BUTTON, never fired automatically. The fallback if it does not work is
-    // leaving and rejoining, which is what you would be doing anyway.
-    async function recoverInboundAudio() {
-        let tried = 0;
-        for (const pc of __xfwPCs) {
+    // Restart ICE on the connections that are actually broken. Restarting a
+    // HEALTHY connection forces X to renegotiate a Space that is working fine,
+    // which it answers by collapsing and reopening the player — so never
+    // touch a connected one. Passing no list means "whatever is not connected",
+    // which is what the manual button does.
+    async function recoverInboundAudio(broken) {
+        const targets = [];
+        const candidates = broken && broken.length ? broken : [...__xfwPCs];
+        for (const pc of candidates) {
             try {
-                if (pc.connectionState === 'closed') continue;
+                const state = pc.connectionState;
+                if (state === 'closed' || state === 'connected') continue;
                 if (typeof pc.restartIce !== 'function') continue;
-                pc.restartIce();
-                tried++;
-            } catch (err) {
-                console.warn('[XCaster] restartIce failed', err);
-            }
+                targets.push(pc);
+            } catch { /* ignore */ }
         }
-        console.info('[XCaster] requested ICE restart on', tried, 'connection(s)');
-        // Give the output side a nudge too, in case both ends stalled together.
-        await recoverXOutput('manual recovery requested from the Speakers pane');
-        return tried;
+        for (const pc of targets) {
+            try { pc.restartIce(); } catch (err) { console.warn('[XCaster] restartIce failed', err); }
+        }
+        console.info('[XCaster] requested ICE restart on', targets.length, 'connection(s)');
+        // Deliberately NOT nudging the output side here. recoverXOutput() calls
+        // play() on media elements and re-applies the sink; doing that on a
+        // timer disturbs X's player for a problem that lives on the receive
+        // side. The output context has its own watchdog.
+        return targets.length;
     }
 
     let sinkScanInterval = 0;

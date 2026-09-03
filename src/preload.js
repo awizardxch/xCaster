@@ -20,11 +20,18 @@ let injected = false;
 
 function injectStyle() {
     try {
+        // This runs at document_start, where BOTH document.head and
+        // document.documentElement can still be null - which threw
+        // "Cannot read properties of null (reading 'appendChild')" on every
+        // page load. The later DOMContentLoaded/load calls re-run this, so
+        // simply bail out and let one of those land it.
+        const mount = document.head || document.documentElement;
+        if (!mount) return;
         if (cssText && !document.getElementById('xfw-style')) {
             const style = document.createElement('style');
             style.id = 'xfw-style';
             style.textContent = cssText;
-            (document.head || document.documentElement).appendChild(style);
+            mount.appendChild(style);
         }
     } catch (err) { console.warn('[XCaster] style inject failed', err); }
 }
