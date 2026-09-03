@@ -518,9 +518,10 @@ function createWindow() {
                         dialog.showMessageBox(mainWindow, {
                             type: 'info',
                             title: 'About XCaster',
-                            message: 'XCaster v1.4.7-dev',
+                            message: 'XCaster v1.4.7',
                             detail:
                                 'Standalone Windows shell for x.com with WebRTC AGC, noise suppression, and echo cancellation disabled.\n\n' +
+                                'v1.4.7 — Removes a false "incoming Space audio has stopped" warning that could appear during a perfectly healthy Space, along with the automatic reconnect it triggered. Also stops several background checks from repeating work every few seconds, including one that could interrupt the broadcast of whoever is hosting.\n\n' +
                                 'v1.4.6 — Fixes the Space player minimising and re-expanding on its own. A background check was accidentally registering as a user interaction with the page every two seconds, and X treated that as you tapping the player.\n\n' +
                                 'v1.4.5 — Removes MetaMask and Chrome-extension support, which no longer had any interface and was loading extension code into every page on every launch. Adds F12 to open the console for the X tab, where XCaster logs its audio diagnostics.\n\n' +
                                 'v1.4.4 — Keeps a live Space running when XCaster is in the background: the processes that decode and mix Space audio are now given priority by the operating system while you are in a Space, and released when you leave. Also detects a Space connection that has died and retries it automatically, instead of leaving the audio silent until you rejoin.\n\n' +

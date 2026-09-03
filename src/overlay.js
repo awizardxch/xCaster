@@ -3897,7 +3897,7 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         <div id="xfw-panel" role="dialog" aria-label="XCaster audio">
             <div class="xfw-header">
                 <div class="xfw-title">XCaster</div>
-                <div class="xfw-version">v1.4.7-dev</div>
+                <div class="xfw-version">v1.4.7</div>
             </div>
 
             <!-- PERSISTENT METERS (always visible) -->

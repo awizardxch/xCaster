@@ -9,17 +9,33 @@ It ships its own Chromium (via Electron), disables WebRTC AGC at the engine leve
 ## Download
 
 **Windows (x64)**
-[XCaster v1.4.6 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.6/XCaster-win32-x64.zip)
+[XCaster v1.4.7 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.7/XCaster-win32-x64.zip)
 
 **macOS (Apple Silicon / arm64)**
-[XCaster v1.4.6 — XCaster-darwin-arm64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.6/XCaster-darwin-arm64.zip)
+[XCaster v1.4.7 — XCaster-darwin-arm64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.7/XCaster-darwin-arm64.zip)
 
 **macOS (Intel / x64)**
-[XCaster v1.4.6 — XCaster-darwin-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.6/XCaster-darwin-x64.zip)
+[XCaster v1.4.7 — XCaster-darwin-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.7/XCaster-darwin-x64.zip)
 
 Extract the zip and run `XCaster.exe` (Windows) or `XCaster.app` (macOS) — no installer required.
 
 > **macOS note:** First launch requires right-click → Open to bypass Gatekeeper (app is not notarized).
+
+---
+
+## What's new in v1.4.7
+
+### A false "incoming audio has stopped" warning, and the reconnect it caused
+- The Speakers pane could warn that incoming Space audio had stopped while the Space was working perfectly — most reliably when **hosting**, because a host with no other speakers legitimately receives no audio at all.
+- Worse than the warning: it silently retried the connection every 20 seconds, which disturbed the Space player. Both the warning and the automatic retry are gone.
+
+### Less repeated background work
+- A host's own live microphone track could be swapped out every 4 seconds if any unrelated connection looked stale — interrupting the broadcast. Only genuinely broken connections are touched now, and it gives up instead of retrying forever.
+- Output-device and background-throttling settings were being re-applied every couple of seconds even when nothing had changed. They are now applied only on an actual change.
+- Media elements are no longer captured before they have anything to play, which cuts a large amount of pointless work on busy pages.
+
+### For troubleshooting
+- Setting `XCASTER_DEBUG_PORT` enables a local debugging port so audio problems can be traced in a running app. Off by default.
 
 ---
 
