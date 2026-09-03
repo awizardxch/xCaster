@@ -3880,6 +3880,13 @@ registerProcessor('xcaster-pitch',XCasterPitch);
     // Space that is already dead, an ICE restart cannot make things worse, and
     // doing nothing guarantees the user has to rejoin. The manual button stays
     // for a second attempt.
+    function startInboundScan() {
+        if (inboundScanInterval) return;
+        inboundScanInterval = setInterval(() => {
+            probeInboundAudio().catch(() => {});
+        }, INBOUND_POLL_MS);
+    }
+
     let _lastAutoRecover = 0;
     const AUTO_RECOVER_COOLDOWN_MS = 20000;
     function autoRecoverInbound(reason, broken) {
