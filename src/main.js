@@ -197,10 +197,27 @@ function applyLiveAudioPriority(livePids) {
     for (const pid of [..._raisedPids.keys()]) if (!wanted.has(pid)) restoreProcessPriority(pid);
 }
 
-function enforceNoThrottleOnWebContents(contents) {
+// Applying these is NOT free. Electron's setBackgroundThrottling() can force a
+// hidden/shown transition on the WebContents to make the new value take effect,
+// which flips document.visibilityState in the page — and a renderer that sees
+// visibility flap every 2 seconds will tear down and rebuild anything tied to
+// it. The reconcile below runs on a 2s timer and used to re-apply the same
+// values every single pass, so remember what each view was last set to and only
+// call through when it actually changes.
+const _throttleState = new WeakMap(); // webContents -> 'full' | 'timers' | 'throttled'
+
+function _applyThrottleMode(contents, mode) {
     if (!contents || contents.isDestroyed()) return;
-    try { contents.setBackgroundThrottling(false); } catch {}
-    try { contents.setFrameRate(60); } catch {}
+    if (_throttleState.get(contents) === mode) return;
+    _throttleState.set(contents, mode);
+    // The argument means "enable throttling", so only the 'throttled' mode is true.
+    try { contents.setBackgroundThrottling(mode === 'throttled'); } catch {}
+    // 60fps only matters for a view that is actually on screen.
+    if (mode === 'full') { try { contents.setFrameRate(60); } catch {} }
+}
+
+function enforceNoThrottleOnWebContents(contents) {
+    _applyThrottleMode(contents, 'full');
 }
 
 // Let a hidden/background view be throttled normally again. Only the
@@ -209,8 +226,7 @@ function enforceNoThrottleOnWebContents(contents) {
 // causing the app to slow down / freeze after a while (each background X tab
 // kept burning full CPU+GPU indefinitely, competing with the active one).
 function allowThrottleOnWebContents(contents) {
-    if (!contents || contents.isDestroyed()) return;
-    try { contents.setBackgroundThrottling(true); } catch {}
+    _applyThrottleMode(contents, 'throttled');
 }
 
 // Third state the policy above lacked. A hidden X tab that is in a live Space
@@ -219,8 +235,7 @@ function allowThrottleOnWebContents(contents) {
 // deliberately do not force 60fps the way enforceNoThrottleOnWebContents does.
 // Unthrottled timers, no rendering work.
 function keepTimersAliveOnWebContents(contents) {
-    if (!contents || contents.isDestroyed()) return;
-    try { contents.setBackgroundThrottling(false); } catch {}
+    _applyThrottleMode(contents, 'timers');
 }
 
 // The overlay maintains window.__xfwAudioActive in every tab (see
