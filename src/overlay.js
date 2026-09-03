@@ -3644,6 +3644,21 @@ registerProcessor('xcaster-pitch',XCasterPitch);
 
     function registerMedia(el) {
         if (!el || knownMedia.has(el)) return;
+        // Don't capture an element that has nothing to play yet.
+        // createMediaElementSource() permanently binds an element to our
+        // AudioContext and detaches it from normal output — and because we hook
+        // Document.createElement, we were grabbing every media element X made at
+        // the moment of creation, before it had a source. The log is full of
+        // "element routed to output device VIDEO (empty)" for exactly that.
+        //
+        // An element with no source produces no audio, so capturing it buys
+        // nothing, while capturing X's throwaway and probe elements is the one
+        // thing we do to its player that an ordinary browser does not. Every
+        // path that matters calls back here once a source exists — the play()
+        // patch (before playback starts), the srcObject setter, the
+        // MutationObserver and the 2s sink scan — so nothing escapes routing;
+        // it just happens when there is something to route.
+        if (!el.src && !el.currentSrc && !el.srcObject) return;
         knownMedia.add(el);
         routeXElement(el);
     }
@@ -4023,7 +4038,7 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         <div id="xfw-panel" role="dialog" aria-label="XCaster audio">
             <div class="xfw-header">
                 <div class="xfw-title">XCaster</div>
-                <div class="xfw-version">v1.4.6</div>
+                <div class="xfw-version">v1.4.7-dev</div>
             </div>
 
             <!-- PERSISTENT METERS (always visible) -->

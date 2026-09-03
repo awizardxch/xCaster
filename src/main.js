@@ -488,7 +488,7 @@ function createWindow() {
                         dialog.showMessageBox(mainWindow, {
                             type: 'info',
                             title: 'About XCaster',
-                            message: 'XCaster v1.4.6',
+                            message: 'XCaster v1.4.7-dev',
                             detail:
                                 'Standalone Windows shell for x.com with WebRTC AGC, noise suppression, and echo cancellation disabled.\n\n' +
                                 'v1.4.6 — Fixes the Space player minimising and re-expanding on its own. A background check was accidentally registering as a user interaction with the page every two seconds, and X treated that as you tapping the player.\n\n' +
