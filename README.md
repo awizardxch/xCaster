@@ -9,17 +9,26 @@ It ships its own Chromium (via Electron), disables WebRTC AGC at the engine leve
 ## Download
 
 **Windows (x64)**
-[XCaster v1.4.5 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.5/XCaster-win32-x64.zip)
+[XCaster v1.4.6 — XCaster-win32-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.6/XCaster-win32-x64.zip)
 
 **macOS (Apple Silicon / arm64)**
-[XCaster v1.4.5 — XCaster-darwin-arm64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.5/XCaster-darwin-arm64.zip)
+[XCaster v1.4.6 — XCaster-darwin-arm64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.6/XCaster-darwin-arm64.zip)
 
 **macOS (Intel / x64)**
-[XCaster v1.4.5 — XCaster-darwin-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.5/XCaster-darwin-x64.zip)
+[XCaster v1.4.6 — XCaster-darwin-x64.zip](https://github.com/awizardxch/xCaster/releases/download/v1.4.6/XCaster-darwin-x64.zip)
 
 Extract the zip and run `XCaster.exe` (Windows) or `XCaster.app` (macOS) — no installer required.
 
 > **macOS note:** First launch requires right-click → Open to bypass Gatekeeper (app is not notarized).
+
+---
+
+## What's new in v1.4.6
+
+### The Space player no longer minimises and re-expands on its own
+- Fixed the X Space player collapsing and reopening by itself every couple of seconds.
+- A background check that asks each tab whether it is carrying a live Space was registering as a **user interaction** with the page each time it ran. X reasonably treated that as you tapping the player, and toggled it. The check now runs without pretending to be a click.
+- Introduced in v1.4.4, which widened that check from hidden tabs to every tab — so it only affected a Space you were actually watching from v1.4.4 onward. Anyone on v1.4.4 or v1.4.5 should update.
 
 ---
 
