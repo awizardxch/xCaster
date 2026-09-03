@@ -3474,29 +3474,61 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         }
     }
 
+    // Heal ONLY the senders whose track has actually ended.
+    //
+    // This used to find one stale sender and then call
+    // replaceTracksOnActivePCs(), which swaps the track on EVERY audio sender,
+    // healthy ones included. It runs from the 4s health watchdog, so when the
+    // stale sender could not be healed the condition stayed true and we
+    // re-swapped the host's LIVE publishing track every four seconds forever.
+    // replaceTrack() on a live sender makes X rebuild the Space player, which is
+    // why only a Space you HOST cycles - a listener has no audio sender for this
+    // to touch - and why it survived turning the main-process poll off.
+    //
+    // So: touch only what is broken, rate-limit it, and give up rather than
+    // retry forever, because a sender we cannot heal is not worth disrupting a
+    // working broadcast over.
+    let _lastSenderHeal = 0;
+    let _senderHealAttempts = 0;
+    const SENDER_HEAL_COOLDOWN_MS = 15000;
+    const SENDER_HEAL_MAX_ATTEMPTS = 3;
+
     async function healActiveAudioSendersIfNeeded() {
-        let hasStaleSender = false;
+        const stale = [];
         for (const pc of __xfwPCs) {
             try {
                 for (const sender of pc.getSenders()) {
                     const track = sender?.track;
-                    if (!track || track.kind !== 'audio') continue;
-                    if (track.readyState === 'ended') {
-                        hasStaleSender = true;
-                        break;
-                    }
+                    if (track && track.kind === 'audio' && track.readyState === 'ended') stale.push(sender);
                 }
             } catch { /* ignore */ }
-            if (hasStaleSender) break;
         }
-        if (!hasStaleSender) return false;
+        if (!stale.length) { _senderHealAttempts = 0; return false; }
 
-        // Ensure we have a live processed source before swapping sender tracks.
-        const live = processedStream?.getAudioTracks?.()[0];
-        if (!live || live.readyState === 'ended') {
-            await ensureProcessedStream();
+        const now = Date.now();
+        if (now - _lastSenderHeal < SENDER_HEAL_COOLDOWN_MS) return false;
+        if (_senderHealAttempts >= SENDER_HEAL_MAX_ATTEMPTS) return false; // stop thrashing
+        _lastSenderHeal = now;
+        _senderHealAttempts++;
+
+        const existing = processedStream?.getAudioTracks?.()[0];
+        if (!existing || existing.readyState === 'ended') await ensureProcessedStream();
+        const source = processedStream?.getAudioTracks?.()[0];
+        if (!source) return false;
+
+        console.warn('[XCaster] healing', stale.length, 'ended audio sender(s) — attempt',
+            _senderHealAttempts, 'of', SENDER_HEAL_MAX_ATTEMPTS);
+        for (const sender of stale) {
+            try {
+                const t = source.clone();
+                _setTrackEnabledRaw(t, !xBroadcastMuted);
+                bridgeXMuteTrack(t);
+                t.applyConstraints({ autoGainControl: false, noiseSuppression: false, echoCancellation: false }).catch(() => {});
+                await sender.replaceTrack(t);
+            } catch (err) {
+                console.warn('[XCaster] sender heal failed', err);
+            }
         }
-        replaceTracksOnActivePCs();
         return true;
     }
 

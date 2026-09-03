@@ -356,6 +356,8 @@ function createWindow() {
     mainWindow.on('focus', reassertNoThrottle);
     // Periodic re-assertion catches occlusion-driven throttling that no
     // event fires for (when other apps cover the window without minimizing).
+    // Re-enabled: bisecting with this off did NOT stop the Space player
+    // cycling, so this path is exonerated and the protection is worth keeping.
     registerInterval(reassertNoThrottle, 2000);
 
     // Resize all visible BrowserViews (x.com tabs) to match new window size.
