@@ -3438,12 +3438,7 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             const pc = new RealPC(...args);
             __xfwPCs.add(pc);
             pc.addEventListener('connectionstatechange', () => {
-                // Only 'closed' is untrackable. A 'failed' connection was being
-                // dropped here too, which hid the dead Space from the inbound
-                // watchdog and from _updateAudioActiveFlag — so the view got
-                // throttled and de-prioritised at the exact moment it needed
-                // help recovering. 'failed' can still be ICE-restarted; keep it.
-                if (pc.connectionState === 'closed') __xfwPCs.delete(pc);
+                if (['closed', 'failed'].includes(pc.connectionState)) __xfwPCs.delete(pc);
                 if (pc.connectionState === 'connected') replaceTracksOnActivePCs();
                 // Immediate, so switching tabs right after joining a Space does
                 // not race the 4s health watchdog and get the view throttled.
@@ -3769,193 +3764,6 @@ registerProcessor('xcaster-pitch',XCasterPitch);
             recoverXOutput('output clock frozen at ' + t.toFixed(3) + 's for '
                 + Math.round((now - _xOutLastAdvance) / 1000) + 's');
         }
-    }
-
-    // ---------- incoming WebRTC receive-side watchdog -----------------------
-    // The output-context watchdog above cannot explain a freeze that only clears
-    // when you leave and REJOIN the Space. xOutputCtx is created once and reused
-    // (ensureXOutputCtx only rebuilds a CLOSED context), so the fresh <audio>
-    // elements X creates on rejoin are routed into the SAME context. If that
-    // context were the wedge, rejoining would change nothing — yet rejoining
-    // reliably restores audio. So the stall is UPSTREAM of our output routing,
-    // in the WebRTC receive path, and nothing watched that: watchStream() covers
-    // mic/aux/aux2 only, and there was no getStats/getReceivers monitoring
-    // anywhere in the overlay.
-    //
-    // Detect it from inbound-rtp stats. If packetsReceived stops advancing while
-    // the connection still reports itself connected, incoming audio has stalled.
-    // Opus DTX still emits roughly one packet per 400ms through silence, so a
-    // completely flat counter over INBOUND_STALL_MS means a stall, not a quiet
-    // room — the same reasoning that made the context clock the right signal
-    // for the output side.
-    let _inboundLastPackets = -1;
-    let _inboundLastAdvance = 0;
-    let _inboundStalled = false;
-    let inboundScanInterval = 0;
-    const INBOUND_POLL_MS = 3000;
-    const INBOUND_STALL_MS = 10000;
-
-    // A peer connection that has failed is kept around briefly so recovery can
-    // act on it, but it must not linger: X leaves dead connections behind when
-    // it builds new ones, and a stale corpse in this set used to raise the alarm
-    // forever even while a healthy connection was carrying the Space.
-    const _failedSince = new WeakMap();
-    const FAILED_PRUNE_MS = 60000;
-
-    async function _readInboundAudio() {
-        let total = 0, sawInbound = false, active = false;
-        const broken = [];
-        const now = Date.now();
-        for (const pc of __xfwPCs) {
-            let state;
-            try { state = pc.connectionState; } catch { continue; }
-            if (state === 'closed') { __xfwPCs.delete(pc); continue; }
-            if (state === 'failed' || state === 'disconnected') {
-                if (!_failedSince.has(pc)) _failedSince.set(pc, now);
-                broken.push(pc);
-                continue;
-            }
-            _failedSince.delete(pc);
-            if (state !== 'connected') continue;   // 'new' / 'connecting'
-            active = true;
-            let stats;
-            try { stats = await pc.getStats(); } catch { continue; }
-            stats.forEach(r => {
-                if (r.type === 'inbound-rtp' && r.kind === 'audio') {
-                    sawInbound = true;
-                    total += r.packetsReceived || 0;
-                }
-            });
-        }
-        return { total, sawInbound, active, broken, now };
-    }
-
-    // Drop dead connections once they have been dead a while, so they cannot
-    // keep the alarm latched. Only safe when something healthy is carrying
-    // audio - otherwise the broken one is still our only route back.
-    function _pruneDeadConnections(broken, now) {
-        for (const pc of broken) {
-            const since = _failedSince.get(pc);
-            if (since && now - since >= FAILED_PRUNE_MS) {
-                __xfwPCs.delete(pc);
-                _failedSince.delete(pc);
-            }
-        }
-    }
-
-    function setInboundStalled(stalled, detail) {
-        if (stalled === _inboundStalled) return;
-        _inboundStalled = stalled;
-        if (stalled) console.warn('[XCaster] incoming Space audio STALLED —', detail);
-        else console.info('[XCaster] incoming Space audio flowing again');
-        paintInboundStatus();
-    }
-
-    function paintInboundStatus() {
-        const el = document.getElementById('xfw-inbound-status');
-        const btn = document.getElementById('xfw-recover-inbound');
-        if (el) {
-            el.textContent = _inboundStalled
-                ? '⚠ Incoming Space audio has stopped arriving. Recovery was attempted automatically — if it is still silent, leave and rejoin the Space.'
-                : '';
-            el.className = _inboundStalled ? 'xfw-spk-status xfw-spk-warn' : 'xfw-spk-status';
-        }
-        if (btn) btn.style.display = _inboundStalled ? '' : 'none';
-    }
-
-    async function probeInboundAudio() {
-        const { total, sawInbound, active, broken, now } = await _readInboundAudio();
-
-        // A healthy connection with audio arriving beats any broken sibling.
-        // X leaves dead connections behind when it makes new ones, so treating
-        // "any connection is failed" as a stall raised a permanent false alarm
-        // - which then fired an ICE restart every 20s at a Space that was
-        // working perfectly, and X answered by collapsing and reopening the
-        // player. Only judge the connections actually carrying audio.
-        if (active && sawInbound) {
-            _pruneDeadConnections(broken, now);
-            if (total !== _inboundLastPackets) {
-                _inboundLastPackets = total;
-                _inboundLastAdvance = now;
-                setInboundStalled(false, '');
-                return;
-            }
-            if (_inboundLastAdvance && now - _inboundLastAdvance >= INBOUND_STALL_MS) {
-                const detail = 'packetsReceived frozen at ' + total + ' for '
-                    + Math.round((now - _inboundLastAdvance) / 1000) + 's';
-                setInboundStalled(true, detail);
-                autoRecoverInbound(detail, broken);
-            }
-            return;
-        }
-
-        // Nothing healthy. Now a broken connection is a real hard stall.
-        if (broken.length) {
-            _inboundLastPackets = -1;
-            _inboundLastAdvance = 0;
-            let state = 'failed';
-            try { state = broken[0].connectionState; } catch { /* ignore */ }
-            setInboundStalled(true, 'peer connection is ' + state + ', no healthy connection carrying audio');
-            autoRecoverInbound('connection ' + state, broken);
-            return;
-        }
-
-        // Not in a Space, or no inbound audio yet - nothing to judge.
-        _inboundLastPackets = -1;
-        _inboundLastAdvance = 0;
-        setInboundStalled(false, '');
-    }
-
-    // Automatic recovery. This was deliberately manual-only at first, on the
-    // reasoning that X owns the signalling and forcing renegotiation under it
-    // should be the user's call. That reasoning does not survive the evidence:
-    // the stall is PERMANENT — it does not clear when the app is brought back
-    // to the foreground, and the only cure is leaving and rejoining. Against a
-    // Space that is already dead, an ICE restart cannot make things worse, and
-    // doing nothing guarantees the user has to rejoin. The manual button stays
-    // for a second attempt.
-    function startInboundScan() {
-        if (inboundScanInterval) return;
-        inboundScanInterval = setInterval(() => {
-            probeInboundAudio().catch(() => {});
-        }, INBOUND_POLL_MS);
-    }
-
-    let _lastAutoRecover = 0;
-    const AUTO_RECOVER_COOLDOWN_MS = 20000;
-    function autoRecoverInbound(reason, broken) {
-        const now = Date.now();
-        if (now - _lastAutoRecover < AUTO_RECOVER_COOLDOWN_MS) return;
-        _lastAutoRecover = now;
-        console.warn('[XCaster] attempting automatic ICE restart —', reason);
-        recoverInboundAudio(broken).catch(err => console.warn('[XCaster] auto recovery failed', err));
-    }
-
-    // Restart ICE on the connections that are actually broken. Restarting a
-    // HEALTHY connection forces X to renegotiate a Space that is working fine,
-    // which it answers by collapsing and reopening the player — so never
-    // touch a connected one. Passing no list means "whatever is not connected",
-    // which is what the manual button does.
-    async function recoverInboundAudio(broken) {
-        const targets = [];
-        const candidates = broken && broken.length ? broken : [...__xfwPCs];
-        for (const pc of candidates) {
-            try {
-                const state = pc.connectionState;
-                if (state === 'closed' || state === 'connected') continue;
-                if (typeof pc.restartIce !== 'function') continue;
-                targets.push(pc);
-            } catch { /* ignore */ }
-        }
-        for (const pc of targets) {
-            try { pc.restartIce(); } catch (err) { console.warn('[XCaster] restartIce failed', err); }
-        }
-        console.info('[XCaster] requested ICE restart on', targets.length, 'connection(s)');
-        // Deliberately NOT nudging the output side here. recoverXOutput() calls
-        // play() on media elements and re-applies the sink; doing that on a
-        // timer disturbs X's player for a problem that lives on the receive
-        // side. The output context has its own watchdog.
-        return targets.length;
     }
 
     let sinkScanInterval = 0;
@@ -4627,11 +4435,8 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                 </div>
             </div>
 
-            <div id="xfw-inbound-status" class="xfw-spk-status"></div>
-
             <div class="xfw-buttons">
                 <button id="xfw-rebuild" class="xfw-btn">Reapply audio graph</button>
-                <button id="xfw-recover-inbound" class="xfw-btn" style="display:none;">Recover incoming audio</button>
                 <button id="xfw-reload" class="xfw-btn xfw-primary">Reload page</button>
             </div>
 
@@ -5048,7 +4853,6 @@ registerProcessor('xcaster-pitch',XCasterPitch);
                 // active Space audio state.
                 startMeters();
                 startSinkScan();
-                startInboundScan();
             }
             if (opening) selectPane(paneName);
             syncSoundsPopups(opening && !!panel.querySelector('.xfw-tab[data-pane="sounds"].xfw-active'));
@@ -5786,21 +5590,6 @@ registerProcessor('xcaster-pitch',XCasterPitch);
         });
         document.getElementById('xfw-reload').addEventListener('click', () => location.reload());
 
-        document.getElementById('xfw-recover-inbound')?.addEventListener('click', async (e) => {
-            const btn = e.currentTarget;
-            const prev = btn.textContent;
-            btn.disabled = true;
-            btn.textContent = 'Recovering…';
-            try {
-                const n = await recoverInboundAudio();
-                btn.textContent = n ? 'ICE restart requested' : 'No active connection';
-            } catch (err) {
-                console.warn('[XCaster] inbound recovery failed', err);
-                btn.textContent = 'Recovery failed';
-            }
-            // Let the next probe decide whether audio actually came back.
-            setTimeout(() => { btn.disabled = false; btn.textContent = prev; }, 4000);
-        });
 
         navigator.mediaDevices.addEventListener?.('devicechange', () => {
             populateInputs(); populateOutputs();
